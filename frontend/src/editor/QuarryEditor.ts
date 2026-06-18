@@ -73,6 +73,15 @@ export interface EditorCallbacks {
   onMode: (editing: boolean) => void;
 }
 
+// How to number the rows of a freshly loaded window. Windows are contiguous and
+// line-aligned, so exact numbers can be chained from a known anchor (byte 0 =
+// line 1) as the user scrolls — far more reliable than the sparse line index,
+// which interpolates badly across the multi-MB lines in real SQL dumps.
+type Numbering =
+  | { kind: "top"; first: number; exact: boolean } // first row is line `first`
+  | { kind: "bottom"; last: number; exact: boolean } // last row is line `last`
+  | { kind: "approx" }; // fall back to the server's interpolated numbers
+
 const WINDOW_BYTES = 1 << 20;
 const EDGE_THRESHOLD = 2000;
 const FLUSH_DEBOUNCE_MS = 1200;
@@ -143,6 +152,11 @@ export class QuarryEditor {
   private applying = false;
   private ref: WinRef = { lineOffsets: [], lineNumbers: [] };
 
+  // Exact line numbers of the current window, used to chain the next/prev one.
+  private winFirstNum = 1;
+  private winLastNum = 1;
+  private winExact = false;
+
   private editMode = false;
   private dirty = false;
   private editWinStart = 0;
@@ -206,6 +220,26 @@ export class QuarryEditor {
     });
 
     this.view = new EditorView({ state, parent });
+
+    // Viewport-edge detection (above) fires a window swap as you *approach* an
+    // edge, which keeps mid-window scrolling smooth. But when a swap lands you
+    // exactly at the top (or bottom) of the new window there's nothing left to
+    // scroll into, so no further scroll events fire and you'd be pinned. This
+    // wheel handler covers that gap: wheeling against an already-pinned edge
+    // pulls in the adjacent window. Each wheel event is single-direction, so it
+    // can't oscillate.
+    this.view.scrollDOM.addEventListener(
+      "wheel",
+      (e: WheelEvent) => {
+        if (this.busy || !this.fileId) return;
+        const el = this.view.scrollDOM;
+        const atTop = el.scrollTop <= 0;
+        const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 1;
+        if (e.deltaY < 0 && atTop && !this.atBof) void this.loadPrev();
+        else if (e.deltaY > 0 && atBottom && !this.atEof) void this.loadNext();
+      },
+      { passive: true },
+    );
   }
 
   // ---- public API ---------------------------------------------------------
@@ -227,7 +261,9 @@ export class QuarryEditor {
     this.atBof = startByte === 0;
     this.atEof = false;
     const w = (await FileService.GetWindow(fileId, startByte, WINDOW_BYTES)) as WindowData;
-    this.apply(w, "top");
+    const numbering: Numbering =
+      startByte === 0 ? { kind: "top", first: 1, exact: true } : { kind: "approx" };
+    this.apply(w, "top", numbering);
   }
 
   clear(): void {
@@ -256,7 +292,7 @@ export class QuarryEditor {
     this.setMode(on);
     if (!this.fileId) return;
     this.busy = true;
-    await this.loadAt(this.startByte, "top");
+    await this.loadAt(this.startByte, "top", { kind: "approx" });
   }
 
   /** Flush the current window's pending edits into the Go staging session. */
@@ -280,21 +316,26 @@ export class QuarryEditor {
   async refresh(): Promise<void> {
     if (!this.fileId) return;
     this.busy = true;
-    await this.loadAt(this.startByte, "top");
+    // Same window, same content (in-place patch is length-preserving) — keep the
+    // numbering we already had.
+    const numbering: Numbering = this.editMode
+      ? { kind: "approx" }
+      : { kind: "top", first: this.winFirstNum, exact: this.winExact };
+    await this.loadAt(this.startByte, "top", numbering);
   }
 
   async gotoByte(byte: number): Promise<void> {
     if (!this.fileId) return;
     await this.flush();
     this.busy = true;
-    await this.loadAt(Math.max(0, byte), "top");
+    await this.loadAt(Math.max(0, byte), "top", { kind: "approx" });
   }
 
   async showMatch(offset: number, length: number, query: string, regex: boolean, caseSensitive: boolean): Promise<void> {
     if (!this.fileId) return;
     await this.flush();
     this.busy = true;
-    await this.loadAt(Math.max(0, offset - 256), "top");
+    await this.loadAt(Math.max(0, offset - 256), "top", { kind: "approx" });
 
     const text = this.view.state.doc.toString();
     const hint = Math.max(0, offset - this.startByte - 8);
@@ -383,9 +424,9 @@ export class QuarryEditor {
     return (await FileService.GetWindow(this.fileId, startByte, WINDOW_BYTES)) as WindowData;
   }
 
-  private async loadAt(startByte: number, anchor: "top" | "bottom"): Promise<void> {
+  private async loadAt(startByte: number, anchor: "top" | "bottom", numbering: Numbering): Promise<void> {
     const w = await this.fetchWindow(startByte);
-    this.apply(w, anchor);
+    this.apply(w, anchor, numbering);
   }
 
   private async loadNext(): Promise<void> {
@@ -396,7 +437,12 @@ export class QuarryEditor {
       const w = this.editMode
         ? ((await FileService.GetEditWindow(this.fileId, this.nextByte, WINDOW_BYTES)) as WindowData)
         : ((await FileService.GetNextWindow(this.fileId, this.nextByte, WINDOW_BYTES)) as WindowData);
-      this.apply(w, "top");
+      // The next window starts on the line after this one's last (windows are
+      // contiguous and line-aligned), so exact numbers continue seamlessly.
+      const numbering: Numbering = this.editMode
+        ? { kind: "approx" }
+        : { kind: "top", first: this.winLastNum + 1, exact: this.winExact };
+      this.apply(w, "top", numbering);
     } catch (e) {
       console.error("loadNext", e);
       this.busy = false;
@@ -411,20 +457,44 @@ export class QuarryEditor {
       const w = this.editMode
         ? ((await FileService.GetEditWindow(this.fileId, Math.max(0, this.startByte - WINDOW_BYTES), WINDOW_BYTES)) as WindowData)
         : ((await FileService.GetPrevWindow(this.fileId, this.startByte, WINDOW_BYTES)) as WindowData);
-      this.apply(w, "bottom");
+      // The previous window ends on the line before this one's first.
+      const numbering: Numbering = this.editMode
+        ? { kind: "approx" }
+        : { kind: "bottom", last: this.winFirstNum - 1, exact: this.winExact };
+      this.apply(w, "bottom", numbering);
     } catch (e) {
       console.error("loadPrev", e);
       this.busy = false;
     }
   }
 
-  private apply(w: WindowData, anchor: "top" | "bottom"): void {
+  private apply(w: WindowData, anchor: "top" | "bottom", numbering: Numbering): void {
     this.startByte = w.startByte;
     this.nextByte = w.nextByte;
     this.atBof = w.atBof;
     this.atEof = w.atEof;
+
+    const rowCount = w.lineNumbers.length;
+    let numbers = w.lineNumbers;
+    let exact = false;
+    if (numbering.kind === "approx" || this.editMode) {
+      numbers = w.lineNumbers;
+      exact = !w.approx;
+    } else if (numbering.kind === "top") {
+      numbers = Array.from({ length: rowCount }, (_, i) => numbering.first + i);
+      exact = numbering.exact;
+    } else {
+      const first = numbering.last - (rowCount - 1);
+      numbers = Array.from({ length: rowCount }, (_, i) => first + i);
+      exact = numbering.exact;
+    }
+
     this.ref.lineOffsets = w.lineOffsets;
-    this.ref.lineNumbers = w.lineNumbers;
+    this.ref.lineNumbers = numbers;
+    this.winFirstNum = numbers[0] ?? 0;
+    this.winLastNum = numbers[rowCount - 1] ?? 0;
+    this.winExact = exact;
+
     this.editWinStart = w.startByte;
     this.editWinOrigLen = utf8Len(w.text);
     this.dirty = false;
@@ -440,22 +510,21 @@ export class QuarryEditor {
     });
     this.applying = false;
 
-    this.emitStatus(w);
+    this.emitStatus(w, numbers, exact);
     setTimeout(() => {
       this.busy = false;
     }, 80);
   }
 
-  private emitStatus(w: WindowData): void {
-    const nums = w.lineNumbers;
+  private emitStatus(w: WindowData, numbers: number[], exact: boolean): void {
     this.cb.onStatus({
       startByte: w.startByte,
       endByte: w.nextByte,
-      firstLine: nums[0] ?? 0,
-      lastLine: nums[nums.length - 1] ?? 0,
+      firstLine: numbers[0] ?? 0,
+      lastLine: numbers[numbers.length - 1] ?? 0,
       atBof: w.atBof,
       atEof: w.atEof,
-      approx: w.approx,
+      approx: !exact,
     });
   }
 }

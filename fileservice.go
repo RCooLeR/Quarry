@@ -11,7 +11,6 @@ import (
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 
-	"github.com/quarry/quarry-wails3/internal/document"
 	sqlanalyze "github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
 	"github.com/quarry/quarry-wails3/internal/search"
 	"github.com/quarry/quarry-wails3/internal/session"
@@ -25,6 +24,21 @@ const searchTimeout = 60 * time.Second
 // holds more than a few of these regardless of file size, so a 400 GB file and
 // a 4 KB file cost the same in memory.
 const defaultWindowBytes = 1 << 20 // 1 MiB
+
+const (
+	// maxRowDisplayRunes collapses a long line to this many runes (+ ⋯) so a huge
+	// line (mysqldump extended INSERT) shows as one compact row, not a giant
+	// CodeMirror line that breaks the viewport.
+	maxRowDisplayRunes = 500
+	// rowDisplayBytes is how many bytes of each line are read for display before
+	// trimming to maxRowDisplayRunes (enough for 500 runes of up to 4 bytes each).
+	rowDisplayBytes = 2400
+	// windowLineTarget is the number of logical lines a window aims to include.
+	windowLineTarget = 2000
+	// windowScanCap bounds the bytes scanned per window so a region of huge lines
+	// (few lines per MiB) stays fast and bounded.
+	windowScanCap int64 = 32 << 20
+)
 
 // FileService exposes streaming, windowed access to very large files. It is
 // bound to the frontend by Wails; the whole-file content never crosses the
@@ -258,37 +272,111 @@ func (s *FileService) windowFrom(f *session.File, startByte int64, maxBytes int)
 		firstLine = 1 // unknown until indexed; numbers shown are relative
 	}
 
-	opts := document.VisibleLineOptions{
-		MaxBytes:        maxBytes,
-		MaxLineBytes:    maxBytes, // no horizontal truncation; the editor wraps
-		FirstLineNumber: firstLine,
-	}
-	page, err := f.Doc.VisiblePageFromOffset(startByte, 1<<20, opts)
-	if err != nil {
-		return Window{}, err
+	_ = maxBytes // window size is governed by windowLineTarget / windowScanCap
+
+	// Scan for line boundaries and decode only the first chunk of each line,
+	// collapsing huge mysqldump INSERT lines to one compact row. This stays fast
+	// even across a region of multi-MB lines (it never decodes the whole window),
+	// so the window has enough rows to scroll and the next load is cheap.
+	scanEnd := startByte + windowScanCap
+	if scanEnd > size {
+		scanEnd = size
 	}
 
 	var b strings.Builder
-	offsets := make([]int64, 0, len(page.Lines))
-	numbers := make([]int64, 0, len(page.Lines))
-	for i, ln := range page.Lines {
-		if i > 0 {
+	offsets := make([]int64, 0, 256)
+	numbers := make([]int64, 0, 256)
+	lineNo := firstLine
+	lineStart := startByte
+	head := make([]byte, 0, rowDisplayBytes)
+	headFull := false
+
+	emitRow := func(truncated bool) {
+		if len(offsets) > 0 {
 			b.WriteByte('\n')
 		}
-		b.WriteString(ln.Text)
-		offsets = append(offsets, ln.Offset)
-		numbers = append(numbers, ln.LineNumber)
+		text := string(head)
+		if r := []rune(text); len(r) > maxRowDisplayRunes {
+			text = string(r[:maxRowDisplayRunes])
+			truncated = true
+		}
+		b.WriteString(text)
+		if truncated {
+			b.WriteString(" ⋯")
+		}
+		offsets = append(offsets, lineStart)
+		numbers = append(numbers, lineNo)
+		lineNo++
+		head = head[:0]
+		headFull = false
+	}
+
+	takeHead := func(seg []byte) {
+		if headFull {
+			return // already captured enough of this line; the rest is dropped
+		}
+		room := rowDisplayBytes - len(head)
+		if len(seg) > room {
+			head = append(head, seg[:room]...)
+			headFull = true
+		} else {
+			head = append(head, seg...)
+		}
+	}
+
+	const chunk = 1 << 20
+	pos := startByte
+	for pos < scanEnd && len(offsets) < windowLineTarget {
+		readEnd := pos + chunk
+		if readEnd > scanEnd {
+			readEnd = scanEnd
+		}
+		buf, err := f.Doc.ReadRange(pos, readEnd)
+		if err != nil {
+			return Window{}, err
+		}
+		i := 0
+		for i < len(buf) && len(offsets) < windowLineTarget {
+			nl := bytes.IndexByte(buf[i:], '\n')
+			if nl < 0 {
+				takeHead(buf[i:])
+				i = len(buf)
+				break
+			}
+			takeHead(buf[i : i+nl])
+			emitRow(headFull)
+			lineStart = pos + int64(i+nl) + 1
+			i += nl + 1
+		}
+		pos = readEnd
+	}
+
+	// Trailing content with no newline: the file's last line (at EOF) or a line
+	// longer than the scan cap. Emit it so the window always makes progress.
+	nextByte := lineStart
+	if lineStart < size && len(offsets) < windowLineTarget {
+		switch {
+		case pos >= size: // true EOF, last line has no newline
+			emitRow(headFull)
+			nextByte = size
+		case len(offsets) == 0: // a single line longer than the scan cap
+			emitRow(true)
+			nextByte = scanEnd
+		}
+	}
+	if nextByte > size {
+		nextByte = size
 	}
 
 	return Window{
 		FileID:      f.ID,
-		StartByte:   page.StartOffset,
-		NextByte:    page.NextOffset,
+		StartByte:   startByte,
+		NextByte:    nextByte,
 		Text:        b.String(),
 		LineOffsets: offsets,
 		LineNumbers: numbers,
-		AtBOF:       page.StartOffset == 0,
-		AtEOF:       page.NextOffset >= size,
+		AtBOF:       startByte == 0,
+		AtEOF:       nextByte >= size,
 		Approx:      approx,
 	}, nil
 }
