@@ -246,6 +246,49 @@ func (pt *PieceTable) WriteTo(ctx context.Context, src document.ReaderAtSize, ds
 	return written, dst.Sync()
 }
 
+// ReadRange returns the transformed (edited) bytes in [start, end), reading
+// original spans from src and added spans from the staging buffer. Used to
+// render a window that reflects staged edits.
+func (pt *PieceTable) ReadRange(src document.ReaderAtSize, start int64, end int64) ([]byte, error) {
+	if pt == nil {
+		return nil, errors.New("piece table is required")
+	}
+	if src == nil {
+		return nil, errors.New("source document is required")
+	}
+	start = clamp64(start, 0, pt.size)
+	end = clamp64(end, 0, pt.size)
+	if end <= start {
+		return []byte{}, nil
+	}
+	out := make([]byte, 0, end-start)
+	cursor := int64(0)
+	for _, current := range pt.pieces {
+		pieceStart := cursor
+		pieceEnd := cursor + current.length
+		cursor = pieceEnd
+		if pieceEnd <= start || pieceStart >= end {
+			continue
+		}
+		within := max64(start, pieceStart) - pieceStart
+		n := min64(end, pieceEnd) - max64(start, pieceStart)
+		switch current.source {
+		case pieceOriginal:
+			buf := make([]byte, n)
+			if _, err := src.ReadAt(buf, current.start+within); err != nil && !errors.Is(err, io.EOF) {
+				return nil, err
+			}
+			out = append(out, buf...)
+		case pieceAdded:
+			from := current.start + within
+			out = append(out, pt.added[from:from+n]...)
+		default:
+			return nil, errors.New("unknown piece source")
+		}
+	}
+	return out, nil
+}
+
 func appendInsertedPiece(pieces []piece, start int64, length int64) []piece {
 	if length <= 0 {
 		return pieces

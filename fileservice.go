@@ -44,6 +44,7 @@ type FileMeta struct {
 	Encoding string `json:"encoding"`
 	Detected string `json:"detected"`
 	Binary   bool   `json:"binary"`
+	Editable bool   `json:"editable"` // UTF-8/ASCII + LF: in-window editing allowed
 }
 
 // Window is a bounded, line-aligned slice of the file decoded to UTF-8, plus
@@ -80,6 +81,7 @@ func (s *FileService) OpenViaDialog() (FileMeta, error) {
 
 // OpenFile opens path, starts background indexing, and returns its metadata.
 func (s *FileService) OpenFile(path string) (FileMeta, error) {
+	recoverInPlace(path) // replay any leftover in-place patch sidecar first
 	f, err := s.reg.Open(path)
 	if err != nil {
 		return FileMeta{}, err
@@ -93,6 +95,7 @@ func (s *FileService) OpenFile(path string) (FileMeta, error) {
 		Encoding: m.Encoding,
 		Detected: m.FileType,
 		Binary:   m.Binary,
+		Editable: !m.Binary && editableEncoding(m.Encoding, m.LineEnding),
 	}, nil
 }
 

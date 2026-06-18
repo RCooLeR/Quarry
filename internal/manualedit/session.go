@@ -1,6 +1,10 @@
 package manualedit
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/quarry/quarry-wails3/internal/document"
+)
 
 // Session is a single-owner mutable staging model. Callers must confine it to
 // one goroutine/UI owner or provide external synchronization before mutating it.
@@ -167,6 +171,23 @@ func (s *Session) Size() int64 {
 		return 0
 	}
 	return s.table.Size()
+}
+
+// OriginalSize is the source document's byte size (before edits).
+func (s *Session) OriginalSize() int64 {
+	if s == nil {
+		return 0
+	}
+	return s.originalSize
+}
+
+// ReadRange returns the transformed (edited) bytes in [start, end), reading
+// unedited spans from src. Used to render a window reflecting staged edits.
+func (s *Session) ReadRange(src document.ReaderAtSize, start int64, end int64) ([]byte, error) {
+	if s == nil || s.table == nil {
+		return nil, errors.New("session is required")
+	}
+	return s.table.ReadRange(src, start, end)
 }
 
 func (s *Session) HasEdits() bool {
