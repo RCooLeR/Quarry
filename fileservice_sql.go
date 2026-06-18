@@ -9,6 +9,7 @@ import (
 	"github.com/quarry/quarry-wails3/internal/exportx"
 	sqlanalyze "github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
 	sqlextract "github.com/quarry/quarry-wails3/internal/plugins/sql/extract"
+	sqlpreset "github.com/quarry/quarry-wails3/internal/plugins/sql/preset"
 	"github.com/quarry/quarry-wails3/internal/replace"
 )
 
@@ -123,6 +124,51 @@ func (s *FileService) SqlReplaceViaDialog(fileID, find, replaceWith string, rege
 		RecordsWritten: sum.Matches,
 		Note:           fmt.Sprintf("%d replacements", sum.Matches),
 	}, nil
+}
+
+// SqlListPresets returns the available SQL cleanup preset names.
+func (s *FileService) SqlListPresets() []string {
+	return append([]string(nil), sqlpreset.PresetNames...)
+}
+
+// SqlApplyPresetViaDialog runs a named cleanup preset, streaming the result to a
+// chosen file. Presets that need arguments (e.g. change-database) take them via
+// a1..a4; the source is never modified.
+func (s *FileService) SqlApplyPresetViaDialog(fileID, name, a1, a2, a3, a4 string) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	cfg, err := sqlpreset.Build(name, a1, a2, a3, a4)
+	if err != nil {
+		return TransformResult{}, err
+	}
+	dst, err := saveDialog("Save cleaned SQL as", "cleaned.sql")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	ci := !cfg.CaseSensitive
+	var sum replace.FileSummary
+	switch cfg.Mode {
+	case sqlpreset.ModeRegex:
+		rules := []replace.BatchRule{{Name: name, Find: []byte(cfg.Search), Replace: []byte(cfg.Replace)}}
+		sum, err = replace.ReplaceBatchRegexpFile(context.Background(), f.Path, dst, rules,
+			replace.FileOptions{CaseInsensitive: ci, WholeWord: cfg.WholeWord},
+			replace.RegexOptions{CaseInsensitive: ci})
+	case sqlpreset.ModeBatch:
+		sum, err = replace.ReplaceBatchPlainFile(context.Background(), f.Path, dst, cfg.BatchRules,
+			replace.FileOptions{CaseInsensitive: ci, WholeWord: cfg.WholeWord},
+			replace.BatchOptions{CaseInsensitive: ci, WholeWord: cfg.WholeWord})
+	default: // plain
+		rules := []replace.BatchRule{{Name: name, Find: []byte(cfg.Search), Replace: []byte(cfg.Replace)}}
+		sum, err = replace.ReplaceBatchPlainFile(context.Background(), f.Path, dst, rules,
+			replace.FileOptions{CaseInsensitive: ci, WholeWord: cfg.WholeWord},
+			replace.BatchOptions{CaseInsensitive: ci, WholeWord: cfg.WholeWord})
+	}
+	if err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{OutputPath: dst, RecordsWritten: sum.Matches, Note: cfg.Summary}, nil
 }
 
 func safeFileName(name string) string {

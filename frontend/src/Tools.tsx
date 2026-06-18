@@ -18,6 +18,13 @@ const DELIMS: { value: string; label: string }[] = [
   { value: " ", label: "Space" },
 ];
 
+function presetArgLabels(name: string): string[] {
+  const n = name.toLowerCase();
+  if (n.includes("database")) return ["old database name", "new database name"];
+  if (n.includes("charset")) return ["old charset", "new charset", "old collation (opt)", "new collation (opt)"];
+  return [];
+}
+
 interface Props {
   fileId: string;
   detected: string;
@@ -48,13 +55,25 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
   const [repl, setRepl] = useState("");
   const [regex, setRegex] = useState(false);
   const [ci, setCi] = useState(false);
+  const [presets, setPresets] = useState<string[]>([]);
+  const [preset, setPreset] = useState("");
+  const [pa, setPa] = useState<string[]>(["", "", "", ""]);
 
   const [busy, setBusy] = useState(false);
 
   // Detect CSV delimiter when the panel opens for a CSV file.
   useEffect(() => {
     setInspect(null); setSchema([]); setPreview(null); setSqlSummary(null); setSqlPreviewText("");
-    if (!isCsv) return;
+    if (!isCsv) {
+      (async () => {
+        try {
+          const p = (await FileService.SqlListPresets()) as string[];
+          setPresets(p);
+          if (p.length) setPreset(p[0]);
+        } catch { /* ignore */ }
+      })();
+      return;
+    }
     let cancelled = false;
     (async () => {
       try {
@@ -139,6 +158,9 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
 
   const doReplace = () =>
     run(async () => (await FileService.SqlReplaceViaDialog(fileId, find, repl, regex, ci, false)) as TransformResult);
+
+  const doPreset = () =>
+    run(async () => (await FileService.SqlApplyPresetViaDialog(fileId, preset, pa[0], pa[1], pa[2], pa[3])) as TransformResult);
 
   // ensure detected delimiter appears in the dropdown
   const delims = DELIMS.some((d) => d.value === delim) ? DELIMS : [{ value: delim, label: `Detected (${JSON.stringify(delim)})` }, ...DELIMS];
@@ -236,6 +258,23 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
               <label className="q-check"><input type="checkbox" checked={regex} onChange={(e) => setRegex(e.target.checked)} /> regex</label>
               <label className="q-check"><input type="checkbox" checked={ci} onChange={(e) => setCi(e.target.checked)} /> ignore case</label>
               <button className="q-btn q-btn-primary" disabled={busy || !find} onClick={doReplace}>Replace → file</button>
+            </div>
+
+            <label className="q-tlabel">Cleanup presets → new file</label>
+            <select className="q-select" value={preset} onChange={(e) => setPreset(e.target.value)}>
+              {presets.map((p) => (<option key={p} value={p}>{p}</option>))}
+            </select>
+            {presetArgLabels(preset).map((lbl, i) => (
+              <input
+                key={i}
+                className="q-select"
+                placeholder={lbl}
+                value={pa[i]}
+                onChange={(e) => setPa((prev) => { const c = [...prev]; c[i] = e.target.value; return c; })}
+              />
+            ))}
+            <div className="q-trow">
+              <button className="q-btn q-btn-primary" disabled={busy || !preset} onClick={doPreset}>Apply preset</button>
             </div>
           </>
         )}
