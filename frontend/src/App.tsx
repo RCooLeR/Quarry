@@ -38,6 +38,18 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [path, setPath] = useState("");
 
+  // search + navigation state
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [gotoOpen, setGotoOpen] = useState(false);
+  const [query, setQuery] = useState("");
+  const [regex, setRegex] = useState(false);
+  const [caseSensitive, setCaseSensitive] = useState(false);
+  const [wholeWord, setWholeWord] = useState(false);
+  const [searching, setSearching] = useState(false);
+  const [searchInfo, setSearchInfo] = useState("");
+  const [gotoValue, setGotoValue] = useState("");
+  const lastMatch = useRef<number | null>(null);
+
   // Refs mirror state so the editor's status callback isn't stale.
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -55,9 +67,21 @@ function App() {
     });
     editorRef.current = ed;
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "o") {
+      const mod = e.ctrlKey || e.metaKey;
+      if (mod && e.key.toLowerCase() === "o") {
         e.preventDefault();
         void openViaDialog();
+      } else if (mod && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        setGotoOpen(false);
+        setSearchOpen(true);
+      } else if (mod && e.key.toLowerCase() === "g") {
+        e.preventDefault();
+        setSearchOpen(false);
+        setGotoOpen(true);
+      } else if (e.key === "Escape") {
+        setSearchOpen(false);
+        setGotoOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -82,6 +106,7 @@ function App() {
     tabsRef.current = [...tabsRef.current, tab];
     setActiveId(meta.fileId);
     activeIdRef.current = meta.fileId;
+    lastMatch.current = null;
     await ed.attach(meta.fileId, 0);
   };
 
@@ -120,6 +145,7 @@ function App() {
     if (!ed || !t) return;
     setActiveId(fileId);
     activeIdRef.current = fileId;
+    lastMatch.current = null;
     await ed.attach(fileId, t.startByte);
   };
 
@@ -142,7 +168,66 @@ function App() {
     }
   };
 
+  const resetSearch = () => {
+    lastMatch.current = null;
+  };
+
+  const runFind = async (dir: "next" | "prev") => {
+    const q = query;
+    const id = activeIdRef.current;
+    if (!q.trim() || !id) return;
+    const tab = tabsRef.current.find((t) => t.fileId === id);
+    if (!tab) return;
+    setSearching(true);
+    setSearchInfo("Searching…");
+    try {
+      let hit;
+      if (dir === "next") {
+        const from = lastMatch.current != null ? lastMatch.current + 1 : tab.startByte;
+        hit = await FileService.FindNext(id, q, from, regex, caseSensitive, wholeWord);
+      } else {
+        const before = lastMatch.current != null ? lastMatch.current : tab.startByte;
+        hit = await FileService.FindPrev(id, q, before, regex, caseSensitive, wholeWord);
+      }
+      if (hit.timedOut) {
+        setSearchInfo("Timed out — try a narrower query");
+        return;
+      }
+      if (!hit.found) {
+        setSearchInfo(dir === "next" ? "No matches below" : "No matches above");
+        return;
+      }
+      lastMatch.current = hit.offset;
+      await editorRef.current?.showMatch(hit.offset, hit.length, q, regex, caseSensitive);
+      setSearchInfo(`0x${hit.offset.toString(16)} · line ~${hit.line}`);
+    } catch (e: any) {
+      setSearchInfo(String(e?.message ?? e));
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const doGoto = async () => {
+    const v = gotoValue.trim();
+    const id = activeIdRef.current;
+    if (!v || !id) return;
+    let offset: number | null = null;
+    if (/^0x[0-9a-f]+$/i.test(v)) {
+      offset = parseInt(v.slice(2), 16);
+    } else if (/^\d+$/.test(v)) {
+      offset = await FileService.ResolveLine(id, parseInt(v, 10));
+    }
+    if (offset == null || Number.isNaN(offset)) {
+      setSearchInfo("Enter a line number or 0xHEX offset");
+      return;
+    }
+    lastMatch.current = null;
+    await editorRef.current?.gotoByte(offset);
+    setGotoOpen(false);
+  };
+
   const hasFiles = tabs.length > 0;
+  const activeTab = tabs.find((t) => t.fileId === activeId);
 
   return (
     <div className="q-app">
@@ -152,6 +237,16 @@ function App() {
           <span className="q-brand-name">Quarry</span>
         </div>
         <div className="q-spacer" />
+        {hasFiles && (
+          <>
+            <button className="q-btn" title="Find (Ctrl+F)" onClick={() => { setGotoOpen(false); setSearchOpen(true); }}>
+              Find
+            </button>
+            <button className="q-btn" title="Go to line / offset (Ctrl+G)" onClick={() => { setSearchOpen(false); setGotoOpen(true); }}>
+              Go to
+            </button>
+          </>
+        )}
         <button className="q-btn q-btn-primary" onClick={() => void openViaDialog()} disabled={busy}>
           {busy ? "Opening…" : "Open file"}
         </button>
@@ -179,6 +274,77 @@ function App() {
 
       <div className="q-stage">
         <div className="q-editor" ref={hostRef} />
+
+        {searchOpen && hasFiles && (
+          <div className="q-find">
+            <input
+              className="q-find-input"
+              autoFocus
+              placeholder="Find…"
+              value={query}
+              spellCheck={false}
+              onChange={(e) => {
+                setQuery(e.target.value);
+                resetSearch();
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void runFind(e.shiftKey ? "prev" : "next");
+                } else if (e.key === "Escape") {
+                  setSearchOpen(false);
+                }
+              }}
+            />
+            <button className={"q-toggle" + (caseSensitive ? " on" : "")} title="Match case" onClick={() => { setCaseSensitive((v) => !v); resetSearch(); }}>
+              Aa
+            </button>
+            <button className={"q-toggle" + (wholeWord ? " on" : "")} title="Whole word" onClick={() => { setWholeWord((v) => !v); resetSearch(); }}>
+              W
+            </button>
+            <button className={"q-toggle" + (regex ? " on" : "")} title="Regular expression" onClick={() => { setRegex((v) => !v); resetSearch(); }}>
+              .*
+            </button>
+            <button className="q-icon" title="Previous (Shift+Enter)" disabled={searching} onClick={() => void runFind("prev")}>
+              ↑
+            </button>
+            <button className="q-icon" title="Next (Enter)" disabled={searching} onClick={() => void runFind("next")}>
+              ↓
+            </button>
+            <span className="q-find-info">{searchInfo}</span>
+            <button className="q-icon" title="Close (Esc)" onClick={() => setSearchOpen(false)}>
+              ×
+            </button>
+          </div>
+        )}
+
+        {gotoOpen && hasFiles && (
+          <div className="q-find q-goto">
+            <input
+              className="q-find-input"
+              autoFocus
+              placeholder="Go to line, or 0xHEX byte offset"
+              value={gotoValue}
+              spellCheck={false}
+              onChange={(e) => setGotoValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void doGoto();
+                } else if (e.key === "Escape") {
+                  setGotoOpen(false);
+                }
+              }}
+            />
+            <button className="q-icon" title="Go" onClick={() => void doGoto()}>
+              Go
+            </button>
+            <button className="q-icon" title="Close (Esc)" onClick={() => setGotoOpen(false)}>
+              ×
+            </button>
+          </div>
+        )}
+
         {!hasFiles && (
           <div className="q-empty">
             <img className="q-empty-logo" src="/logos/wordmark.png" alt="Quarry" />
@@ -207,15 +373,15 @@ function App() {
       </div>
 
       <footer className="q-status">
-        {status && activeId ? (
+        {status && activeTab ? (
           <>
-            <span className="q-file" title={tabs.find((t) => t.fileId === activeId)?.meta.path}>
-              {tabs.find((t) => t.fileId === activeId)?.meta.path}
+            <span className="q-file" title={activeTab.meta.path}>
+              {activeTab.meta.path}
             </span>
             <span className="q-sep" />
-            <span>{fmtBytes(tabs.find((t) => t.fileId === activeId)?.meta.size ?? 0)}</span>
-            <span>{tabs.find((t) => t.fileId === activeId)?.meta.encoding || "?"}</span>
-            <span>{tabs.find((t) => t.fileId === activeId)?.meta.detected || "plain"}</span>
+            <span>{fmtBytes(activeTab.meta.size)}</span>
+            <span>{activeTab.meta.encoding || "?"}</span>
+            <span>{activeTab.meta.detected || "plain"}</span>
             <span className="q-spacer" />
             <span>
               0x{status.startByte.toString(16)}–0x{status.endByte.toString(16)}

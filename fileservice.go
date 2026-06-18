@@ -2,14 +2,22 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 
 	"github.com/quarry/quarry-wails3/internal/document"
+	"github.com/quarry/quarry-wails3/internal/search"
 	"github.com/quarry/quarry-wails3/internal/session"
 )
+
+// searchTimeout bounds a single find call so a no-match search on a huge file
+// cannot run forever. The UI shows "searching…" while it runs.
+const searchTimeout = 60 * time.Second
 
 // defaultWindowBytes is the byte budget for one editor window. The editor never
 // holds more than a few of these regardless of file size, so a 400 GB file and
@@ -91,6 +99,87 @@ func (s *FileService) OpenFile(path string) (FileMeta, error) {
 // CloseFile releases a file's resources.
 func (s *FileService) CloseFile(fileID string) error {
 	return s.reg.Close(fileID)
+}
+
+// SearchHit is one match (or a not-found / timed-out result).
+type SearchHit struct {
+	Found    bool   `json:"found"`
+	Offset   int64  `json:"offset"`
+	Length   int    `json:"length"`
+	Line     int64  `json:"line"`     // approximate until the index is built
+	TimedOut bool   `json:"timedOut"` // search hit the time budget before finishing
+}
+
+// FindNext finds the first match at/after fromByte (single streaming pass).
+func (s *FileService) FindNext(fileID, query string, fromByte int64, regex, caseSensitive, wholeWord bool) (SearchHit, error) {
+	return s.find(fileID, query, fromByte, false, regex, caseSensitive, wholeWord)
+}
+
+// FindPrev finds the first match before beforeByte (streaming backward pass).
+func (s *FileService) FindPrev(fileID, query string, beforeByte int64, regex, caseSensitive, wholeWord bool) (SearchHit, error) {
+	return s.find(fileID, query, beforeByte, true, regex, caseSensitive, wholeWord)
+}
+
+func (s *FileService) find(fileID, query string, start int64, backward, regex, caseSensitive, wholeWord bool) (SearchHit, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return SearchHit{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if strings.TrimSpace(query) == "" {
+		return SearchHit{}, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
+	defer cancel()
+
+	var results []search.Result
+	var err error
+	if regex {
+		results, err = search.CollectRegexp(ctx, f.Doc, []byte(query), search.RegexOptions{
+			StartOffset:     start,
+			MaxHits:         1,
+			Backward:        backward,
+			CaseInsensitive: !caseSensitive,
+		}, 0)
+	} else {
+		results, err = search.CollectPlain(ctx, f.Doc, []byte(query), search.PlainOptions{
+			StartOffset:     start,
+			MaxHits:         1,
+			Backward:        backward,
+			CaseInsensitive: !caseSensitive,
+			WholeWord:       wholeWord,
+		}, 0)
+	}
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return SearchHit{TimedOut: true}, nil
+		}
+		return SearchHit{}, err
+	}
+	if len(results) == 0 {
+		return SearchHit{Found: false}, nil
+	}
+	m := results[0]
+	line, _ := f.Doc.ApproxOffsetToLine(m.Offset)
+	return SearchHit{Found: true, Offset: m.Offset, Length: m.Length, Line: line}, nil
+}
+
+// ResolveLine maps a 1-based line number to a byte offset (exact if the index
+// is built, otherwise approximate). Returns 0 when the line can't be resolved.
+func (s *FileService) ResolveLine(fileID string, line int64) (int64, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return 0, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if line < 1 {
+		line = 1
+	}
+	if off, ok, err := f.Doc.ExactLineToOffset(line); err == nil && ok {
+		return off, nil
+	}
+	if off, ok := f.Doc.ApproxLineToOffset(line); ok {
+		return off, nil
+	}
+	return 0, nil
 }
 
 // GetWindow returns a window beginning at startByte (clamped, aligned by the

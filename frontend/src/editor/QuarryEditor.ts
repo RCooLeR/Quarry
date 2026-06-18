@@ -8,8 +8,10 @@
 // memory is bounded, scroll loads the next/prev window atomically). Editing,
 // diff, and save come in later phases.
 
-import { EditorState, Transaction } from "@codemirror/state";
+import { EditorState, StateEffect, StateField, Transaction } from "@codemirror/state";
 import {
+  Decoration,
+  DecorationSet,
   EditorView,
   lineNumbers,
   gutter,
@@ -22,6 +24,23 @@ import {
 } from "@codemirror/view";
 import { defaultKeymap } from "@codemirror/commands";
 import { FileService } from "../../bindings/github.com/quarry/quarry-wails3";
+
+// Decoration for the current search match (a highlighted span).
+const setMatch = StateEffect.define<{ from: number; to: number } | null>();
+const matchMark = Decoration.mark({ class: "cm-search-match" });
+const matchField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setMatch)) {
+        deco = e.value ? Decoration.set([matchMark.range(e.value.from, e.value.to)]) : Decoration.none;
+      }
+    }
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
 
 // Mirrors the Go DTOs (kept local so we don't depend on generated model paths).
 export interface FileMetaData {
@@ -82,6 +101,11 @@ const quarryTheme = EditorView.theme(
     ".cm-byteGutter": { padding: "0 10px", color: "#4b87d6", fontVariantNumeric: "tabular-nums" },
     ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px", minWidth: "3ch" },
     ".cm-activeLineGutter": { backgroundColor: "#161c26" },
+    ".cm-search-match": {
+      backgroundColor: "rgba(43,182,196,0.32)",
+      outline: "1px solid rgba(63,204,218,0.8)",
+      borderRadius: "2px",
+    },
   },
   { dark: true },
 );
@@ -138,6 +162,7 @@ export class QuarryEditor {
       extensions: [
         globalLineNumbers,
         byteGutter,
+        matchField,
         highlightActiveLineGutter(),
         drawSelection(),
         EditorView.lineWrapping,
@@ -183,6 +208,63 @@ export class QuarryEditor {
     this.ref.lineNumbers = [];
     this.onStatus(null);
     this.busy = false;
+  }
+
+  /** Jump so the byte offset is at the top of the view (go-to). */
+  async gotoByte(byte: number): Promise<void> {
+    if (!this.fileId) return;
+    await this.attach(this.fileId, Math.max(0, byte));
+  }
+
+  /**
+   * Load a window containing a match (with a little context above it) and
+   * highlight/scroll to it. The authoritative offset comes from the Go search;
+   * we re-find the query in the loaded window to place the highlight at the
+   * right column without byte↔char conversion.
+   */
+  async showMatch(
+    offset: number,
+    length: number,
+    query: string,
+    regex: boolean,
+    caseSensitive: boolean,
+  ): Promise<void> {
+    if (!this.fileId) return;
+    const start = Math.max(0, offset - 256);
+    await this.attach(this.fileId, start);
+
+    const text = this.view.state.doc.toString();
+    const hint = Math.max(0, offset - this.startByte - 8);
+    let from = -1;
+    let len = length;
+
+    if (regex) {
+      try {
+        const re = new RegExp(query, caseSensitive ? "g" : "gi");
+        re.lastIndex = hint;
+        const m = re.exec(text);
+        if (m) {
+          from = m.index;
+          len = m[0].length || length;
+        }
+      } catch {
+        /* invalid regex on the client — fall through to no highlight */
+      }
+    } else {
+      const hay = caseSensitive ? text : text.toLowerCase();
+      const needle = caseSensitive ? query : query.toLowerCase();
+      from = hay.indexOf(needle, hint);
+      if (from < 0) from = hay.indexOf(needle);
+      len = query.length;
+    }
+
+    if (from >= 0) {
+      const to = Math.min(text.length, from + len);
+      this.view.dispatch({
+        selection: { anchor: from, head: to },
+        effects: [setMatch.of({ from, to }), EditorView.scrollIntoView(from, { y: "center" })],
+      });
+    }
   }
 
   destroy(): void {
@@ -231,7 +313,7 @@ export class QuarryEditor {
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: doc },
       selection: { anchor: pos },
-      effects: EditorView.scrollIntoView(pos, { y: anchor === "bottom" ? "end" : "start" }),
+      effects: [setMatch.of(null), EditorView.scrollIntoView(pos, { y: anchor === "bottom" ? "end" : "start" })],
       annotations: Transaction.addToHistory.of(false),
     });
 
