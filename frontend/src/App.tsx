@@ -4,6 +4,7 @@ import { QuarryEditor } from "./editor/QuarryEditor";
 import type { FileMetaData, StagingStateData, WindowStatus } from "./editor/QuarryEditor";
 import Tools from "./Tools";
 import CsvGrid from "./CsvGrid";
+import HexView from "./HexView";
 import "./quarry.css";
 
 interface Tab {
@@ -71,6 +72,7 @@ function App() {
   const [notice, setNotice] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
   const [gridView, setGridView] = useState(false);
+  const [hexView, setHexView] = useState(false);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -355,8 +357,11 @@ function App() {
             <button className="q-btn" title="Go to (Ctrl+G)" onClick={() => { setSearchOpen(false); setGotoOpen(true); }}>
               Go to
             </button>
+            <button className={"q-btn" + (hexView ? " q-btn-on" : "")} title="Hex view" onClick={() => setHexView((v) => { const n = !v; if (n) setGridView(false); return n; })}>
+              {hexView ? "Text" : "Hex"}
+            </button>
             {["csv", "tsv"].includes((activeTab?.meta.detected ?? "").toLowerCase()) && (
-              <button className={"q-btn" + (gridView ? " q-btn-on" : "")} title="Spreadsheet grid view" onClick={() => setGridView((v) => !v)}>
+              <button className={"q-btn" + (gridView ? " q-btn-on" : "")} title="Spreadsheet grid view" onClick={() => setGridView((v) => { const n = !v; if (n) setHexView(false); return n; })}>
                 {gridView ? "Text" : "Grid"}
               </button>
             )}
@@ -424,6 +429,10 @@ function App() {
 
         {gridView && activeTab && ["csv", "tsv"].includes(activeTab.meta.detected.toLowerCase()) && (
           <CsvGrid key={activeTab.fileId} fileId={activeTab.fileId} onError={setError} />
+        )}
+
+        {hexView && activeTab && (
+          <HexView key={activeTab.fileId} fileId={activeTab.fileId} onError={setError} />
         )}
 
         {searchOpen && hasFiles && (

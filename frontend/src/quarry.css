@@ -618,10 +618,27 @@ body {
 .q-ttable .q-tcol-n { flex: 1; }
 
 /* ---- CSV grid (spreadsheet view) ---- */
-.q-grid {
+.q-gridwrap {
   position: absolute;
   inset: 0;
   z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+
+.q-gridbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 5px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+.q-grid {
+  flex: 1;
+  min-height: 0;
   overflow: auto;
   background: var(--bg);
 }
@@ -663,4 +680,35 @@ body {
 
 .q-grid-table thead .q-grid-rownum {
   z-index: 3;
+}
+
+/* ---- hex view ---- */
+.q-hex {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  overflow: auto;
+  background: var(--bg);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.45;
+  padding: 6px 10px;
+  white-space: pre;
+}
+
+.q-hex-row {
+  display: flex;
+  gap: 18px;
+}
+
+.q-hex-off {
+  color: #4b87d6;
+}
+
+.q-hex-bytes {
+  color: var(--text);
+}
+
+.q-hex-ascii {
+  color: var(--muted);
 }
