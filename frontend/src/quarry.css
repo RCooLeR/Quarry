@@ -1,0 +1,113 @@
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+.q-app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  background: #12161c;
+  color: #cdd6e4;
+  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  overflow: hidden;
+}
+
+.q-top {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: #0d1117;
+  border-bottom: 1px solid #1f2630;
+}
+
+.q-brand {
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #4b87d6;
+}
+
+.q-path {
+  flex: 1;
+  padding: 6px 10px;
+  background: #12161c;
+  border: 1px solid #2a323f;
+  border-radius: 6px;
+  color: #cdd6e4;
+  font-family: "JetBrains Mono", Consolas, monospace;
+  font-size: 13px;
+  outline: none;
+}
+
+.q-path:focus {
+  border-color: #2f6fdc;
+}
+
+.q-open {
+  padding: 6px 16px;
+  background: #2f6fdc;
+  border: none;
+  border-radius: 6px;
+  color: white;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+.q-open:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+.q-error {
+  padding: 6px 12px;
+  background: #3a1d1d;
+  color: #ff9b9b;
+  font-family: monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
+
+.q-editor {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.q-editor .cm-editor {
+  height: 100%;
+}
+
+.q-status {
+  display: flex;
+  gap: 16px;
+  align-items: center;
+  padding: 4px 12px;
+  background: #0d1117;
+  border-top: 1px solid #1f2630;
+  font-size: 12px;
+  color: #8893a7;
+  font-family: "JetBrains Mono", Consolas, monospace;
+}
+
+.q-file {
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.q-edge {
+  color: #d6a14b;
+  font-weight: 600;
+}
+
+.q-hint {
+  color: #56627a;
+}
