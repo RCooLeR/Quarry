@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -164,6 +165,82 @@ func (s *FileService) CsvPreview(fileID string, delimiter string, hasHeader bool
 		return CsvPreviewResult{}, err
 	}
 	return CsvPreviewResult{Header: rep.Header, Rows: rep.Rows, Warnings: rep.Warnings}, nil
+}
+
+// ---- windowed grid (spreadsheet view) -----------------------------------
+
+type CsvGridResult struct {
+	StartByte int64      `json:"startByte"`
+	NextByte  int64      `json:"nextByte"`
+	StartRow  int64      `json:"startRow"` // approx global row of the first row
+	Rows      [][]string `json:"rows"`
+	Columns   int        `json:"columns"`
+	AtBof     bool       `json:"atBof"`
+	AtEof     bool       `json:"atEof"`
+}
+
+// GetCsvGrid parses a bounded, line-aligned byte window into CSV rows for the
+// grid view. Rows are returned as data (no header special-casing); the frontend
+// supplies column labels from the schema. Scrolling loads adjacent windows.
+func (s *FileService) GetCsvGrid(fileID string, delimiter string, startByte int64, maxBytes int) (CsvGridResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return CsvGridResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if maxBytes <= 0 {
+		maxBytes = 128 * 1024
+	}
+	size := f.Doc.Size()
+	readRange := func(a, b int64) ([]byte, error) { return f.Doc.ReadRange(a, b) }
+	if startByte < 0 {
+		startByte = 0
+	}
+	if startByte > size {
+		startByte = size
+	}
+	aligned, err := alignToLineStart(readRange, startByte, int64(maxBytes))
+	if err != nil {
+		return CsvGridResult{}, err
+	}
+	end := aligned + int64(maxBytes)
+	if end > size {
+		end = size
+	}
+	raw, err := readRange(aligned, end)
+	if err != nil {
+		return CsvGridResult{}, err
+	}
+	if end < size {
+		if nl := lastIndexByte(raw, '\n'); nl >= 0 {
+			raw = raw[:nl+1]
+			end = aligned + int64(nl+1)
+		}
+	}
+	rep, err := csv.PreviewRowsContext(context.Background(), bytes.NewReader(raw), csv.PreviewOptions{
+		Delimiter: delimiterRune(delimiter),
+		HasHeader: false,
+		MaxBytes:  int64(len(raw)),
+		MaxRows:   200000,
+	})
+	if err != nil {
+		return CsvGridResult{}, err
+	}
+	cols := 0
+	for _, r := range rep.Rows {
+		if len(r) > cols {
+			cols = len(r)
+		}
+	}
+	startRow, _ := f.Doc.ApproxOffsetToLine(aligned)
+	return CsvGridResult{
+		StartByte: aligned,
+		NextByte:  end,
+		StartRow:  startRow,
+		Rows:      rep.Rows,
+		Columns:   cols,
+		AtBof:     aligned == 0,
+		AtEof:     end >= size,
+	}, nil
 }
 
 // ---- transforms (stream to a chosen output file) ------------------------

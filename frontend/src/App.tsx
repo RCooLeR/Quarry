@@ -3,6 +3,7 @@ import { FileService } from "../bindings/github.com/quarry/quarry-wails3";
 import { QuarryEditor } from "./editor/QuarryEditor";
 import type { FileMetaData, StagingStateData, WindowStatus } from "./editor/QuarryEditor";
 import Tools from "./Tools";
+import CsvGrid from "./CsvGrid";
 import "./quarry.css";
 
 interface Tab {
@@ -69,6 +70,7 @@ function App() {
   const [stagedEdits, setStagedEdits] = useState<StagedEditData[]>([]);
   const [notice, setNotice] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
+  const [gridView, setGridView] = useState(false);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -353,6 +355,11 @@ function App() {
             <button className="q-btn" title="Go to (Ctrl+G)" onClick={() => { setSearchOpen(false); setGotoOpen(true); }}>
               Go to
             </button>
+            {["csv", "tsv"].includes((activeTab?.meta.detected ?? "").toLowerCase()) && (
+              <button className={"q-btn" + (gridView ? " q-btn-on" : "")} title="Spreadsheet grid view" onClick={() => setGridView((v) => !v)}>
+                {gridView ? "Text" : "Grid"}
+              </button>
+            )}
             {["csv", "tsv", "sql"].includes((activeTab?.meta.detected ?? "").toLowerCase()) && (
               <button className={"q-btn" + (toolsOpen ? " q-btn-on" : "")} title="CSV / SQL data tools" onClick={() => setToolsOpen((v) => !v)}>
                 Tools
@@ -414,6 +421,10 @@ function App() {
 
       <div className="q-stage">
         <div className="q-editor" ref={hostRef} />
+
+        {gridView && activeTab && ["csv", "tsv"].includes(activeTab.meta.detected.toLowerCase()) && (
+          <CsvGrid key={activeTab.fileId} fileId={activeTab.fileId} onError={setError} />
+        )}
 
         {searchOpen && hasFiles && (
           <div className="q-find">
