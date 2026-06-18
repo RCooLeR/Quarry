@@ -1,14 +1,14 @@
-// QuarryEditor wraps CodeMirror 6 as a *windowed* viewer over a file that may be
-// hundreds of GB. CodeMirror never holds the whole file: it holds one bounded
-// window (~1 MiB of decoded text) supplied by the Go FileService, and swaps to
-// the adjacent window when the user scrolls near an edge. Gutters show GLOBAL
-// byte offsets and line numbers, not the window-local 1..N.
+// QuarryEditor wraps CodeMirror 6 as a *windowed* viewer/editor over a file that
+// may be hundreds of GB. CodeMirror only ever holds one bounded window supplied
+// by the Go FileService; it swaps to the adjacent window on scroll. Gutters show
+// GLOBAL byte offsets and line numbers.
 //
-// Phase 0 is read-only: this proves the windowing substrate (open is instant,
-// memory is bounded, scroll loads the next/prev window atomically). Editing,
-// diff, and save come in later phases.
+// Read-only mode uses GetWindow (robust display for any encoding). Edit mode uses
+// GetEditWindow (byte-exact UTF-8 windows over the *edited* view) so changes are
+// visible across window swaps; edits are flushed into the Go staging session as
+// whole-window replacements on swap, on a debounce, and before save.
 
-import { EditorState, StateEffect, StateField, Transaction } from "@codemirror/state";
+import { Compartment, EditorState, StateEffect, StateField, Transaction } from "@codemirror/state";
 import {
   Decoration,
   DecorationSet,
@@ -22,27 +22,9 @@ import {
   highlightActiveLineGutter,
   keymap,
 } from "@codemirror/view";
-import { defaultKeymap } from "@codemirror/commands";
+import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { FileService } from "../../bindings/github.com/quarry/quarry-wails3";
 
-// Decoration for the current search match (a highlighted span).
-const setMatch = StateEffect.define<{ from: number; to: number } | null>();
-const matchMark = Decoration.mark({ class: "cm-search-match" });
-const matchField = StateField.define<DecorationSet>({
-  create: () => Decoration.none,
-  update(deco, tr) {
-    deco = deco.map(tr.changes);
-    for (const e of tr.effects) {
-      if (e.is(setMatch)) {
-        deco = e.value ? Decoration.set([matchMark.range(e.value.from, e.value.to)]) : Decoration.none;
-      }
-    }
-    return deco;
-  },
-  provide: (f) => EditorView.decorations.from(f),
-});
-
-// Mirrors the Go DTOs (kept local so we don't depend on generated model paths).
 export interface FileMetaData {
   fileId: string;
   path: string;
@@ -50,6 +32,7 @@ export interface FileMetaData {
   encoding: string;
   detected: string;
   binary: boolean;
+  editable: boolean;
 }
 
 export interface WindowData {
@@ -74,11 +57,30 @@ export interface WindowStatus {
   approx: boolean;
 }
 
-const WINDOW_BYTES = 1 << 20; // 1 MiB window budget
-const EDGE_THRESHOLD = 2000; // chars from a doc edge that trigger a window load
+export interface StagingStateData {
+  editCount: number;
+  originalSize: number;
+  editedSize: number;
+  netDelta: number;
+  lengthPreserving: boolean;
+  inPlaceEligible: boolean;
+}
 
-// Per-window coordinate arrays the gutters read. A shared mutable ref so the
-// gutter closures always see the current window after a swap.
+export interface EditorCallbacks {
+  onStatus: (s: WindowStatus | null) => void;
+  onDirty: (dirty: boolean) => void;
+  onStaging: (s: StagingStateData) => void;
+  onMode: (editing: boolean) => void;
+}
+
+const WINDOW_BYTES = 1 << 20;
+const EDGE_THRESHOLD = 2000;
+const FLUSH_DEBOUNCE_MS = 1200;
+const MAX_DOC = 4 << 20;
+
+const encoder = new TextEncoder();
+const utf8Len = (s: string) => encoder.encode(s).length;
+
 interface WinRef {
   lineOffsets: number[];
   lineNumbers: number[];
@@ -93,6 +95,22 @@ class ByteMarker extends GutterMarker {
   }
 }
 
+const setMatch = StateEffect.define<{ from: number; to: number } | null>();
+const matchMark = Decoration.mark({ class: "cm-search-match" });
+const matchField = StateField.define<DecorationSet>({
+  create: () => Decoration.none,
+  update(deco, tr) {
+    deco = deco.map(tr.changes);
+    for (const e of tr.effects) {
+      if (e.is(setMatch)) {
+        deco = e.value ? Decoration.set([matchMark.range(e.value.from, e.value.to)]) : Decoration.none;
+      }
+    }
+    return deco;
+  },
+  provide: (f) => EditorView.decorations.from(f),
+});
+
 const quarryTheme = EditorView.theme(
   {
     "&": { height: "100%", fontSize: "13px", color: "#cdd6e4", backgroundColor: "#12161c" },
@@ -106,13 +124,15 @@ const quarryTheme = EditorView.theme(
       outline: "1px solid rgba(63,204,218,0.8)",
       borderRadius: "2px",
     },
+    "&.cm-editing .cm-content": { caretColor: "#3fccda" },
   },
   { dark: true },
 );
 
 export class QuarryEditor {
   private view: EditorView;
-  private onStatus: (s: WindowStatus | null) => void;
+  private cb: EditorCallbacks;
+  private editableC = new Compartment();
 
   private fileId = "";
   private startByte = 0;
@@ -120,10 +140,17 @@ export class QuarryEditor {
   private atBof = true;
   private atEof = false;
   private busy = false;
+  private applying = false;
   private ref: WinRef = { lineOffsets: [], lineNumbers: [] };
 
-  constructor(parent: HTMLElement, onStatus: (s: WindowStatus | null) => void) {
-    this.onStatus = onStatus;
+  private editMode = false;
+  private dirty = false;
+  private editWinStart = 0;
+  private editWinOrigLen = 0;
+  private flushTimer: number | null = null;
+
+  constructor(parent: HTMLElement, cb: EditorCallbacks) {
+    this.cb = cb;
     const ref = this.ref;
     const self = this;
 
@@ -148,6 +175,9 @@ export class QuarryEditor {
     const edgeWatcher = ViewPlugin.fromClass(
       class {
         update(u: ViewUpdate) {
+          if (u.docChanged && self.editMode && !self.applying) {
+            self.markDirty();
+          }
           if (!u.viewportChanged) return;
           const len = u.state.doc.length;
           const vp = u.view.viewport;
@@ -165,10 +195,11 @@ export class QuarryEditor {
         matchField,
         highlightActiveLineGutter(),
         drawSelection(),
+        history(),
         EditorView.lineWrapping,
-        keymap.of(defaultKeymap),
-        EditorState.readOnly.of(true),
-        EditorView.editable.of(false),
+        keymap.of([...defaultKeymap, ...historyKeymap]),
+        EditorState.changeFilter.of((tr) => tr.newDoc.length <= MAX_DOC),
+        this.editableC.of([EditorState.readOnly.of(true), EditorView.editable.of(false)]),
         edgeWatcher,
         quarryTheme,
       ],
@@ -177,16 +208,19 @@ export class QuarryEditor {
     this.view = new EditorView({ state, parent });
   }
 
-  /** Open a path in Go, then show its first window. */
+  // ---- public API ---------------------------------------------------------
+
   async openPath(path: string): Promise<FileMetaData> {
     const meta = (await FileService.OpenFile(path)) as FileMetaData;
     await this.attach(meta.fileId, 0);
     return meta;
   }
 
-  /** Point the editor at an already-open file id and load a window at startByte. */
+  /** Switch to an already-open file (flushing the current one first). */
   async attach(fileId: string, startByte = 0): Promise<void> {
-    this.busy = true; // suppress edge-watcher during the swap
+    await this.flush();
+    this.setMode(false); // a freshly activated file starts read-only
+    this.busy = true;
     this.fileId = fileId;
     this.startByte = startByte;
     this.nextByte = startByte;
@@ -196,48 +230,76 @@ export class QuarryEditor {
     this.apply(w, "top");
   }
 
-  /** Detach from any file and show an empty document. */
   clear(): void {
+    this.cancelFlushTimer();
     this.fileId = "";
+    this.editMode = false;
+    this.dirty = false;
     this.busy = true;
+    this.applying = true;
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: "" },
+      effects: [setMatch.of(null)],
       annotations: Transaction.addToHistory.of(false),
     });
+    this.applying = false;
     this.ref.lineOffsets = [];
     this.ref.lineNumbers = [];
-    this.onStatus(null);
+    this.cb.onStatus(null);
     this.busy = false;
   }
 
-  /** Jump so the byte offset is at the top of the view (go-to). */
-  async gotoByte(byte: number): Promise<void> {
+  /** Turn editing on/off for the current file, reloading the window. */
+  async setEditMode(on: boolean): Promise<void> {
+    if (on === this.editMode) return;
+    if (!on) await this.flush();
+    this.setMode(on);
     if (!this.fileId) return;
-    await this.attach(this.fileId, Math.max(0, byte));
+    this.busy = true;
+    await this.loadAt(this.startByte, "top");
   }
 
-  /**
-   * Load a window containing a match (with a little context above it) and
-   * highlight/scroll to it. The authoritative offset comes from the Go search;
-   * we re-find the query in the loaded window to place the highlight at the
-   * right column without byte↔char conversion.
-   */
-  async showMatch(
-    offset: number,
-    length: number,
-    query: string,
-    regex: boolean,
-    caseSensitive: boolean,
-  ): Promise<void> {
+  /** Flush the current window's pending edits into the Go staging session. */
+  async flush(): Promise<void> {
+    this.cancelFlushTimer();
+    if (!this.editMode || !this.dirty || !this.fileId) return;
+    const text = this.view.state.doc.toString();
+    try {
+      const st = (await FileService.StageEdit(this.fileId, this.editWinStart, this.editWinOrigLen, text)) as StagingStateData;
+      this.editWinOrigLen = utf8Len(text);
+      this.dirty = false;
+      this.cb.onDirty(false);
+      this.cb.onStaging(st);
+      this.view.requestMeasure(); // nudge WebView2 to repaint after the React update
+    } catch (e) {
+      console.error("flush", e);
+    }
+  }
+
+  /** Reload the current window (e.g. after a save changed the file on disk). */
+  async refresh(): Promise<void> {
     if (!this.fileId) return;
-    const start = Math.max(0, offset - 256);
-    await this.attach(this.fileId, start);
+    this.busy = true;
+    await this.loadAt(this.startByte, "top");
+  }
+
+  async gotoByte(byte: number): Promise<void> {
+    if (!this.fileId) return;
+    await this.flush();
+    this.busy = true;
+    await this.loadAt(Math.max(0, byte), "top");
+  }
+
+  async showMatch(offset: number, length: number, query: string, regex: boolean, caseSensitive: boolean): Promise<void> {
+    if (!this.fileId) return;
+    await this.flush();
+    this.busy = true;
+    await this.loadAt(Math.max(0, offset - 256), "top");
 
     const text = this.view.state.doc.toString();
     const hint = Math.max(0, offset - this.startByte - 8);
     let from = -1;
     let len = length;
-
     if (regex) {
       try {
         const re = new RegExp(query, caseSensitive ? "g" : "gi");
@@ -248,7 +310,7 @@ export class QuarryEditor {
           len = m[0].length || length;
         }
       } catch {
-        /* invalid regex on the client — fall through to no highlight */
+        /* invalid client regex */
       }
     } else {
       const hay = caseSensitive ? text : text.toLowerCase();
@@ -257,7 +319,6 @@ export class QuarryEditor {
       if (from < 0) from = hay.indexOf(needle);
       len = query.length;
     }
-
     if (from >= 0) {
       const to = Math.min(text.length, from + len);
       this.view.dispatch({
@@ -267,15 +328,74 @@ export class QuarryEditor {
     }
   }
 
+  isEditing(): boolean {
+    return this.editMode;
+  }
+
   destroy(): void {
+    this.cancelFlushTimer();
     this.view.destroy();
+  }
+
+  // ---- internals ----------------------------------------------------------
+
+  private setMode(on: boolean): void {
+    if (this.editMode === on) {
+      this.view.dom.classList.toggle("cm-editing", on);
+      return;
+    }
+    this.editMode = on;
+    this.view.dispatch({
+      effects: this.editableC.reconfigure([EditorState.readOnly.of(!on), EditorView.editable.of(on)]),
+    });
+    this.view.dom.classList.toggle("cm-editing", on);
+    this.view.requestMeasure();
+    this.cb.onMode(on);
+  }
+
+  private markDirty(): void {
+    if (!this.dirty) {
+      this.dirty = true;
+      this.cb.onDirty(true);
+    }
+    this.scheduleFlush();
+  }
+
+  private scheduleFlush(): void {
+    this.cancelFlushTimer();
+    this.flushTimer = window.setTimeout(() => {
+      this.flushTimer = null;
+      void this.flush();
+    }, FLUSH_DEBOUNCE_MS);
+  }
+
+  private cancelFlushTimer(): void {
+    if (this.flushTimer != null) {
+      window.clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+  }
+
+  private async fetchWindow(startByte: number): Promise<WindowData> {
+    if (this.editMode) {
+      return (await FileService.GetEditWindow(this.fileId, startByte, WINDOW_BYTES)) as WindowData;
+    }
+    return (await FileService.GetWindow(this.fileId, startByte, WINDOW_BYTES)) as WindowData;
+  }
+
+  private async loadAt(startByte: number, anchor: "top" | "bottom"): Promise<void> {
+    const w = await this.fetchWindow(startByte);
+    this.apply(w, anchor);
   }
 
   private async loadNext(): Promise<void> {
     if (this.busy || this.atEof || !this.fileId) return;
     this.busy = true;
+    await this.flush();
     try {
-      const w = (await FileService.GetNextWindow(this.fileId, this.nextByte, WINDOW_BYTES)) as WindowData;
+      const w = this.editMode
+        ? ((await FileService.GetEditWindow(this.fileId, this.nextByte, WINDOW_BYTES)) as WindowData)
+        : ((await FileService.GetNextWindow(this.fileId, this.nextByte, WINDOW_BYTES)) as WindowData);
       this.apply(w, "top");
     } catch (e) {
       console.error("loadNext", e);
@@ -286,8 +406,11 @@ export class QuarryEditor {
   private async loadPrev(): Promise<void> {
     if (this.busy || this.atBof || !this.fileId) return;
     this.busy = true;
+    await this.flush();
     try {
-      const w = (await FileService.GetPrevWindow(this.fileId, this.startByte, WINDOW_BYTES)) as WindowData;
+      const w = this.editMode
+        ? ((await FileService.GetEditWindow(this.fileId, Math.max(0, this.startByte - WINDOW_BYTES), WINDOW_BYTES)) as WindowData)
+        : ((await FileService.GetPrevWindow(this.fileId, this.startByte, WINDOW_BYTES)) as WindowData);
       this.apply(w, "bottom");
     } catch (e) {
       console.error("loadPrev", e);
@@ -295,11 +418,6 @@ export class QuarryEditor {
     }
   }
 
-  // apply swaps the whole document for the new window in ONE transaction
-  // (changes + selection + scroll), which is the documented fix for the
-  // CodeMirror flash-to-line-1 bug. addToHistory:false keeps swaps off any undo
-  // stack. anchor decides which edge of the new window the viewport lands on so
-  // forward/backward scrolling reads continuously.
   private apply(w: WindowData, anchor: "top" | "bottom"): void {
     this.startByte = w.startByte;
     this.nextByte = w.nextByte;
@@ -307,19 +425,22 @@ export class QuarryEditor {
     this.atEof = w.atEof;
     this.ref.lineOffsets = w.lineOffsets;
     this.ref.lineNumbers = w.lineNumbers;
+    this.editWinStart = w.startByte;
+    this.editWinOrigLen = utf8Len(w.text);
+    this.dirty = false;
 
     const doc = w.text;
     const pos = anchor === "bottom" ? doc.length : 0;
+    this.applying = true;
     this.view.dispatch({
       changes: { from: 0, to: this.view.state.doc.length, insert: doc },
       selection: { anchor: pos },
       effects: [setMatch.of(null), EditorView.scrollIntoView(pos, { y: anchor === "bottom" ? "end" : "start" })],
       annotations: Transaction.addToHistory.of(false),
     });
+    this.applying = false;
 
     this.emitStatus(w);
-    // Clear the busy flag after the swap-induced update settles, so the swap
-    // itself can't immediately re-trigger an opposite-edge load.
     setTimeout(() => {
       this.busy = false;
     }, 80);
@@ -327,7 +448,7 @@ export class QuarryEditor {
 
   private emitStatus(w: WindowData): void {
     const nums = w.lineNumbers;
-    this.onStatus({
+    this.cb.onStatus({
       startByte: w.startByte,
       endByte: w.nextByte,
       firstLine: nums[0] ?? 0,

@@ -1,13 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { FileService } from "../bindings/github.com/quarry/quarry-wails3";
 import { QuarryEditor } from "./editor/QuarryEditor";
-import type { FileMetaData, WindowStatus } from "./editor/QuarryEditor";
+import type { FileMetaData, StagingStateData, WindowStatus } from "./editor/QuarryEditor";
 import "./quarry.css";
 
 interface Tab {
   fileId: string;
   meta: FileMetaData;
-  startByte: number; // last window start, so re-activating returns you here
+  startByte: number;
+}
+
+interface StagedEditData {
+  start: number;
+  end: number;
+  line: number;
+  old: string;
+  new: string;
 }
 
 function fmtBytes(n: number): string {
@@ -27,6 +35,10 @@ function baseName(p: string): string {
   return i >= 0 ? p.slice(i + 1) : p;
 }
 
+function snippet(s: string): string {
+  return s.replace(/\n/g, "⏎").slice(0, 120);
+}
+
 function App() {
   const hostRef = useRef<HTMLDivElement>(null);
   const editorRef = useRef<QuarryEditor | null>(null);
@@ -38,7 +50,6 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [path, setPath] = useState("");
 
-  // search + navigation state
   const [searchOpen, setSearchOpen] = useState(false);
   const [gotoOpen, setGotoOpen] = useState(false);
   const [query, setQuery] = useState("");
@@ -50,7 +61,13 @@ function App() {
   const [gotoValue, setGotoValue] = useState("");
   const lastMatch = useRef<number | null>(null);
 
-  // Refs mirror state so the editor's status callback isn't stale.
+  const [editMode, setEditMode] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [staging, setStaging] = useState<StagingStateData | null>(null);
+  const [diffOpen, setDiffOpen] = useState(false);
+  const [stagedEdits, setStagedEdits] = useState<StagedEditData[]>([]);
+  const [notice, setNotice] = useState("");
+
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
   activeIdRef.current = activeId;
@@ -58,12 +75,11 @@ function App() {
 
   useEffect(() => {
     if (!hostRef.current) return;
-    const ed = new QuarryEditor(hostRef.current, (s) => {
-      setStatus(s);
-      if (s) {
-        const t = tabsRef.current.find((t) => t.fileId === activeIdRef.current);
-        if (t) t.startByte = s.startByte;
-      }
+    const ed = new QuarryEditor(hostRef.current, {
+      onStatus: setStatus,
+      onDirty: setDirty,
+      onStaging: (s) => setStaging(s),
+      onMode: (on) => setEditMode(on),
     });
     editorRef.current = ed;
     const onKey = (e: KeyboardEvent) => {
@@ -93,8 +109,27 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  const refreshStaging = async (fileId: string) => {
+    try {
+      const s = (await FileService.GetStagingState(fileId)) as StagingStateData;
+      setStaging(s);
+      if (diffOpen) await loadDiff(fileId);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  const loadDiff = async (fileId: string) => {
+    try {
+      const edits = (await FileService.GetStagedEdits(fileId)) as StagedEditData[] | null;
+      setStagedEdits(edits ?? []);
+    } catch {
+      setStagedEdits([]);
+    }
+  };
+
   const showMeta = async (meta: FileMetaData) => {
-    if (!meta.fileId) return; // cancelled dialog
+    if (!meta.fileId) return;
     const ed = editorRef.current;
     if (!ed) return;
     if (tabsRef.current.some((t) => t.fileId === meta.fileId)) {
@@ -108,6 +143,7 @@ function App() {
     activeIdRef.current = meta.fileId;
     lastMatch.current = null;
     await ed.attach(meta.fileId, 0);
+    await refreshStaging(meta.fileId);
   };
 
   const openViaDialog = async () => {
@@ -147,6 +183,7 @@ function App() {
     activeIdRef.current = fileId;
     lastMatch.current = null;
     await ed.attach(fileId, t.startByte);
+    await refreshStaging(fileId);
   };
 
   const closeTab = async (fileId: string, e?: React.MouseEvent) => {
@@ -164,14 +201,12 @@ function App() {
         activeIdRef.current = null;
         editorRef.current?.clear();
         setStatus(null);
+        setStaging(null);
       }
     }
   };
 
-  const resetSearch = () => {
-    lastMatch.current = null;
-  };
-
+  // ---- search / goto ----
   const runFind = async (dir: "next" | "prev") => {
     const q = query;
     const id = activeIdRef.current;
@@ -190,7 +225,7 @@ function App() {
         hit = await FileService.FindPrev(id, q, before, regex, caseSensitive, wholeWord);
       }
       if (hit.timedOut) {
-        setSearchInfo("Timed out — try a narrower query");
+        setSearchInfo("Timed out — narrow the query");
         return;
       }
       if (!hit.found) {
@@ -212,11 +247,8 @@ function App() {
     const id = activeIdRef.current;
     if (!v || !id) return;
     let offset: number | null = null;
-    if (/^0x[0-9a-f]+$/i.test(v)) {
-      offset = parseInt(v.slice(2), 16);
-    } else if (/^\d+$/.test(v)) {
-      offset = await FileService.ResolveLine(id, parseInt(v, 10));
-    }
+    if (/^0x[0-9a-f]+$/i.test(v)) offset = parseInt(v.slice(2), 16);
+    else if (/^\d+$/.test(v)) offset = await FileService.ResolveLine(id, parseInt(v, 10));
     if (offset == null || Number.isNaN(offset)) {
       setSearchInfo("Enter a line number or 0xHEX offset");
       return;
@@ -226,8 +258,82 @@ function App() {
     setGotoOpen(false);
   };
 
+  // ---- editing / save ----
+  const toggleEdit = async () => {
+    const ed = editorRef.current;
+    const id = activeIdRef.current;
+    if (!ed || !id) return;
+    setNotice("");
+    await ed.setEditMode(!editMode);
+    await refreshStaging(id);
+  };
+
+  const toggleDiff = async () => {
+    const id = activeIdRef.current;
+    const next = !diffOpen;
+    setDiffOpen(next);
+    if (next && id) await loadDiff(id);
+  };
+
+  const discardEdits = async () => {
+    const ed = editorRef.current;
+    const id = activeIdRef.current;
+    if (!ed || !id) return;
+    try {
+      const s = (await FileService.DiscardEdits(id)) as StagingStateData;
+      setStaging(s);
+      setStagedEdits([]);
+      await ed.refresh();
+      setNotice("Edits discarded");
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    }
+  };
+
+  const saveInPlace = async () => {
+    const ed = editorRef.current;
+    const id = activeIdRef.current;
+    if (!ed || !id) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      await ed.flush();
+      const r = await FileService.SavePatch(id);
+      await ed.setEditMode(false);
+      await ed.refresh();
+      await refreshStaging(id);
+      setNotice(`Patched in place — ${fmtBytes(r.bytesWritten)} written`);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveCopy = async () => {
+    const ed = editorRef.current;
+    const id = activeIdRef.current;
+    if (!ed || !id) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      await ed.flush();
+      const r = await FileService.SaveCopyViaDialog(id);
+      if (r.mode === "copy") {
+        setNotice(`Saved copy → ${r.outputPath} (${fmtBytes(r.bytesWritten)})`);
+        await refreshStaging(id);
+      }
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const hasFiles = tabs.length > 0;
   const activeTab = tabs.find((t) => t.fileId === activeId);
+  const editCount = staging?.editCount ?? 0;
+  const hasEdits = editCount > 0 || dirty;
 
   return (
     <div className="q-app">
@@ -242,13 +348,39 @@ function App() {
             <button className="q-btn" title="Find (Ctrl+F)" onClick={() => { setGotoOpen(false); setSearchOpen(true); }}>
               Find
             </button>
-            <button className="q-btn" title="Go to line / offset (Ctrl+G)" onClick={() => { setSearchOpen(false); setGotoOpen(true); }}>
+            <button className="q-btn" title="Go to (Ctrl+G)" onClick={() => { setSearchOpen(false); setGotoOpen(true); }}>
               Go to
             </button>
+            {activeTab?.meta.editable && (
+              <button className={"q-btn" + (editMode ? " q-btn-on" : "")} title="Toggle editing" onClick={() => void toggleEdit()}>
+                {editMode ? "Editing" : "Edit"}
+              </button>
+            )}
+            {hasEdits && (
+              <>
+                <button className={"q-btn" + (diffOpen ? " q-btn-on" : "")} onClick={() => void toggleDiff()}>
+                  Diff ({editCount})
+                </button>
+                <button className="q-btn" title="Discard all staged edits" onClick={() => void discardEdits()}>
+                  Discard
+                </button>
+                <button
+                  className="q-btn q-btn-primary"
+                  disabled={busy || !staging?.inPlaceEligible}
+                  title={staging?.inPlaceEligible ? "Overwrite changed bytes in place (with backup)" : "Length changed — use Save copy"}
+                  onClick={() => void saveInPlace()}
+                >
+                  Patch in place
+                </button>
+                <button className="q-btn q-btn-primary" disabled={busy} title="Stream a full edited copy to a new file" onClick={() => void saveCopy()}>
+                  Save copy…
+                </button>
+              </>
+            )}
           </>
         )}
         <button className="q-btn q-btn-primary" onClick={() => void openViaDialog()} disabled={busy}>
-          {busy ? "Opening…" : "Open file"}
+          {busy ? "Working…" : "Open file"}
         </button>
       </header>
 
@@ -271,6 +403,7 @@ function App() {
       )}
 
       {error && <div className="q-error">{error}</div>}
+      {notice && <div className="q-notice">{notice}</div>}
 
       <div className="q-stage">
         <div className="q-editor" ref={hostRef} />
@@ -283,38 +416,19 @@ function App() {
               placeholder="Find…"
               value={query}
               spellCheck={false}
-              onChange={(e) => {
-                setQuery(e.target.value);
-                resetSearch();
-              }}
+              onChange={(e) => { setQuery(e.target.value); lastMatch.current = null; }}
               onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void runFind(e.shiftKey ? "prev" : "next");
-                } else if (e.key === "Escape") {
-                  setSearchOpen(false);
-                }
+                if (e.key === "Enter") { e.preventDefault(); void runFind(e.shiftKey ? "prev" : "next"); }
+                else if (e.key === "Escape") setSearchOpen(false);
               }}
             />
-            <button className={"q-toggle" + (caseSensitive ? " on" : "")} title="Match case" onClick={() => { setCaseSensitive((v) => !v); resetSearch(); }}>
-              Aa
-            </button>
-            <button className={"q-toggle" + (wholeWord ? " on" : "")} title="Whole word" onClick={() => { setWholeWord((v) => !v); resetSearch(); }}>
-              W
-            </button>
-            <button className={"q-toggle" + (regex ? " on" : "")} title="Regular expression" onClick={() => { setRegex((v) => !v); resetSearch(); }}>
-              .*
-            </button>
-            <button className="q-icon" title="Previous (Shift+Enter)" disabled={searching} onClick={() => void runFind("prev")}>
-              ↑
-            </button>
-            <button className="q-icon" title="Next (Enter)" disabled={searching} onClick={() => void runFind("next")}>
-              ↓
-            </button>
+            <button className={"q-toggle" + (caseSensitive ? " on" : "")} title="Match case" onClick={() => { setCaseSensitive((v) => !v); lastMatch.current = null; }}>Aa</button>
+            <button className={"q-toggle" + (wholeWord ? " on" : "")} title="Whole word" onClick={() => { setWholeWord((v) => !v); lastMatch.current = null; }}>W</button>
+            <button className={"q-toggle" + (regex ? " on" : "")} title="Regex" onClick={() => { setRegex((v) => !v); lastMatch.current = null; }}>.*</button>
+            <button className="q-icon" title="Previous (Shift+Enter)" disabled={searching} onClick={() => void runFind("prev")}>↑</button>
+            <button className="q-icon" title="Next (Enter)" disabled={searching} onClick={() => void runFind("next")}>↓</button>
             <span className="q-find-info">{searchInfo}</span>
-            <button className="q-icon" title="Close (Esc)" onClick={() => setSearchOpen(false)}>
-              ×
-            </button>
+            <button className="q-icon" title="Close (Esc)" onClick={() => setSearchOpen(false)}>×</button>
           </div>
         )}
 
@@ -328,20 +442,34 @@ function App() {
               spellCheck={false}
               onChange={(e) => setGotoValue(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  e.preventDefault();
-                  void doGoto();
-                } else if (e.key === "Escape") {
-                  setGotoOpen(false);
-                }
+                if (e.key === "Enter") { e.preventDefault(); void doGoto(); }
+                else if (e.key === "Escape") setGotoOpen(false);
               }}
             />
-            <button className="q-icon" title="Go" onClick={() => void doGoto()}>
-              Go
-            </button>
-            <button className="q-icon" title="Close (Esc)" onClick={() => setGotoOpen(false)}>
-              ×
-            </button>
+            <button className="q-icon" onClick={() => void doGoto()}>Go</button>
+            <button className="q-icon" onClick={() => setGotoOpen(false)}>×</button>
+          </div>
+        )}
+
+        {diffOpen && hasFiles && (
+          <div className="q-diff">
+            <div className="q-diff-head">
+              <span>Staged edits ({stagedEdits.length})</span>
+              <button className="q-icon" onClick={() => setDiffOpen(false)}>×</button>
+            </div>
+            <div className="q-diff-body">
+              {stagedEdits.length === 0 ? (
+                <div className="q-diff-empty">No staged edits yet. Turn on Edit and change the text.</div>
+              ) : (
+                stagedEdits.map((e, i) => (
+                  <div className="q-diff-item" key={i}>
+                    <div className="q-diff-loc">line ~{e.line} · 0x{e.start.toString(16)}</div>
+                    <div className="q-diff-old">- {snippet(e.old)}</div>
+                    <div className="q-diff-new">+ {snippet(e.new)}</div>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         )}
 
@@ -375,21 +503,20 @@ function App() {
       <footer className="q-status">
         {status && activeTab ? (
           <>
-            <span className="q-file" title={activeTab.meta.path}>
-              {activeTab.meta.path}
-            </span>
+            <span className="q-file" title={activeTab.meta.path}>{activeTab.meta.path}</span>
             <span className="q-sep" />
             <span>{fmtBytes(activeTab.meta.size)}</span>
             <span>{activeTab.meta.encoding || "?"}</span>
             <span>{activeTab.meta.detected || "plain"}</span>
             <span className="q-spacer" />
-            <span>
-              0x{status.startByte.toString(16)}–0x{status.endByte.toString(16)}
-            </span>
-            <span>
-              lines {status.firstLine}–{status.lastLine}
-              {status.approx ? " ~" : ""}
-            </span>
+            {editMode && <span className="q-edit-flag">{dirty ? "● editing" : "editing"}</span>}
+            {hasEdits && (
+              <span className="q-edit-flag">
+                {editCount} staged{staging && !staging.inPlaceEligible ? " · len±" + staging.netDelta : ""}
+              </span>
+            )}
+            <span>0x{status.startByte.toString(16)}–0x{status.endByte.toString(16)}</span>
+            <span>lines {status.firstLine}–{status.lastLine}{status.approx ? " ~" : ""}</span>
             {status.atBof && <span className="q-edge">BOF</span>}
             {status.atEof && <span className="q-edge">EOF</span>}
           </>

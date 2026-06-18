@@ -393,3 +393,89 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* ---- editing ---- */
+.q-btn-on {
+  border-color: var(--accent);
+  color: var(--accent-hover);
+  background: rgba(43, 182, 196, 0.15);
+}
+
+.q-notice {
+  padding: 6px 12px;
+  background: #14262a;
+  color: var(--accent-hover);
+  font-family: var(--mono);
+  font-size: 12px;
+  border-bottom: 1px solid #1c3a40;
+}
+
+.q-edit-flag {
+  color: var(--accent-hover);
+  font-weight: 600;
+}
+
+/* ---- diff panel ---- */
+.q-diff {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 380px;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 24px rgba(0, 0, 0, 0.35);
+}
+
+.q-diff-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.q-diff-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+}
+
+.q-diff-empty {
+  padding: 16px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+
+.q-diff-item {
+  margin: 4px 2px;
+  padding: 6px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+
+.q-diff-loc {
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.q-diff-old {
+  color: #e88;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.q-diff-new {
+  color: #8d8;
+  white-space: pre-wrap;
+  word-break: break-all;
+}

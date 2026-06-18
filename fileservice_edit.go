@@ -6,10 +6,81 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/wailsapp/wails/v3/pkg/application"
+
 	"github.com/quarry/quarry-wails3/internal/inplace"
 	"github.com/quarry/quarry-wails3/internal/manualedit"
 	"github.com/quarry/quarry-wails3/internal/session"
 )
+
+// StagedEdit is one pending edit, anchored to the original source, with short
+// before/after previews for the diff panel.
+type StagedEdit struct {
+	Start int64  `json:"start"`
+	End   int64  `json:"end"`
+	Line  int64  `json:"line"`
+	Old   string `json:"old"`
+	New   string `json:"new"`
+}
+
+const stagedPreviewBytes = 240
+
+// GetStagedEdits returns the pending edits (source-anchored) for the diff panel.
+func (s *FileService) GetStagedEdits(fileID string) ([]StagedEdit, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return nil, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if f.Edit == nil || !f.Edit.HasEdits() {
+		return nil, nil
+	}
+	edits := f.Edit.SourceMappedActiveEdits()
+	out := make([]StagedEdit, 0, len(edits))
+	for _, e := range edits {
+		oldEnd := e.End
+		if oldEnd > e.Start+stagedPreviewBytes {
+			oldEnd = e.Start + stagedPreviewBytes
+		}
+		oldBytes, err := f.Doc.ReadRange(e.Start, oldEnd)
+		if err != nil {
+			return nil, err
+		}
+		line, _ := f.Doc.ApproxOffsetToLine(e.Start)
+		out = append(out, StagedEdit{
+			Start: e.Start,
+			End:   e.End,
+			Line:  line,
+			Old:   string(oldBytes),
+			New:   truncateBytes(e.Text, stagedPreviewBytes),
+		})
+	}
+	return out, nil
+}
+
+// SaveCopyViaDialog shows a native save dialog and writes the edited copy there.
+// A cancelled dialog returns an empty SaveResult (Mode == "") with nil error.
+func (s *FileService) SaveCopyViaDialog(fileID string) (SaveResult, error) {
+	if _, ok := s.reg.Get(fileID); !ok {
+		return SaveResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	dst, err := application.Get().Dialog.SaveFile().
+		SetMessage("Save edited copy as").
+		PromptForSingleSelection()
+	if err != nil {
+		return SaveResult{}, err
+	}
+	if strings.TrimSpace(dst) == "" {
+		return SaveResult{}, nil // cancelled
+	}
+	return s.SaveCopy(fileID, dst)
+}
+
+func truncateBytes(b []byte, max int) string {
+	if len(b) > max {
+		return string(b[:max])
+	}
+	return string(b)
+}
 
 const editWindowBytes = 1 << 20 // 1 MiB editable window budget
 
@@ -134,15 +205,40 @@ func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int
 	}, nil
 }
 
-// StageEdit replaces the transformed byte range [startByte, startByte+origLen)
-// with newText, recording it in the file's staging session.
+// StageEdit reconciles the window [startByte, startByte+origLen) with newText.
+// It trims the common prefix/suffix so only the genuinely changed bytes are
+// staged — keeping the diff granular and in-place patches minimal.
 func (s *FileService) StageEdit(fileID string, startByte int64, origLen int64, newText string) (StagingState, error) {
 	f, ok := s.reg.Get(fileID)
 	if !ok {
 		return StagingState{}, fmt.Errorf("unknown file id %q", fileID)
 	}
 	sess := f.EditSession()
-	if err := sess.ApplyEdit(manualedit.Edit{Start: startByte, End: startByte + origLen, Text: []byte(newText)}); err != nil {
+	oldBytes, err := sess.ReadRange(f.Doc, startByte, startByte+origLen)
+	if err != nil {
+		return StagingState{}, err
+	}
+	newBytes := []byte(newText)
+
+	// Common prefix.
+	pre := 0
+	for pre < len(oldBytes) && pre < len(newBytes) && oldBytes[pre] == newBytes[pre] {
+		pre++
+	}
+	// Common suffix (not overlapping the prefix).
+	suf := 0
+	for suf < len(oldBytes)-pre && suf < len(newBytes)-pre &&
+		oldBytes[len(oldBytes)-1-suf] == newBytes[len(newBytes)-1-suf] {
+		suf++
+	}
+
+	editStart := startByte + int64(pre)
+	editEnd := startByte + int64(len(oldBytes)-suf)
+	editText := newBytes[pre : len(newBytes)-suf]
+	if editEnd == editStart && len(editText) == 0 {
+		return stagingState(f), nil // no net change
+	}
+	if err := sess.ApplyEdit(manualedit.Edit{Start: editStart, End: editEnd, Text: editText}); err != nil {
 		return StagingState{}, err
 	}
 	return stagingState(f), nil
