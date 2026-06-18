@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 
 	"github.com/quarry/quarry-wails3/internal/document"
+	sqlanalyze "github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
 	"github.com/quarry/quarry-wails3/internal/search"
 	"github.com/quarry/quarry-wails3/internal/session"
 )
@@ -29,11 +31,17 @@ const defaultWindowBytes = 1 << 20 // 1 MiB
 // bridge — only bounded, line-aligned windows do.
 type FileService struct {
 	reg *session.Registry
+
+	sqlMu      sync.Mutex
+	sqlSummary map[string]sqlanalyze.Summary // cached SQL dump analysis per file id
 }
 
 // NewFileService constructs the service with an empty session registry.
 func NewFileService() *FileService {
-	return &FileService{reg: session.New()}
+	return &FileService{
+		reg:        session.New(),
+		sqlSummary: make(map[string]sqlanalyze.Summary),
+	}
 }
 
 // FileMeta describes a freshly opened file.

@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { FileService } from "../bindings/github.com/quarry/quarry-wails3";
 import { QuarryEditor } from "./editor/QuarryEditor";
 import type { FileMetaData, StagingStateData, WindowStatus } from "./editor/QuarryEditor";
+import Tools from "./Tools";
 import "./quarry.css";
 
 interface Tab {
@@ -67,6 +68,7 @@ function App() {
   const [diffOpen, setDiffOpen] = useState(false);
   const [stagedEdits, setStagedEdits] = useState<StagedEditData[]>([]);
   const [notice, setNotice] = useState("");
+  const [toolsOpen, setToolsOpen] = useState(false);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -351,6 +353,11 @@ function App() {
             <button className="q-btn" title="Go to (Ctrl+G)" onClick={() => { setSearchOpen(false); setGotoOpen(true); }}>
               Go to
             </button>
+            {["csv", "tsv", "sql"].includes((activeTab?.meta.detected ?? "").toLowerCase()) && (
+              <button className={"q-btn" + (toolsOpen ? " q-btn-on" : "")} title="CSV / SQL data tools" onClick={() => setToolsOpen((v) => !v)}>
+                Tools
+              </button>
+            )}
             {activeTab?.meta.editable && (
               <button className={"q-btn" + (editMode ? " q-btn-on" : "")} title="Toggle editing" onClick={() => void toggleEdit()}>
                 {editMode ? "Editing" : "Edit"}
@@ -471,6 +478,17 @@ function App() {
               )}
             </div>
           </div>
+        )}
+
+        {toolsOpen && activeTab && (
+          <Tools
+            key={activeTab.fileId}
+            fileId={activeTab.fileId}
+            detected={activeTab.meta.detected}
+            onNotice={setNotice}
+            onError={setError}
+            onClose={() => setToolsOpen(false)}
+          />
         )}
 
         {!hasFiles && (
