@@ -5,6 +5,7 @@ import type { FileMetaData, StagingStateData, WindowStatus } from "./editor/Quar
 import Tools from "./Tools";
 import CsvGrid from "./CsvGrid";
 import HexView from "./HexView";
+import DiffView from "./DiffView";
 import "./quarry.css";
 
 interface Tab {
@@ -68,6 +69,7 @@ function App() {
   const [dirty, setDirty] = useState(false);
   const [staging, setStaging] = useState<StagingStateData | null>(null);
   const [diffOpen, setDiffOpen] = useState(false);
+  const [diffMode, setDiffMode] = useState<"list" | "side">("list");
   const [stagedEdits, setStagedEdits] = useState<StagedEditData[]>([]);
   const [notice, setNotice] = useState("");
   const [toolsOpen, setToolsOpen] = useState(false);
@@ -479,24 +481,31 @@ function App() {
         )}
 
         {diffOpen && hasFiles && (
-          <div className="q-diff">
+          <div className={"q-diff" + (diffMode === "side" ? " q-diff-wide" : "")}>
             <div className="q-diff-head">
               <span>Staged edits ({stagedEdits.length})</span>
+              <span className="q-spacer" />
+              <button className={"q-toggle" + (diffMode === "list" ? " on" : "")} onClick={() => setDiffMode("list")}>List</button>
+              <button className={"q-toggle" + (diffMode === "side" ? " on" : "")} onClick={() => setDiffMode("side")}>Side</button>
               <button className="q-icon" onClick={() => setDiffOpen(false)}>×</button>
             </div>
-            <div className="q-diff-body">
-              {stagedEdits.length === 0 ? (
-                <div className="q-diff-empty">No staged edits yet. Turn on Edit and change the text.</div>
-              ) : (
-                stagedEdits.map((e, i) => (
-                  <div className="q-diff-item" key={i}>
-                    <div className="q-diff-loc">line ~{e.line} · 0x{e.start.toString(16)}</div>
-                    <div className="q-diff-old">- {snippet(e.old)}</div>
-                    <div className="q-diff-new">+ {snippet(e.new)}</div>
-                  </div>
-                ))
-              )}
-            </div>
+            {diffMode === "side" ? (
+              <DiffView key={(activeId ?? "") + ":" + (status?.startByte ?? 0)} fileId={activeId ?? ""} startByte={status?.startByte ?? 0} />
+            ) : (
+              <div className="q-diff-body">
+                {stagedEdits.length === 0 ? (
+                  <div className="q-diff-empty">No staged edits yet. Turn on Edit and change the text.</div>
+                ) : (
+                  stagedEdits.map((e, i) => (
+                    <div className="q-diff-item" key={i}>
+                      <div className="q-diff-loc">line ~{e.line} · 0x{e.start.toString(16)}</div>
+                      <div className="q-diff-old">- {snippet(e.old)}</div>
+                      <div className="q-diff-new">+ {snippet(e.new)}</div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
           </div>
         )}
 

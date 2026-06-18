@@ -480,6 +480,25 @@ body {
   word-break: break-all;
 }
 
+.q-diff-wide {
+  width: 760px;
+}
+
+.q-merge {
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.q-merge .cm-mergeView,
+.q-merge .cm-mergeViewEditors {
+  height: 100%;
+}
+
+.q-merge .cm-editor {
+  height: 100%;
+}
+
 /* ---- tools panel ---- */
 .q-tools {
   position: absolute;

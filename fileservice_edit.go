@@ -205,6 +205,86 @@ func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int
 	}, nil
 }
 
+// DiffWindow holds the original vs edited text for a window, for side-by-side
+// review. (Offsets align exactly for length-preserving edits; for
+// length-changing edits the diff is still computed but may show a tail.)
+type DiffWindow struct {
+	StartByte int64  `json:"startByte"`
+	NextByte  int64  `json:"nextByte"`
+	Original  string `json:"original"`
+	Edited    string `json:"edited"`
+	AtBOF     bool   `json:"atBof"`
+	AtEOF     bool   `json:"atEof"`
+}
+
+// GetDiffWindow returns the edited and original text for a line-aligned window,
+// for the side-by-side diff view.
+func (s *FileService) GetDiffWindow(fileID string, startByte int64, maxBytes int) (DiffWindow, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return DiffWindow{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if maxBytes <= 0 {
+		maxBytes = editWindowBytes
+	}
+	var size int64
+	var editedRange func(a, b int64) ([]byte, error)
+	if f.Edit != nil && f.Edit.HasEdits() {
+		sess := f.Edit
+		size = sess.Size()
+		editedRange = func(a, b int64) ([]byte, error) { return sess.ReadRange(f.Doc, a, b) }
+	} else {
+		size = f.Doc.Size()
+		editedRange = func(a, b int64) ([]byte, error) { return f.Doc.ReadRange(a, b) }
+	}
+	if startByte < 0 {
+		startByte = 0
+	}
+	if startByte > size {
+		startByte = size
+	}
+	aligned, err := alignToLineStart(editedRange, startByte, int64(maxBytes))
+	if err != nil {
+		return DiffWindow{}, err
+	}
+	end := aligned + int64(maxBytes)
+	if end > size {
+		end = size
+	}
+	ed, err := editedRange(aligned, end)
+	if err != nil {
+		return DiffWindow{}, err
+	}
+	if end < size {
+		if nl := lastIndexByte(ed, '\n'); nl >= 0 {
+			ed = ed[:nl+1]
+			end = aligned + int64(nl+1)
+		}
+	}
+	docSize := f.Doc.Size()
+	oStart, oEnd := aligned, end
+	if oStart > docSize {
+		oStart = docSize
+	}
+	if oEnd > docSize {
+		oEnd = docSize
+	}
+	var orig []byte
+	if oEnd > oStart {
+		if orig, err = f.Doc.ReadRange(oStart, oEnd); err != nil {
+			return DiffWindow{}, err
+		}
+	}
+	return DiffWindow{
+		StartByte: aligned,
+		NextByte:  end,
+		Original:  string(orig),
+		Edited:    string(ed),
+		AtBOF:     aligned == 0,
+		AtEOF:     end >= size,
+	}, nil
+}
+
 // StageEdit reconciles the window [startByte, startByte+origLen) with newText.
 // It trims the common prefix/suffix so only the genuinely changed bytes are
 // staged — keeping the diff granular and in-place patches minimal.
