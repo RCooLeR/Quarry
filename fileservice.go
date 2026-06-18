@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/wailsapp/wails/v3/pkg/application"
+
 	"github.com/quarry/quarry-wails3/internal/document"
 	"github.com/quarry/quarry-wails3/internal/session"
 )
@@ -48,6 +50,24 @@ type Window struct {
 	AtBOF       bool    `json:"atBof"`
 	AtEOF       bool    `json:"atEof"`
 	Approx      bool    `json:"approx"` // line numbers are approximate (index not ready)
+}
+
+// OpenViaDialog shows a native open-file dialog and opens the chosen file. A
+// cancelled dialog returns an empty FileMeta (FileID == "") with a nil error.
+func (s *FileService) OpenViaDialog() (FileMeta, error) {
+	path, err := application.Get().Dialog.OpenFile().
+		CanChooseFiles(true).
+		SetTitle("Open file in Quarry").
+		AddFilter("Data & dumps (*.sql, *.csv, *.tsv, *.log, *.txt, *.json)", "*.sql;*.csv;*.tsv;*.log;*.txt;*.json").
+		AddFilter("All files (*.*)", "*.*").
+		PromptForSingleSelection()
+	if err != nil {
+		return FileMeta{}, err
+	}
+	if strings.TrimSpace(path) == "" {
+		return FileMeta{}, nil // cancelled
+	}
+	return s.OpenFile(path)
 }
 
 // OpenFile opens path, starts background indexing, and returns its metadata.

@@ -1,82 +1,200 @@
 :root {
   color-scheme: dark;
+  --bg: #0e1217;
+  --panel: #0b0f14;
+  --panel-2: #131a22;
+  --border: #1e2630;
+  --text: #cdd6e4;
+  --muted: #707d91;
+  --accent: #2bb6c4;
+  --accent-hover: #3fccda;
+  --accent-press: #1f99a6;
+  --danger: #ff9b9b;
+  --mono: "JetBrains Mono", "Cascadia Code", Consolas, monospace;
+  --ui: -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
 }
 
 html,
 body,
 #root {
   height: 100%;
+  width: 100%;
   margin: 0;
+}
+
+body {
+  background: var(--bg);
 }
 
 .q-app {
   display: flex;
   flex-direction: column;
   height: 100vh;
-  background: #12161c;
-  color: #cdd6e4;
-  font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--ui);
   overflow: hidden;
+  user-select: none;
 }
 
+/* ---- top bar ---- */
 .q-top {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 12px;
   padding: 8px 12px;
-  background: #0d1117;
-  border-bottom: 1px solid #1f2630;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+}
+
+.q-top .q-btn,
+.q-tabs,
+.q-path {
+  -webkit-app-region: no-drag;
 }
 
 .q-brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.q-brand-mark {
+  width: 22px;
+  height: 22px;
+  display: block;
+}
+
+.q-brand-name {
   font-weight: 700;
-  letter-spacing: 0.5px;
-  color: #4b87d6;
+  letter-spacing: 0.3px;
+  font-size: 15px;
 }
 
-.q-path {
+.q-spacer {
   flex: 1;
-  padding: 6px 10px;
-  background: #12161c;
-  border: 1px solid #2a323f;
-  border-radius: 6px;
-  color: #cdd6e4;
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 13px;
-  outline: none;
 }
 
-.q-path:focus {
-  border-color: #2f6fdc;
-}
-
-.q-open {
-  padding: 6px 16px;
-  background: #2f6fdc;
-  border: none;
-  border-radius: 6px;
-  color: white;
+/* ---- buttons ---- */
+.q-btn {
+  padding: 6px 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
   cursor: pointer;
   font-size: 13px;
+  transition: background 0.12s, border-color 0.12s;
 }
 
-.q-open:disabled {
-  opacity: 0.6;
+.q-btn:hover:not(:disabled) {
+  border-color: #2c3848;
+  background: #18212c;
+}
+
+.q-btn:disabled {
+  opacity: 0.55;
   cursor: default;
 }
 
+.q-btn-primary {
+  background: var(--accent);
+  border-color: transparent;
+  color: #04181c;
+  font-weight: 600;
+}
+
+.q-btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.q-btn-primary:active:not(:disabled) {
+  background: var(--accent-press);
+}
+
+/* ---- tab strip ---- */
+.q-tabs {
+  display: flex;
+  align-items: stretch;
+  gap: 1px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+  scrollbar-width: thin;
+}
+
+.q-tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  max-width: 240px;
+  font-size: 12.5px;
+  color: var(--muted);
+  background: transparent;
+  border-right: 1px solid var(--border);
+  border-top: 2px solid transparent;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.q-tab:hover {
+  background: var(--panel-2);
+  color: var(--text);
+}
+
+.q-tab-active {
+  color: var(--text);
+  background: var(--bg);
+  border-top-color: var(--accent);
+}
+
+.q-tab-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.q-tab-close {
+  width: 16px;
+  height: 16px;
+  line-height: 14px;
+  text-align: center;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 15px;
+}
+
+.q-tab-close:hover {
+  background: #2a3340;
+  color: var(--text);
+}
+
+/* ---- error banner ---- */
 .q-error {
   padding: 6px 12px;
-  background: #3a1d1d;
-  color: #ff9b9b;
-  font-family: monospace;
+  background: #2c1717;
+  color: var(--danger);
+  font-family: var(--mono);
   font-size: 12px;
   white-space: pre-wrap;
+  border-bottom: 1px solid #4a2424;
+}
+
+/* ---- stage (editor + empty state) ---- */
+.q-stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
 }
 
 .q-editor {
-  flex: 1;
-  min-height: 0;
+  position: absolute;
+  inset: 0;
   overflow: hidden;
 }
 
@@ -84,30 +202,101 @@ body,
   height: 100%;
 }
 
+.q-empty {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  background: var(--bg);
+  padding: 24px;
+  text-align: center;
+}
+
+.q-empty-logo {
+  width: min(360px, 60%);
+  opacity: 0.95;
+  margin-bottom: 4px;
+}
+
+.q-empty-tag {
+  margin: 0;
+  color: var(--text);
+  font-size: 15px;
+}
+
+.q-empty-open {
+  padding: 9px 22px;
+  font-size: 14px;
+}
+
+.q-empty-path {
+  display: flex;
+  gap: 8px;
+  width: min(520px, 90%);
+  margin-top: 4px;
+}
+
+.q-path {
+  flex: 1;
+  padding: 7px 11px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  outline: none;
+}
+
+.q-path:focus {
+  border-color: var(--accent);
+}
+
+.q-empty-hint {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* ---- status bar ---- */
 .q-status {
   display: flex;
-  gap: 16px;
   align-items: center;
+  gap: 14px;
   padding: 4px 12px;
-  background: #0d1117;
-  border-top: 1px solid #1f2630;
-  font-size: 12px;
-  color: #8893a7;
-  font-family: "JetBrains Mono", Consolas, monospace;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+
+.q-status .q-spacer {
+  flex: 1;
 }
 
 .q-file {
-  max-width: 45%;
+  max-width: 50%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text);
+}
+
+.q-sep {
+  width: 1px;
+  height: 12px;
+  background: var(--border);
 }
 
 .q-edge {
-  color: #d6a14b;
+  color: var(--accent);
   font-weight: 600;
 }
 
-.q-hint {
-  color: #56627a;
+.q-muted {
+  color: var(--muted);
 }

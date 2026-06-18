@@ -152,22 +152,40 @@ export class QuarryEditor {
     this.view = new EditorView({ state, parent });
   }
 
-  /** Open a file and load its first window. */
-  async open(path: string): Promise<FileMetaData> {
-    this.busy = true; // suppress edge-watcher during the initial swap
+  /** Open a path in Go, then show its first window. */
+  async openPath(path: string): Promise<FileMetaData> {
     const meta = (await FileService.OpenFile(path)) as FileMetaData;
-    this.fileId = meta.fileId;
-    this.startByte = 0;
-    this.nextByte = 0;
-    this.atBof = true;
-    this.atEof = false;
-    const w = (await FileService.GetWindow(this.fileId, 0, WINDOW_BYTES)) as WindowData;
-    this.apply(w, "top");
+    await this.attach(meta.fileId, 0);
     return meta;
   }
 
+  /** Point the editor at an already-open file id and load a window at startByte. */
+  async attach(fileId: string, startByte = 0): Promise<void> {
+    this.busy = true; // suppress edge-watcher during the swap
+    this.fileId = fileId;
+    this.startByte = startByte;
+    this.nextByte = startByte;
+    this.atBof = startByte === 0;
+    this.atEof = false;
+    const w = (await FileService.GetWindow(fileId, startByte, WINDOW_BYTES)) as WindowData;
+    this.apply(w, "top");
+  }
+
+  /** Detach from any file and show an empty document. */
+  clear(): void {
+    this.fileId = "";
+    this.busy = true;
+    this.view.dispatch({
+      changes: { from: 0, to: this.view.state.doc.length, insert: "" },
+      annotations: Transaction.addToHistory.of(false),
+    });
+    this.ref.lineOffsets = [];
+    this.ref.lineNumbers = [];
+    this.onStatus(null);
+    this.busy = false;
+  }
+
   destroy(): void {
-    if (this.fileId) void FileService.CloseFile(this.fileId).catch(() => {});
     this.view.destroy();
   }
 
