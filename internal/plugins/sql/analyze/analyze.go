@@ -44,7 +44,6 @@ type Options struct {
 
 var (
 	createTableRe = regexp.MustCompile("(?i)CREATE(?:\\s+DEFINER\\s*=\\s*`?[^`\\s]+`?@`?[^`\\s]+`?)?\\s+TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?\\s+`?([a-zA-Z0-9_.$-]+)`?")
-	insertIntoRe  = regexp.MustCompile("(?i)INSERT\\s+INTO\\s+`?([a-zA-Z0-9_.$-]+)`?")
 	definerRe     = regexp.MustCompile("(?i)DEFINER\\s*=\\s*`?[^`\\s]+`?@`?[^`\\s]+`?")
 	charsetRe     = regexp.MustCompile("(?i)(?:DEFAULT\\s+)?(?:CHARSET|CHARACTER\\s+SET)\\s*=?\\s*`?([a-zA-Z0-9_]+)`?")
 	collationRe   = regexp.MustCompile("(?i)COLLATE\\s*=?\\s*`?([a-zA-Z0-9_]+)`?")
@@ -167,57 +166,176 @@ func processWindow(summary *Summary, tables map[string]*Table, window []byte, wi
 	if processLimit < 0 {
 		processLimit = 0
 	}
-	if !summary.MysqldumpHeader {
+	if !summary.MysqldumpHeader && containsFold(window, "mysql") {
 		if match := mysqldumpRe.FindIndex(window); matchStartsBeforeLimit(match, processLimit) {
 			summary.MysqldumpHeader = true
 		}
 	}
-	for _, match := range definerRe.FindAllIndex(scan, -1) {
-		if matchStartsBeforeLimit(match, processLimit) {
-			summary.DefinerCount++
+
+	// INSERT INTO is the hot path on data dumps: a fast ASCII fold scan + a
+	// hand-rolled parse instead of a case-insensitive RE2 scan (which dominated
+	// CPU profiling). Equivalent to insertIntoRe over the masked window.
+	for pos := 0; pos < processLimit; {
+		k := indexFold(scan, "insert", pos)
+		if k < 0 || k >= processLimit {
+			break
+		}
+		ns, ne, end, ok := parseInsertInto(scan, k)
+		if ok {
+			table := ensureTable(tables, normalizeIdentifier(window[ns:ne]))
+			if table.InsertOffset < 0 {
+				table.InsertOffset = windowStart + int64(k)
+			}
+			pos = end
+		} else {
+			pos = k + 1
 		}
 	}
 
-	for _, match := range createTableRe.FindAllSubmatchIndex(scan, -1) {
-		if !matchStartsBeforeLimit(match, processLimit) {
-			continue
-		}
-		name := normalizeIdentifier(window[match[2]:match[3]])
-		offset := windowStart + int64(match[0])
-		table := ensureTable(tables, name)
-		if table.CreateOffset < 0 {
-			table.CreateOffset = offset
-		}
-	}
-	for _, match := range insertIntoRe.FindAllSubmatchIndex(scan, -1) {
-		if !matchStartsBeforeLimit(match, processLimit) {
-			continue
-		}
-		name := normalizeIdentifier(window[match[2]:match[3]])
-		offset := windowStart + int64(match[0])
-		table := ensureTable(tables, name)
-		if table.InsertOffset < 0 {
-			table.InsertOffset = offset
+	// Rarer statements: only run the precise regex when its keyword is present
+	// in the window (a cheap fold scan), so INSERT-only windows skip them all.
+	if containsFold(scan, "create") {
+		for _, match := range createTableRe.FindAllSubmatchIndex(scan, -1) {
+			if !matchStartsBeforeLimit(match, processLimit) {
+				continue
+			}
+			name := normalizeIdentifier(window[match[2]:match[3]])
+			offset := windowStart + int64(match[0])
+			table := ensureTable(tables, name)
+			if table.CreateOffset < 0 {
+				table.CreateOffset = offset
+			}
 		}
 	}
-	for _, match := range charsetRe.FindAllSubmatchIndex(scan, -1) {
-		if !matchStartsBeforeLimit(match, processLimit) {
-			continue
-		}
-		name := normalizeStatsName(window[match[2]:match[3]])
-		if name != "" {
-			summary.Charsets[name]++
+	if containsFold(scan, "definer") {
+		for _, match := range definerRe.FindAllIndex(scan, -1) {
+			if matchStartsBeforeLimit(match, processLimit) {
+				summary.DefinerCount++
+			}
 		}
 	}
-	for _, match := range collationRe.FindAllSubmatchIndex(scan, -1) {
-		if !matchStartsBeforeLimit(match, processLimit) {
-			continue
-		}
-		name := normalizeStatsName(window[match[2]:match[3]])
-		if name != "" {
-			summary.Collations[name]++
+	if containsFold(scan, "char") { // CHARSET or CHARACTER SET
+		for _, match := range charsetRe.FindAllSubmatchIndex(scan, -1) {
+			if !matchStartsBeforeLimit(match, processLimit) {
+				continue
+			}
+			name := normalizeStatsName(window[match[2]:match[3]])
+			if name != "" {
+				summary.Charsets[name]++
+			}
 		}
 	}
+	if containsFold(scan, "collate") {
+		for _, match := range collationRe.FindAllSubmatchIndex(scan, -1) {
+			if !matchStartsBeforeLimit(match, processLimit) {
+				continue
+			}
+			name := normalizeStatsName(window[match[2]:match[3]])
+			if name != "" {
+				summary.Collations[name]++
+			}
+		}
+	}
+}
+
+func asciiLower(c byte) byte {
+	if c >= 'A' && c <= 'Z' {
+		return c + 32
+	}
+	return c
+}
+
+// indexFold returns the index >= from of the first case-insensitive ASCII match
+// of word (which must be lowercase) in b, or -1.
+func indexFold(b []byte, word string, from int) int {
+	m := len(word)
+	if m == 0 {
+		return from
+	}
+	c0 := word[0]
+	last := len(b) - m
+	for i := from; i <= last; i++ {
+		if asciiLower(b[i]) != c0 {
+			continue
+		}
+		j := 1
+		for ; j < m; j++ {
+			if asciiLower(b[i+j]) != word[j] {
+				break
+			}
+		}
+		if j == m {
+			return i
+		}
+	}
+	return -1
+}
+
+func containsFold(b []byte, word string) bool { return indexFold(b, word, 0) >= 0 }
+
+func matchFold(b []byte, pos int, word string) bool {
+	if pos+len(word) > len(b) {
+		return false
+	}
+	for j := 0; j < len(word); j++ {
+		if asciiLower(b[pos+j]) != word[j] {
+			return false
+		}
+	}
+	return true
+}
+
+func skipSQLSpace(b []byte, pos int) int {
+	for pos < len(b) {
+		switch b[pos] {
+		case ' ', '\t', '\r', '\n', '\f', '\v':
+			pos++
+		default:
+			return pos
+		}
+	}
+	return pos
+}
+
+func isSQLIdentByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+		c == '_' || c == '.' || c == '$' || c == '-'
+}
+
+// parseInsertInto parses "INSERT\s+INTO\s+`?name`?" starting at b[k] (where b[k:]
+// already folds to "insert"). It returns the name byte range [ns,ne), the end
+// position, and whether it matched — equivalent to insertIntoRe.
+func parseInsertInto(b []byte, k int) (ns, ne, end int, ok bool) {
+	p := k + len("insert")
+	q := skipSQLSpace(b, p)
+	if q == p {
+		return 0, 0, 0, false
+	}
+	p = q
+	if !matchFold(b, p, "into") {
+		return 0, 0, 0, false
+	}
+	p += len("into")
+	q = skipSQLSpace(b, p)
+	if q == p {
+		return 0, 0, 0, false
+	}
+	p = q
+	if p < len(b) && b[p] == '`' {
+		p++
+	}
+	ns = p
+	for p < len(b) && isSQLIdentByte(b[p]) {
+		p++
+	}
+	ne = p
+	if ne == ns {
+		return 0, 0, 0, false
+	}
+	if p < len(b) && b[p] == '`' {
+		p++
+	}
+	return ns, ne, p, true
 }
 
 func matchStartsBeforeLimit(match []int, processLimit int) bool {
