@@ -212,3 +212,143 @@ func TestAnalyzeFindsLongDefinerCreateAcrossChunkBoundary(t *testing.T) {
 		t.Fatalf("create offset = %d, want 700", summary.Tables[0].CreateOffset)
 	}
 }
+
+func tableNames(summary Summary) map[string]Table {
+	out := make(map[string]Table, len(summary.Tables))
+	for _, t := range summary.Tables {
+		out[t.Name] = t
+	}
+	return out
+}
+
+// A string literal larger than the chunk used to leave the next window starting
+// mid-literal with the opening quote out of view, so blob text that looks like
+// CREATE TABLE / INSERT INTO was scanned as live SQL (phantom tables). The lexer
+// state must now carry across windows. Fillers exceed 16 KiB so real streaming
+// (multiple processWindow calls) occurs.
+func TestAnalyzeIgnoresStatementsInsideLiteralSpanningChunks(t *testing.T) {
+	filler := strings.Repeat("x", 20000)
+	literal := filler + " CREATE TABLE phantom (id int); INSERT INTO ghost VALUES (1); " + filler
+	text := "INSERT INTO realtbl VALUES ('" + literal + "');\n" +
+		"CREATE TABLE after_it (id int);\n" +
+		"INSERT INTO after_it VALUES (1);\n"
+
+	summary, err := Analyze(context.Background(), memReader{data: []byte(text)}, Options{ChunkSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := tableNames(summary)
+	if _, ok := names["phantom"]; ok {
+		t.Fatalf("phantom table leaked from inside a boundary-spanning literal: %#v", summary.Tables)
+	}
+	if _, ok := names["ghost"]; ok {
+		t.Fatalf("ghost table leaked from inside a boundary-spanning literal: %#v", summary.Tables)
+	}
+	if _, ok := names["realtbl"]; !ok {
+		t.Fatalf("realtbl missing: %#v", summary.Tables)
+	}
+	if at, ok := names["after_it"]; !ok || at.CreateOffset < 0 || at.InsertOffset < 0 {
+		t.Fatalf("after_it should be discovered with create+insert: %#v", summary.Tables)
+	}
+}
+
+// Guards the polarity-flip / silent-loss case: an apostrophe inside a
+// boundary-spanning literal must not flip masking and drop a genuine table that
+// comes after the literal.
+func TestAnalyzeFindsGenuineTableAfterLiteralWithApostrophe(t *testing.T) {
+	filler := strings.Repeat("y", 20000)
+	// it\'s — a backslash-escaped apostrophe deep inside a multi-window literal.
+	literal := filler + " it\\'s a value with CREATE TABLE bait inside " + filler
+	text := "INSERT INTO data_tbl VALUES ('" + literal + "');\n" +
+		"CREATE TABLE genuine_after (id int);\n"
+
+	summary, err := Analyze(context.Background(), memReader{data: []byte(text)}, Options{ChunkSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := tableNames(summary)
+	if _, ok := names["bait"]; ok {
+		t.Fatalf("bait leaked from inside the literal: %#v", summary.Tables)
+	}
+	if g, ok := names["genuine_after"]; !ok || g.CreateOffset < 0 {
+		t.Fatalf("genuine_after must be discovered after the literal: %#v", summary.Tables)
+	}
+}
+
+// A block comment larger than the chunk must stay masked across windows.
+func TestAnalyzeIgnoresStatementsInsideBlockCommentSpanningChunks(t *testing.T) {
+	filler := strings.Repeat("z", 20000)
+	text := "/* " + filler + " CREATE TABLE phantom_block (id int); " + filler + " */\n" +
+		"CREATE TABLE real_after_block (id int);\n"
+
+	summary, err := Analyze(context.Background(), memReader{data: []byte(text)}, Options{ChunkSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := tableNames(summary)
+	if _, ok := names["phantom_block"]; ok {
+		t.Fatalf("phantom_block leaked from inside a boundary-spanning block comment: %#v", summary.Tables)
+	}
+	if _, ok := names["real_after_block"]; !ok {
+		t.Fatalf("real_after_block must be discovered after the comment: %#v", summary.Tables)
+	}
+}
+
+// db-qualified names (`db`.`tbl`, db.tbl) must record the TABLE, not the
+// database, and quoted names with spaces must be captured whole — otherwise
+// multi-database dumps collapse under the db name and extract fails.
+func TestAnalyzeCapturesTableSegmentOfQualifiedNames(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want []string
+	}{
+		{
+			name: "backtick qualified",
+			text: "CREATE TABLE `mydb`.`users` (id int);\nINSERT INTO `mydb`.`orders` VALUES (1);\n",
+			want: []string{"orders", "users"},
+		},
+		{
+			name: "bare qualified",
+			text: "CREATE TABLE mydb.users (id int);\nINSERT INTO mydb.orders VALUES (1);\n",
+			want: []string{"orders", "users"},
+		},
+		{
+			name: "spaced quoted name",
+			text: "CREATE TABLE `weird name` (id int);\nINSERT INTO `weird name` VALUES (1);\n",
+			want: []string{"weird name"},
+		},
+		{
+			name: "qualified spaced table",
+			text: "INSERT INTO `my-db`.`tbl with space` VALUES (1);\n",
+			want: []string{"tbl with space"},
+		},
+		{
+			name: "unqualified still works",
+			text: "CREATE TABLE `users` (id int);\nINSERT INTO users VALUES (1);\n",
+			want: []string{"users"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			summary, err := Analyze(context.Background(), memReader{data: []byte(tc.text)}, Options{ChunkSize: 64})
+			if err != nil {
+				t.Fatal(err)
+			}
+			names := tableNames(summary)
+			for _, w := range tc.want {
+				if _, ok := names[w]; !ok {
+					t.Fatalf("want table %q, got %#v", w, summary.Tables)
+				}
+			}
+			if len(names) != len(tc.want) {
+				t.Fatalf("table count = %d (%#v), want %d", len(names), summary.Tables, len(tc.want))
+			}
+			for _, bad := range []string{"mydb", "my-db", "weird", "tbl"} {
+				if _, ok := names[bad]; ok {
+					t.Fatalf("captured %q (a database/partial name) instead of the table: %#v", bad, summary.Tables)
+				}
+			}
+		})
+	}
+}

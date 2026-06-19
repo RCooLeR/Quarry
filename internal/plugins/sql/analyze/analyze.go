@@ -42,8 +42,14 @@ type Options struct {
 	Progress  func(Progress)
 }
 
+// sqlIdent matches one MySQL identifier: a backtick-quoted name (with doubled
+// `` escapes, so it may contain dots/spaces) or a bare run of identifier bytes
+// (no '.', so a db-qualified name splits into qualifier + table).
+const sqlIdent = "(?:`(?:``|[^`])*`|[A-Za-z0-9_$-]+)"
+
 var (
-	createTableRe = regexp.MustCompile("(?i)CREATE(?:\\s+DEFINER\\s*=\\s*`?[^`\\s]+`?@`?[^`\\s]+`?)?\\s+TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?\\s+`?([a-zA-Z0-9_.$-]+)`?")
+	// CREATE TABLE [`db`.]`tbl` — capture the TABLE segment, not the database.
+	createTableRe = regexp.MustCompile("(?i)CREATE(?:\\s+DEFINER\\s*=\\s*`?[^`\\s]+`?@`?[^`\\s]+`?)?\\s+TABLE(?:\\s+IF\\s+NOT\\s+EXISTS)?\\s+(?:" + sqlIdent + "\\s*\\.\\s*)?(" + sqlIdent + ")")
 	definerRe     = regexp.MustCompile("(?i)DEFINER\\s*=\\s*`?[^`\\s]+`?@`?[^`\\s]+`?")
 	charsetRe     = regexp.MustCompile("(?i)(?:DEFAULT\\s+)?(?:CHARSET|CHARACTER\\s+SET)\\s*=?\\s*`?([a-zA-Z0-9_]+)`?")
 	collationRe   = regexp.MustCompile("(?i)COLLATE\\s*=?\\s*`?([a-zA-Z0-9_]+)`?")
@@ -81,6 +87,8 @@ func Analyze(ctx context.Context, r ReaderAtSize, opts Options) (Summary, error)
 	buf := make([]byte, opts.ChunkSize)
 	carry := make([]byte, 0, analyzerCarrySize)
 	window := make([]byte, 0, opts.ChunkSize+analyzerCarrySize)
+	scratch := make([]byte, 0, opts.ChunkSize+analyzerCarrySize)
+	var maskSt maskState
 	processed := int64(0)
 	total := r.Size()
 
@@ -121,7 +129,7 @@ func Analyze(ctx context.Context, r ReaderAtSize, opts Options) (Summary, error)
 			processLimit = 0
 		}
 
-		processWindow(&summary, tables, window, windowStart, processLimit)
+		maskSt, scratch = processWindow(&summary, tables, window, scratch, windowStart, processLimit, maskSt)
 
 		if processLimit < len(window) {
 			carry = append(carry[:0], window[processLimit:]...)
@@ -135,7 +143,7 @@ func Analyze(ctx context.Context, r ReaderAtSize, opts Options) (Summary, error)
 	}
 
 	if len(carry) > 0 {
-		processWindow(&summary, tables, carry, total-int64(len(carry)), len(carry))
+		processWindow(&summary, tables, carry, scratch, total-int64(len(carry)), len(carry), maskSt)
 	}
 
 	for _, table := range tables {
@@ -158,8 +166,8 @@ func Analyze(ctx context.Context, r ReaderAtSize, opts Options) (Summary, error)
 	return summary, nil
 }
 
-func processWindow(summary *Summary, tables map[string]*Table, window []byte, windowStart int64, processLimit int) {
-	scan := maskSQLLiteralsAndComments(window)
+func processWindow(summary *Summary, tables map[string]*Table, window, scratch []byte, windowStart int64, processLimit int, st maskState) (maskState, []byte) {
+	scan, nextState := maskSQLLiteralsAndComments(window, scratch, st, processLimit)
 	if processLimit > len(scan) {
 		processLimit = len(scan)
 	}
@@ -236,6 +244,9 @@ func processWindow(summary *Summary, tables map[string]*Table, window []byte, wi
 			}
 		}
 	}
+	// Return the masked buffer so the caller can reuse it as scratch, and the
+	// lexer state at processLimit so the next window resumes mid-literal correctly.
+	return nextState, scan
 }
 
 func asciiLower(c byte) byte {
@@ -297,14 +308,46 @@ func skipSQLSpace(b []byte, pos int) int {
 	return pos
 }
 
-func isSQLIdentByte(c byte) bool {
+func isBareIdentByte(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
-		c == '_' || c == '.' || c == '$' || c == '-'
+		c == '_' || c == '$' || c == '-'
 }
 
-// parseInsertInto parses "INSERT\s+INTO\s+`?name`?" starting at b[k] (where b[k:]
-// already folds to "insert"). It returns the name byte range [ns,ne), the end
-// position, and whether it matched — equivalent to insertIntoRe.
+// parseSQLIdentifier parses one identifier at b[pos]: a backtick-quoted name
+// (with doubled `` escapes) or a bare run of identifier bytes. It returns the
+// raw token range [start,end) (backticks included; normalizeIdentifier strips
+// them) and the position after it. ok is false if no identifier is present or a
+// backtick quote is left unterminated (truncated at a window edge).
+func parseSQLIdentifier(b []byte, pos int) (start, end, next int, ok bool) {
+	if pos >= len(b) {
+		return 0, 0, 0, false
+	}
+	if b[pos] == '`' {
+		for i := pos + 1; i < len(b); i++ {
+			if b[i] == '`' {
+				if i+1 < len(b) && b[i+1] == '`' { // doubled backtick escape
+					i++
+					continue
+				}
+				return pos, i + 1, i + 1, true
+			}
+		}
+		return 0, 0, 0, false
+	}
+	i := pos
+	for i < len(b) && isBareIdentByte(b[i]) {
+		i++
+	}
+	if i == pos {
+		return 0, 0, 0, false
+	}
+	return pos, i, i, true
+}
+
+// parseInsertInto parses "INSERT\s+INTO\s+[`?db`?\s*.\s*]`?name`?" starting at
+// b[k] (where b[k:] already folds to "insert"). It returns the TABLE name byte
+// range [ns,ne) (skipping any db. qualifier), the end position, and whether it
+// matched — equivalent to insertIntoRe with db-qualified support.
 func parseInsertInto(b []byte, k int) (ns, ne, end int, ok bool) {
 	p := k + len("insert")
 	q := skipSQLSpace(b, p)
@@ -321,106 +364,157 @@ func parseInsertInto(b []byte, k int) (ns, ne, end int, ok bool) {
 		return 0, 0, 0, false
 	}
 	p = q
-	if p < len(b) && b[p] == '`' {
-		p++
-	}
-	ns = p
-	for p < len(b) && isSQLIdentByte(b[p]) {
-		p++
-	}
-	ne = p
-	if ne == ns {
+	s1, e1, n1, ok1 := parseSQLIdentifier(b, p)
+	if !ok1 {
 		return 0, 0, 0, false
 	}
-	if p < len(b) && b[p] == '`' {
-		p++
+	// Optional `db`. qualifier — keep only the table segment after the dot.
+	q = skipSQLSpace(b, n1)
+	if q < len(b) && b[q] == '.' {
+		p = skipSQLSpace(b, q+1)
+		s2, e2, n2, ok2 := parseSQLIdentifier(b, p)
+		if !ok2 {
+			return 0, 0, 0, false
+		}
+		return s2, e2, n2, true
 	}
-	return ns, ne, p, true
+	return s1, e1, n1, true
 }
 
 func matchStartsBeforeLimit(match []int, processLimit int) bool {
 	return len(match) >= 2 && match[0] >= 0 && match[0] < processLimit
 }
 
-func maskSQLLiteralsAndComments(in []byte) []byte {
-	out := append([]byte(nil), in...)
-	for i := 0; i < len(out); {
-		switch out[i] {
-		case '\'':
-			i = maskSQLQuoted(in, out, i, '\'')
-		case '"':
-			i = maskSQLQuoted(in, out, i, '"')
-		case '#':
-			i = maskSQLLineComment(out, i)
-		case '-':
-			if i+1 < len(out) && out[i+1] == '-' && (i+2 >= len(out) || out[i+2] == ' ' || out[i+2] == '\t' || out[i+2] == '\r' || out[i+2] == '\n') {
-				i = maskSQLLineComment(out, i)
-				continue
-			}
-			i++
-		case '/':
-			if i+1 < len(out) && out[i+1] == '*' {
-				i = maskSQLBlockComment(in, out, i)
-				continue
-			}
-			i++
-		default:
-			i++
-		}
-	}
-	return out
+// maskMode is the SQL lexer state carried across analysis windows. Without it,
+// a string literal or comment larger than one chunk would leave the next window
+// starting mid-literal with the opening quote out of view, so blob contents
+// (e.g. text that looks like CREATE TABLE / INSERT INTO, or a stray apostrophe)
+// would be scanned as live SQL — producing phantom tables or dropping real ones,
+// which then corrupts the byte ranges used by extract/split.
+type maskMode uint8
+
+const (
+	modeNormal maskMode = iota
+	modeSingleQuote
+	modeDoubleQuote
+	modeLineComment
+	modeBlockComment
+)
+
+type maskState struct {
+	mode maskMode
+	// escaped: inside a quote, the previous byte was an escaping backslash, so
+	// this byte is literal and cannot close the quote.
+	escaped bool
+	// prevStar: inside a block comment, the previous byte was '*', so a '/' now
+	// closes the comment.
+	prevStar bool
+	// justExited: the quote byte that just closed a string; if the next byte
+	// repeats it, it was a doubled-quote escape ('' or "") and we re-enter.
+	justExited byte
 }
 
-func maskSQLQuoted(in []byte, out []byte, start int, quote byte) int {
-	out[start] = ' '
-	for i := start + 1; i < len(out); i++ {
-		if in[i] != '\n' && in[i] != '\r' {
-			out[i] = ' '
+// maskSQLLiteralsAndComments masks SQL string literals and comments in `in`,
+// writing into `scratch` (reused and grown as needed, eliminating a per-chunk
+// allocation). It resumes from `st` and returns the masked slice plus the lexer
+// state as of index `stateAt` (clamped), which the caller carries to the next
+// window so constructs that span the chunk boundary stay masked. Newlines are
+// preserved so offset/line bookkeeping is unaffected.
+func maskSQLLiteralsAndComments(in, scratch []byte, st maskState, stateAt int) ([]byte, maskState) {
+	out := append(scratch[:0], in...)
+	if stateAt < 0 {
+		stateAt = 0
+	}
+	mode := st.mode
+	escaped := st.escaped
+	prevStar := st.prevStar
+	justExited := st.justExited
+
+	atState := st
+	captured := stateAt == 0
+
+	for i := 0; i < len(out); i++ {
+		if !captured && i >= stateAt {
+			atState = maskState{mode: mode, escaped: escaped, prevStar: prevStar, justExited: justExited}
+			captured = true
 		}
-		if in[i] == quote {
-			if isEscapedSQLQuote(in, i) {
-				continue
+		c := out[i]
+		switch mode {
+		case modeNormal:
+			if justExited != 0 {
+				q := justExited
+				justExited = 0
+				if c == q { // doubled quote: re-enter the string
+					if c != '\n' && c != '\r' {
+						out[i] = ' '
+					}
+					if q == '\'' {
+						mode = modeSingleQuote
+					} else {
+						mode = modeDoubleQuote
+					}
+					continue
+				}
 			}
-			if i+1 < len(out) && in[i+1] == quote {
-				out[i+1] = ' '
-				i++
-				continue
+			switch c {
+			case '\'':
+				out[i] = ' '
+				mode, escaped = modeSingleQuote, false
+			case '"':
+				out[i] = ' '
+				mode, escaped = modeDoubleQuote, false
+			case '#':
+				out[i] = ' '
+				mode = modeLineComment
+			case '-':
+				if i+1 < len(out) && out[i+1] == '-' &&
+					(i+2 >= len(out) || out[i+2] == ' ' || out[i+2] == '\t' || out[i+2] == '\r' || out[i+2] == '\n') {
+					out[i] = ' '
+					mode = modeLineComment
+				}
+			case '/':
+				if i+1 < len(out) && out[i+1] == '*' {
+					out[i] = ' '
+					mode, prevStar = modeBlockComment, false
+				}
 			}
-			return i + 1
+		case modeSingleQuote, modeDoubleQuote:
+			q := byte('\'')
+			if mode == modeDoubleQuote {
+				q = '"'
+			}
+			if c != '\n' && c != '\r' {
+				out[i] = ' '
+			}
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == q:
+				mode, justExited = modeNormal, q
+			}
+		case modeLineComment:
+			if c == '\n' || c == '\r' {
+				mode = modeNormal
+			} else {
+				out[i] = ' '
+			}
+		case modeBlockComment:
+			if c != '\n' && c != '\r' {
+				out[i] = ' '
+			}
+			if c == '/' && prevStar {
+				mode, prevStar = modeNormal, false
+			} else {
+				prevStar = c == '*'
+			}
 		}
 	}
-	return len(out)
-}
-
-func maskSQLLineComment(out []byte, start int) int {
-	for i := start; i < len(out); i++ {
-		if out[i] == '\n' || out[i] == '\r' {
-			return i
-		}
-		out[i] = ' '
+	if !captured {
+		atState = maskState{mode: mode, escaped: escaped, prevStar: prevStar, justExited: justExited}
 	}
-	return len(out)
-}
-
-func maskSQLBlockComment(in []byte, out []byte, start int) int {
-	for i := start; i < len(out); i++ {
-		end := i > start && in[i-1] == '*' && in[i] == '/'
-		if in[i] != '\n' && in[i] != '\r' {
-			out[i] = ' '
-		}
-		if end {
-			return i + 1
-		}
-	}
-	return len(out)
-}
-
-func isEscapedSQLQuote(in []byte, index int) bool {
-	slashes := 0
-	for i := index - 1; i >= 0 && in[i] == '\\'; i-- {
-		slashes++
-	}
-	return slashes%2 == 1
+	return out, atState
 }
 
 func ensureTable(tables map[string]*Table, name string) *Table {
