@@ -24,6 +24,7 @@ import {
 } from "@codemirror/view";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { FileService } from "../../bindings/github.com/quarry/quarry-wails3";
+import { highlightFor } from "./sqlHighlight";
 
 export interface FileMetaData {
   fileId: string;
@@ -142,6 +143,7 @@ export class QuarryEditor {
   private view: EditorView;
   private cb: EditorCallbacks;
   private editableC = new Compartment();
+  private langC = new Compartment();
 
   private fileId = "";
   private startByte = 0;
@@ -214,6 +216,7 @@ export class QuarryEditor {
         keymap.of([...defaultKeymap, ...historyKeymap]),
         EditorState.changeFilter.of((tr) => tr.newDoc.length <= MAX_DOC),
         this.editableC.of([EditorState.readOnly.of(true), EditorView.editable.of(false)]),
+        this.langC.of([]),
         edgeWatcher,
         quarryTheme,
       ],
@@ -246,14 +249,15 @@ export class QuarryEditor {
 
   async openPath(path: string): Promise<FileMetaData> {
     const meta = (await FileService.OpenFile(path)) as FileMetaData;
-    await this.attach(meta.fileId, 0);
+    await this.attach(meta.fileId, meta.detected, 0);
     return meta;
   }
 
   /** Switch to an already-open file (flushing the current one first). */
-  async attach(fileId: string, startByte = 0): Promise<void> {
+  async attach(fileId: string, detected = "", startByte = 0): Promise<void> {
     await this.flush();
     this.setMode(false); // a freshly activated file starts read-only
+    this.setLanguage(detected);
     this.busy = true;
     this.fileId = fileId;
     this.startByte = startByte;
@@ -371,6 +375,11 @@ export class QuarryEditor {
 
   isEditing(): boolean {
     return this.editMode;
+  }
+
+  /** Swap the syntax-highlighting extension to match the file type. */
+  private setLanguage(detected: string): void {
+    this.view.dispatch({ effects: this.langC.reconfigure(highlightFor(detected)) });
   }
 
   destroy(): void {

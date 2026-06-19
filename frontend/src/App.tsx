@@ -150,7 +150,7 @@ function App() {
     setActiveId(meta.fileId);
     activeIdRef.current = meta.fileId;
     lastMatch.current = null;
-    await ed.attach(meta.fileId, 0);
+    await ed.attach(meta.fileId, meta.detected, 0);
     await refreshStaging(meta.fileId);
   };
 
@@ -190,7 +190,7 @@ function App() {
     setActiveId(fileId);
     activeIdRef.current = fileId;
     lastMatch.current = null;
-    await ed.attach(fileId, t.startByte);
+    await ed.attach(fileId, t.meta.detected, t.startByte);
     await refreshStaging(fileId);
   };
 
