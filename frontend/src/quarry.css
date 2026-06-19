@@ -311,6 +311,12 @@ body {
   color: var(--muted);
   font-size: 12px;
 }
+.q-bookmarks .q-result {
+  justify-content: space-between;
+}
+.q-bookmarks .q-result-text {
+  flex: 1;
+}
 
 /* ---- command palette ---- */
 .q-cmd-backdrop {

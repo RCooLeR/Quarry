@@ -88,6 +88,14 @@ function App() {
   const [analyses, setAnalyses] = useState<Record<string, SqlSummaryResult>>({});
   const [xrayOn, setXrayOn] = useState(true);
   const [theme, setTheme] = useState<string>(() => localStorage.getItem("quarry.theme") || "dark");
+  const [recent, setRecent] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("quarry.recent") || "[]"); } catch { return []; }
+  });
+  const restoredRef = useRef(false);
+  const [bookmarks, setBookmarks] = useState<Record<string, { offset: number; label: string }[]>>(() => {
+    try { return JSON.parse(localStorage.getItem("quarry.bookmarks") || "{}"); } catch { return {}; }
+  });
+  const [bookmarksOpen, setBookmarksOpen] = useState(false);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -178,6 +186,56 @@ function App() {
     return () => { try { off(); } catch { /* ignore */ } };
   }, []);
 
+  const pushRecent = (p: string) => {
+    if (!p) return;
+    setRecent((prev) => {
+      const next = [p, ...prev.filter((x) => x !== p)].slice(0, 12);
+      localStorage.setItem("quarry.recent", JSON.stringify(next));
+      return next;
+    });
+  };
+
+  const saveBookmarks = (next: Record<string, { offset: number; label: string }[]>) => {
+    setBookmarks(next);
+    localStorage.setItem("quarry.bookmarks", JSON.stringify(next));
+  };
+  const addBookmark = () => {
+    const t = tabsRef.current.find((x) => x.fileId === activeIdRef.current);
+    if (!t) return;
+    const offset = status?.startByte ?? 0;
+    const label = `line ~${status?.firstLine ?? "?"}`;
+    const list = bookmarks[t.meta.path] ?? [];
+    if (list.some((b) => b.offset === offset)) { setBookmarksOpen(true); return; }
+    const next = { ...bookmarks, [t.meta.path]: [...list, { offset, label }].sort((a, b) => a.offset - b.offset) };
+    saveBookmarks(next);
+    setBookmarksOpen(true);
+    setNotice(`Bookmarked 0x${offset.toString(16)}`);
+  };
+  const removeBookmark = (path: string, offset: number) => {
+    const list = (bookmarks[path] ?? []).filter((b) => b.offset !== offset);
+    const next = { ...bookmarks };
+    if (list.length) next[path] = list; else delete next[path];
+    saveBookmarks(next);
+  };
+
+  // Persist the open-file set so a relaunch can restore it.
+  useEffect(() => {
+    if (!restoredRef.current) return; // don't clobber saved session before restore
+    const paths = tabs.map((t) => t.meta.path).filter(Boolean);
+    localStorage.setItem("quarry.session", JSON.stringify(paths));
+  }, [tabs]);
+
+  // Restore last session's files once, on first mount.
+  useEffect(() => {
+    let saved: string[] = [];
+    try { saved = JSON.parse(localStorage.getItem("quarry.session") || "[]"); } catch { saved = []; }
+    void (async () => {
+      for (const p of saved) await openFileRef.current(p);
+      restoredRef.current = true;
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const refreshStaging = async (fileId: string) => {
     try {
       const s = (await FileService.GetStagingState(fileId)) as StagingStateData;
@@ -221,6 +279,7 @@ function App() {
     lastMatch.current = null;
     await ed.attach(meta.fileId, meta.detected, meta.path, 0);
     await refreshStaging(meta.fileId);
+    pushRecent(meta.path);
   };
 
   const openViaDialog = async () => {
@@ -487,6 +546,17 @@ function App() {
       items: [
         { label: "Open file…", shortcut: "Ctrl+O", onClick: () => void openViaDialog() },
         { label: "Close tab", shortcut: "Ctrl+W", disabled: !activeTab, onClick: () => activeId && void closeTab(activeId) },
+        ...(recent.length > 0
+          ? [
+              { separator: true } as MenuItem,
+              { label: "Recent files", disabled: true } as MenuItem,
+              ...recent.slice(0, 10).map((p) => ({
+                label: "  " + p.replace(/^.*[\\/]/, ""),
+                onClick: () => void openFilePath(p),
+              })),
+              { label: "Clear recent", onClick: () => { setRecent([]); localStorage.removeItem("quarry.recent"); } },
+            ]
+          : []),
         { separator: true },
         { label: "Patch in place", disabled: !staging?.inPlaceEligible, onClick: () => void saveInPlace() },
         { label: "Save copy…", disabled: !hasEdits, onClick: () => void saveCopy() },
@@ -508,6 +578,8 @@ function App() {
       items: [
         { label: "Sidebar", shortcut: "Ctrl+B", checked: !sidebarCollapsed, onClick: () => setSidebarCollapsed((v) => !v) },
         { label: "File map (X-ray)", checked: xrayOn, onClick: () => setXrayOn((v) => !v) },
+        { label: "Bookmarks", disabled: !hasFiles, checked: bookmarksOpen, onClick: () => setBookmarksOpen((v) => !v) },
+        { label: "Add bookmark here", disabled: !activeTab, onClick: addBookmark },
         { label: "Command palette…", shortcut: "Ctrl+P", onClick: () => setPaletteOpen(true) },
         { label: "Light theme", checked: theme === "light", onClick: toggleTheme },
         { separator: true },
@@ -538,6 +610,8 @@ function App() {
     { id: "edit", group: "Edit", label: editMode ? "Turn editing off" : "Turn editing on", run: () => void toggleEdit() },
     { id: "sidebar", group: "View", label: "Toggle sidebar", hint: "Ctrl+B", run: () => setSidebarCollapsed((v) => !v) },
     { id: "theme", group: "View", label: theme === "light" ? "Switch to dark theme" : "Switch to light theme", run: toggleTheme },
+    { id: "bookmark", group: "View", label: "Add bookmark here", run: addBookmark },
+    { id: "bookmarks", group: "View", label: "Toggle bookmarks panel", run: () => setBookmarksOpen((v) => !v) },
     { id: "text", group: "View", label: "Plain text view", run: showText },
     { id: "hex", group: "View", label: "Toggle hex view", run: () => { setGridView(false); setHexView((v) => !v); } },
     { id: "grid", group: "View", label: "Toggle grid view", run: () => { setHexView(false); setGridView((v) => !v); } },
@@ -689,6 +763,30 @@ function App() {
                 >
                   <span className="q-result-line">{r.line}</span>
                   <span className="q-result-text">{r.preview}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {bookmarksOpen && activeTab && (
+          <div className="q-results q-bookmarks">
+            <div className="q-results-head">
+              <span>Bookmarks · {(bookmarks[activeTab.meta.path] ?? []).length}</span>
+              <span className="q-spacer" />
+              <button className="q-icon" title="Add current position" onClick={addBookmark}>＋</button>
+              <button className="q-icon" title="Close" onClick={() => setBookmarksOpen(false)}>×</button>
+            </div>
+            <div className="q-results-body">
+              {(bookmarks[activeTab.meta.path] ?? []).length === 0 && (
+                <div className="q-results-empty">No bookmarks. Use ＋ or “Add bookmark here”.</div>
+              )}
+              {(bookmarks[activeTab.meta.path] ?? []).map((b, i) => (
+                <div key={i} className="q-result" title={`0x${b.offset.toString(16)}`}>
+                  <span className="q-result-text" onClick={() => void editorRef.current?.gotoByte(b.offset)}>
+                    {b.label} · 0x{b.offset.toString(16)}
+                  </span>
+                  <button className="q-icon" title="Remove" onClick={() => removeBookmark(activeTab.meta.path, b.offset)}>×</button>
                 </div>
               ))}
             </div>
