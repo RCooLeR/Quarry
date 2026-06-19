@@ -6,9 +6,11 @@ interface CsvInspectResult { delimiter: string; delimiterName: string; confidenc
 interface CsvColumn { name: string; sqlType: string; nonNull: number; null: number; samples: string[]; }
 interface CsvSchemaResult { columns: CsvColumn[]; hasHeader: boolean; warnings: string[]; }
 interface CsvPreviewResult { header: string[]; rows: string[][]; warnings: string[]; }
-interface SqlTable { name: string; createOffset: number; insertOffset: number; }
+interface SqlTable { name: string; createOffset: number; insertOffset: number; bytes: number; }
 interface SqlSummaryResult { tables: SqlTable[]; createTables: number; insertTables: number; definerCount: number; header: boolean; }
 interface TransformResult { outputPath: string; recordsRead: number; recordsWritten: number; note: string; }
+
+interface ColCfg { source: number; name: string; type: string; include: boolean; }
 
 const DELIMS: { value: string; label: string }[] = [
   { value: ",", label: "Comma  ," },
@@ -17,6 +19,20 @@ const DELIMS: { value: string; label: string }[] = [
   { value: "|", label: "Pipe  |" },
   { value: " ", label: "Space" },
 ];
+
+const SQL_TYPES = [
+  "BIGINT", "INT", "SMALLINT", "DOUBLE", "DECIMAL(10,2)", "BOOLEAN",
+  "DATE", "DATETIME", "TIMESTAMP", "VARCHAR(255)", "TEXT", "LONGTEXT", "BLOB",
+];
+
+function fmtBytes(n: number): string {
+  if (!n) return "—";
+  if (n < 1024) return `${n} B`;
+  const u = ["KB", "MB", "GB", "TB"];
+  let v = n / 1024, i = 0;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v < 10 ? 1 : 0)} ${u[i]}`;
+}
 
 function presetArgLabels(name: string): string[] {
   const n = name.toLowerCase();
@@ -43,10 +59,15 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
   const [inspect, setInspect] = useState<CsvInspectResult | null>(null);
   const [schema, setSchema] = useState<CsvColumn[]>([]);
   const [preview, setPreview] = useState<CsvPreviewResult | null>(null);
+  const [cols, setCols] = useState<ColCfg[]>([]);
   const [dropCol, setDropCol] = useState(0);
   const [addVal, setAddVal] = useState("");
   const [tableName, setTableName] = useState("imported");
   const [includeCreate, setIncludeCreate] = useState(true);
+  const [insertMode, setInsertMode] = useState("insert");
+  const [batchSize, setBatchSize] = useState(500);
+  const [nullValue, setNullValue] = useState("NULL");
+  const [onInvalid, setOnInvalid] = useState("fail");
   const [sqlPreviewText, setSqlPreviewText] = useState("");
 
   // SQL state
@@ -61,9 +82,8 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
 
   const [busy, setBusy] = useState(false);
 
-  // Detect CSV delimiter when the panel opens for a CSV file.
   useEffect(() => {
-    setInspect(null); setSchema([]); setPreview(null); setSqlSummary(null); setSqlPreviewText("");
+    setInspect(null); setSchema([]); setPreview(null); setCols([]); setSqlSummary(null); setSqlPreviewText("");
     if (!isCsv) {
       (async () => {
         try {
@@ -91,20 +111,36 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fileId, detected]);
 
-  const refreshCsv = async (d: string, h: boolean) => {
+  const refreshCsv = async (dl: string, h: boolean) => {
     try {
-      const sc = (await FileService.CsvSchema(fileId, d, h)) as CsvSchemaResult;
+      const sc = (await FileService.CsvSchema(fileId, dl, h)) as CsvSchemaResult;
       setSchema(sc.columns);
+      setCols(sc.columns.map((c, i) => ({ source: i, name: c.name, type: c.sqlType || "TEXT", include: true })));
       if (dropCol >= sc.columns.length) setDropCol(0);
-      const pv = (await FileService.CsvPreview(fileId, d, h, 12)) as CsvPreviewResult;
+      const pv = (await FileService.CsvPreview(fileId, dl, h, 12)) as CsvPreviewResult;
       setPreview(pv);
     } catch (e: any) {
       onError(String(e?.message ?? e));
     }
   };
 
-  const onDelimChange = async (d: string) => { setDelim(d); await refreshCsv(d, hasHeader); };
+  const onDelimChange = async (dl: string) => { setDelim(dl); await refreshCsv(dl, hasHeader); };
   const onHeaderChange = async (h: boolean) => { setHasHeader(h); await refreshCsv(delim, h); };
+
+  const setCol = (i: number, patch: Partial<ColCfg>) =>
+    setCols((prev) => prev.map((c, j) => (j === i ? { ...c, ...patch } : c)));
+
+  const buildConfig = () => ({
+    delimiter: delim,
+    hasHeader,
+    tableName,
+    columns: cols,
+    includeCreate,
+    insertMode,
+    batchSize,
+    nullValues: nullValue.split(",").map((s) => s.trim()).filter(Boolean),
+    onInvalid,
+  });
 
   const run = async (fn: () => Promise<TransformResult>) => {
     setBusy(true);
@@ -118,27 +154,26 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
     }
   };
 
+  // CSV transforms
   const doDrop = () =>
     run(async () => {
       const keep = schema.map((_, i) => i).filter((i) => i !== dropCol);
       return (await FileService.CsvProjectViaDialog(fileId, delim, keep)) as TransformResult;
     });
-
   const doAdd = () =>
     run(async () => (await FileService.CsvAddColumnViaDialog(fileId, delim, schema.length, addVal)) as TransformResult);
-
   const doConvert = () =>
-    run(async () => (await FileService.CsvToSQLViaDialog(fileId, delim, tableName, hasHeader, includeCreate)) as TransformResult);
-
+    run(async () => (await FileService.CsvToSQLConfigViaDialog(fileId, buildConfig() as any)) as TransformResult);
   const doSqlPreview = async () => {
     try {
-      const sql = (await FileService.CsvToSQLPreview(fileId, delim, tableName, hasHeader, includeCreate)) as string;
+      const sql = (await FileService.CsvToSQLConfigPreview(fileId, buildConfig() as any)) as string;
       setSqlPreviewText(sql);
     } catch (e: any) {
       onError(String(e?.message ?? e));
     }
   };
 
+  // SQL tools
   const doAnalyze = async () => {
     setBusy(true);
     onNotice("Analyzing dump…");
@@ -152,18 +187,16 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
       setBusy(false);
     }
   };
+  const doExtract = (name: string) => run(async () => (await FileService.SqlExtractTableViaDialog(fileId, name)) as TransformResult);
+  const doSchema = (name: string) => run(async () => (await FileService.SqlExtractSchemaViaDialog(fileId, name)) as TransformResult);
+  const doData = (name: string) => run(async () => (await FileService.SqlExtractDataViaDialog(fileId, name)) as TransformResult);
+  const doSplit = () => run(async () => (await FileService.SqlSplitByTableViaDialog(fileId)) as TransformResult);
+  const doReplace = () => run(async () => (await FileService.SqlReplaceViaDialog(fileId, find, repl, regex, ci, false)) as TransformResult);
+  const doPreset = () => run(async () => (await FileService.SqlApplyPresetViaDialog(fileId, preset, pa[0], pa[1], pa[2], pa[3])) as TransformResult);
 
-  const doExtract = (name: string) =>
-    run(async () => (await FileService.SqlExtractTableViaDialog(fileId, name)) as TransformResult);
-
-  const doReplace = () =>
-    run(async () => (await FileService.SqlReplaceViaDialog(fileId, find, repl, regex, ci, false)) as TransformResult);
-
-  const doPreset = () =>
-    run(async () => (await FileService.SqlApplyPresetViaDialog(fileId, preset, pa[0], pa[1], pa[2], pa[3])) as TransformResult);
-
-  // ensure detected delimiter appears in the dropdown
-  const delims = DELIMS.some((d) => d.value === delim) ? DELIMS : [{ value: delim, label: `Detected (${JSON.stringify(delim)})` }, ...DELIMS];
+  const delims = DELIMS.some((x) => x.value === delim) ? DELIMS : [{ value: delim, label: `Detected (${JSON.stringify(delim)})` }, ...DELIMS];
+  const typeOptions = (t: string) => (SQL_TYPES.includes(t) ? SQL_TYPES : [t, ...SQL_TYPES]);
+  const selectedCount = cols.filter((c) => c.include).length;
 
   return (
     <div className="q-tools">
@@ -177,38 +210,72 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
             <label className="q-tlabel">Separator</label>
             <div className="q-trow">
               <select className="q-select" value={delim} onChange={(e) => void onDelimChange(e.target.value)}>
-                {delims.map((d) => (<option key={d.value} value={d.value}>{d.label}</option>))}
+                {delims.map((x) => (<option key={x.value} value={x.value}>{x.label}</option>))}
               </select>
-              {inspect && (
-                <span className="q-thint">
-                  detected {inspect.delimiterName} ({inspect.confidence}), {inspect.columns} cols
-                </span>
-              )}
+              {inspect && <span className="q-thint">detected {inspect.delimiterName} ({inspect.confidence}), {inspect.columns} cols</span>}
             </div>
             <label className="q-check">
               <input type="checkbox" checked={hasHeader} onChange={(e) => void onHeaderChange(e.target.checked)} /> First row is a header
             </label>
 
-            <label className="q-tlabel">Columns ({schema.length})</label>
-            <div className="q-tcols">
-              {schema.map((c, i) => (
-                <div className="q-tcol" key={i}><span className="q-tcol-n">{c.name}</span><span className="q-tcol-t">{c.sqlType}</span></div>
+            <div className="q-tsection">CSV → SQL</div>
+            <label className="q-tlabel">Table name</label>
+            <input className="q-select" placeholder="table name" value={tableName} onChange={(e) => setTableName(e.target.value)} />
+
+            <label className="q-tlabel">Columns — include · rename · type ({selectedCount}/{cols.length})</label>
+            <div className="q-colcfg">
+              {cols.map((c, i) => (
+                <div className={"q-colrow" + (c.include ? "" : " q-colrow-off")} key={i}>
+                  <input type="checkbox" checked={c.include} onChange={(e) => setCol(i, { include: e.target.checked })} title="Include this column" />
+                  <input className="q-colname" value={c.name} onChange={(e) => setCol(i, { name: e.target.value })} placeholder={`col${i + 1}`} />
+                  <select className="q-coltype" value={c.type} onChange={(e) => setCol(i, { type: e.target.value })} disabled={!includeCreate}>
+                    {typeOptions(c.type).map((t) => (<option key={t} value={t}>{t}</option>))}
+                  </select>
+                </div>
               ))}
+              {cols.length === 0 && <div className="q-thint">No columns detected.</div>}
             </div>
 
-            {preview && preview.rows.length > 0 && (
-              <>
-                <label className="q-tlabel">Preview</label>
-                <div className="q-tprev">
-                  <table>
-                    {preview.header.length > 0 && (<thead><tr>{preview.header.map((h, i) => <th key={i}>{h}</th>)}</tr></thead>)}
-                    <tbody>{preview.rows.slice(0, 8).map((r, i) => (<tr key={i}>{r.map((c, j) => <td key={j}>{c}</td>)}</tr>))}</tbody>
-                  </table>
-                </div>
-              </>
-            )}
+            <div className="q-trow">
+              <label className="q-tlabel q-tlabel-inline">Insert mode</label>
+              <select className="q-select" value={insertMode} onChange={(e) => setInsertMode(e.target.value)}>
+                <option value="insert">INSERT INTO</option>
+                <option value="ignore">INSERT IGNORE</option>
+                <option value="replace">REPLACE INTO</option>
+              </select>
+            </div>
+            <div className="q-trow">
+              <label className="q-check"><input type="checkbox" checked={includeCreate} onChange={(e) => setIncludeCreate(e.target.checked)} /> CREATE TABLE</label>
+              <label className="q-tlabel q-tlabel-inline">Batch</label>
+              <input className="q-num" type="number" min={1} value={batchSize} onChange={(e) => setBatchSize(Math.max(1, Number(e.target.value) || 1))} />
+            </div>
+            <div className="q-trow">
+              <label className="q-tlabel q-tlabel-inline">NULL =</label>
+              <input className="q-select" placeholder="NULL,\\N (comma-separated)" value={nullValue} onChange={(e) => setNullValue(e.target.value)} />
+            </div>
+            <div className="q-trow">
+              <label className="q-tlabel q-tlabel-inline">Bad bytes</label>
+              <select className="q-select" value={onInvalid} onChange={(e) => setOnInvalid(e.target.value)}>
+                <option value="fail">Fail on invalid byte</option>
+                <option value="skip-row">Skip offending row</option>
+                <option value="replace">Replace with �</option>
+              </select>
+            </div>
+            <div className="q-trow">
+              <button className="q-btn" disabled={busy} onClick={() => void doSqlPreview()}>Preview SQL</button>
+              <button className="q-btn q-btn-primary" disabled={busy || selectedCount === 0} onClick={doConvert}>Convert → .sql</button>
+            </div>
+            {sqlPreviewText && <pre className="q-tpre">{sqlPreviewText}</pre>}
 
-            <label className="q-tlabel">Transforms (write a new file)</label>
+            <div className="q-tsection">Column transforms (new CSV)</div>
+            {preview && preview.rows.length > 0 && (
+              <div className="q-tprev">
+                <table>
+                  {preview.header.length > 0 && (<thead><tr>{preview.header.map((h, i) => <th key={i}>{h}</th>)}</tr></thead>)}
+                  <tbody>{preview.rows.slice(0, 6).map((r, i) => (<tr key={i}>{r.map((cc, j) => <td key={j}>{cc}</td>)}</tr>))}</tbody>
+                </table>
+              </div>
+            )}
             <div className="q-trow">
               <select className="q-select" value={dropCol} onChange={(e) => setDropCol(Number(e.target.value))}>
                 {schema.map((c, i) => (<option key={i} value={i}>{c.name}</option>))}
@@ -219,15 +286,6 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
               <input className="q-select" placeholder="constant value" value={addVal} onChange={(e) => setAddVal(e.target.value)} />
               <button className="q-btn" disabled={busy} onClick={doAdd}>Add column</button>
             </div>
-            <div className="q-trow">
-              <input className="q-select" placeholder="table name" value={tableName} onChange={(e) => setTableName(e.target.value)} />
-              <label className="q-check"><input type="checkbox" checked={includeCreate} onChange={(e) => setIncludeCreate(e.target.checked)} /> CREATE</label>
-            </div>
-            <div className="q-trow">
-              <button className="q-btn" disabled={busy} onClick={() => void doSqlPreview()}>Preview SQL</button>
-              <button className="q-btn q-btn-primary" disabled={busy} onClick={doConvert}>Convert → .sql</button>
-            </div>
-            {sqlPreviewText && <pre className="q-tpre">{sqlPreviewText}</pre>}
           </>
         ) : (
           <>
@@ -239,19 +297,28 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
                 <div className="q-thint">
                   CREATE {sqlSummary.createTables} · INSERT {sqlSummary.insertTables} · DEFINER {sqlSummary.definerCount}
                 </div>
-                <label className="q-tlabel">Tables ({sqlSummary.tables.length})</label>
+                <div className="q-trow">
+                  <button className="q-btn" disabled={busy} onClick={doSplit} title="Write one .sql file per table into a folder">Split by table → folder</button>
+                  <button className="q-btn" disabled={busy} onClick={() => doSchema("")} title="Export the whole-dump schema (DDL only)">Whole schema</button>
+                </div>
+                <label className="q-tlabel">Tables ({sqlSummary.tables.length}) — extract / schema / data</label>
                 <div className="q-ttables">
                   {sqlSummary.tables.map((t, i) => (
                     <div className="q-ttable" key={i}>
-                      <span className="q-tcol-n">{t.name}</span>
-                      <span className="q-tcol-t">0x{t.createOffset.toString(16)}</span>
-                      <button className="q-icon" disabled={busy} onClick={() => doExtract(t.name)}>Extract</button>
+                      <span className="q-tcol-n" title={t.name}>{t.name}</span>
+                      <span className="q-tcol-sz">{fmtBytes(t.bytes)}</span>
+                      <span className="q-tbtns">
+                        <button className="q-icon" disabled={busy} title="Extract whole table" onClick={() => doExtract(t.name)}>⤓</button>
+                        <button className="q-icon" disabled={busy} title="Schema only (DDL)" onClick={() => doSchema(t.name)}>S</button>
+                        <button className="q-icon" disabled={busy || t.insertOffset < 0} title="Data only (INSERTs)" onClick={() => doData(t.name)}>D</button>
+                      </span>
                     </div>
                   ))}
                 </div>
               </>
             )}
-            <label className="q-tlabel">Find / replace → new file</label>
+
+            <div className="q-tsection">Find / replace → new file</div>
             <input className="q-select" placeholder="find (e.g. `old_prefix_)" value={find} onChange={(e) => setFind(e.target.value)} />
             <input className="q-select" placeholder="replace with (e.g. `new_prefix_)" value={repl} onChange={(e) => setRepl(e.target.value)} />
             <div className="q-trow">
@@ -260,7 +327,7 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
               <button className="q-btn q-btn-primary" disabled={busy || !find} onClick={doReplace}>Replace → file</button>
             </div>
 
-            <label className="q-tlabel">Cleanup presets → new file</label>
+            <div className="q-tsection">Cleanup presets → new file</div>
             <select className="q-select" value={preset} onChange={(e) => setPreset(e.target.value)}>
               {presets.map((p) => (<option key={p} value={p}>{p}</option>))}
             </select>

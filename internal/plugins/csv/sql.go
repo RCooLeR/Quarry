@@ -44,6 +44,13 @@ type SQLConvertOptions struct {
 	IncludeCreateTable bool
 	ColumnTypes        []string
 	MaxFieldBytes      int64
+	// SourceColumns selects which input fields to emit, in output order (0-based).
+	// Empty means all fields in their original order. When set, len(Columns) and
+	// len(ColumnTypes) must match len(SourceColumns).
+	SourceColumns []int
+	// InsertVerb is the statement prefix, e.g. "INSERT INTO" (default),
+	// "INSERT IGNORE INTO", or "REPLACE INTO".
+	InsertVerb string
 	// OnInvalidValue selects how to handle un-emittable field bytes. Empty means
 	// InvalidValueFail.
 	OnInvalidValue InvalidValuePolicy
@@ -175,16 +182,27 @@ func ConvertToSQL(ctx context.Context, r io.Reader, w io.Writer, opts SQLConvert
 			return summary, err
 		}
 		summary.RecordsRead++
-		if len(record) != len(columns) {
-			summary.BytesRead = counting.n
-			return summary, fmt.Errorf("record %d has %d fields, expected %d", summary.RecordsRead, len(record), len(columns))
+		// Project to the selected source columns, in output order. Out-of-range
+		// indices (ragged rows) become empty so a short row doesn't abort the job.
+		row := record
+		if len(opts.SourceColumns) > 0 {
+			row = make([]string, len(opts.SourceColumns))
+			for i, si := range opts.SourceColumns {
+				if si >= 0 && si < len(record) {
+					row[i] = record[si]
+				}
+			}
 		}
-		if err := validateSQLRecordFieldSizes(record, opts.MaxFieldBytes); err != nil {
+		if len(row) != len(columns) {
+			summary.BytesRead = counting.n
+			return summary, fmt.Errorf("record %d has %d fields, expected %d", summary.RecordsRead, len(row), len(columns))
+		}
+		if err := validateSQLRecordFieldSizes(row, opts.MaxFieldBytes); err != nil {
 			summary.BytesRead = counting.n
 			return summary, fmt.Errorf("record %d: %w", summary.RecordsRead, err)
 		}
 
-		tuple, skip, sanitized, err := sqlValuesTuple(record, nulls, opts.OnInvalidValue)
+		tuple, skip, sanitized, err := sqlValuesTuple(row, nulls, opts.OnInvalidValue)
 		if err != nil {
 			summary.BytesRead = counting.n
 			return summary, fmt.Errorf("record %d: %w", summary.RecordsRead, err)
@@ -198,7 +216,7 @@ func ConvertToSQL(ctx context.Context, r io.Reader, w io.Writer, opts SQLConvert
 		}
 		batch = append(batch, tuple)
 		if len(batch) >= opts.InsertBatchSize {
-			if err := writeSQLInsertBatch(writer, opts.TableName, columns, batch); err != nil {
+			if err := writeSQLInsertBatch(writer, opts.InsertVerb, opts.TableName, columns, batch); err != nil {
 				summary.BytesRead = counting.n
 				return summary, err
 			}
@@ -215,7 +233,7 @@ func ConvertToSQL(ctx context.Context, r io.Reader, w io.Writer, opts SQLConvert
 		}
 	}
 	if len(batch) > 0 {
-		if err := writeSQLInsertBatch(writer, opts.TableName, columns, batch); err != nil {
+		if err := writeSQLInsertBatch(writer, opts.InsertVerb, opts.TableName, columns, batch); err != nil {
 			summary.BytesRead = counting.n
 			return summary, err
 		}
@@ -506,6 +524,9 @@ func normalizeSQLConvertOptions(opts SQLConvertOptions) (SQLConvertOptions, erro
 	if opts.InsertBatchSize <= 0 {
 		opts.InsertBatchSize = DefaultSQLInsertBatchSize
 	}
+	if strings.TrimSpace(opts.InsertVerb) == "" {
+		opts.InsertVerb = "INSERT INTO"
+	}
 	if opts.Dialect == "" {
 		opts.Dialect = SQLDialectMySQL
 	}
@@ -621,7 +642,7 @@ func validateSQLRecordFieldSizes(record []string, maxFieldBytes int64) error {
 	return nil
 }
 
-func writeSQLInsertBatch(w io.Writer, table string, columns []string, tuples []string) error {
+func writeSQLInsertBatch(w io.Writer, verb, table string, columns []string, tuples []string) error {
 	if len(tuples) == 0 {
 		return nil
 	}
@@ -637,7 +658,7 @@ func writeSQLInsertBatch(w io.Writer, table string, columns []string, tuples []s
 	if err != nil {
 		return err
 	}
-	_, err = fmt.Fprintf(w, "INSERT INTO %s (%s) VALUES\n  %s;\n", quotedTable, strings.Join(quotedColumns, ", "), strings.Join(tuples, ",\n  "))
+	_, err = fmt.Fprintf(w, "%s %s (%s) VALUES\n  %s;\n", verb, quotedTable, strings.Join(quotedColumns, ", "), strings.Join(tuples, ",\n  "))
 	return err
 }
 

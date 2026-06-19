@@ -260,6 +260,16 @@ func saveDialog(message, defaultName string) (string, error) {
 	return d.PromptForSingleSelection()
 }
 
+// dirDialog prompts for an existing/new folder and returns its path ("" if cancelled).
+func dirDialog(message string) (string, error) {
+	d := application.Get().Dialog.OpenFile().
+		SetMessage(message).
+		CanChooseDirectories(true).
+		CanChooseFiles(false).
+		CanCreateDirectories(true)
+	return d.PromptForSingleSelection()
+}
+
 // CsvProjectViaDialog writes a new CSV keeping only keepIndices (0-based) in the
 // given order — used for drop-column and reorder.
 func (s *FileService) CsvProjectViaDialog(fileID string, delimiter string, keepIndices []int) (TransformResult, error) {
@@ -359,4 +369,108 @@ func sqlTableName(name string) string {
 		return "imported"
 	}
 	return name
+}
+
+// CsvSqlColumnConfig describes one output column of a CSV→SQL conversion.
+type CsvSqlColumnConfig struct {
+	Source  int    `json:"source"`  // 0-based source field index
+	Name    string `json:"name"`    // output column name
+	Type    string `json:"type"`    // SQL type (used only when includeCreate)
+	Include bool   `json:"include"` // whether to emit this column
+}
+
+// CsvSqlConfig is the full, flexible CSV→SQL conversion request.
+type CsvSqlConfig struct {
+	Delimiter     string               `json:"delimiter"`
+	HasHeader     bool                 `json:"hasHeader"`
+	TableName     string               `json:"tableName"`
+	Columns       []CsvSqlColumnConfig `json:"columns"`
+	IncludeCreate bool                 `json:"includeCreate"`
+	InsertMode    string               `json:"insertMode"` // insert | ignore | replace
+	BatchSize     int                  `json:"batchSize"`
+	NullValues    []string             `json:"nullValues"`
+	OnInvalid     string               `json:"onInvalid"` // fail | skip-row | replace
+}
+
+func csvSqlOptions(cfg CsvSqlConfig) (csv.SQLConvertOptions, error) {
+	var src []int
+	var names, types []string
+	for _, c := range cfg.Columns {
+		if !c.Include {
+			continue
+		}
+		src = append(src, c.Source)
+		names = append(names, strings.TrimSpace(c.Name))
+		types = append(types, c.Type)
+	}
+	if len(names) == 0 {
+		return csv.SQLConvertOptions{}, fmt.Errorf("select at least one column to convert")
+	}
+	verb := "INSERT INTO"
+	switch strings.ToLower(strings.TrimSpace(cfg.InsertMode)) {
+	case "ignore":
+		verb = "INSERT IGNORE INTO"
+	case "replace":
+		verb = "REPLACE INTO"
+	}
+	return csv.SQLConvertOptions{
+		Delimiter:          delimiterRune(cfg.Delimiter),
+		TableName:          sqlTableName(cfg.TableName),
+		HasHeader:          cfg.HasHeader,
+		Columns:            names,
+		ColumnTypes:        types,
+		SourceColumns:      src,
+		IncludeCreateTable: cfg.IncludeCreate,
+		InsertVerb:         verb,
+		InsertBatchSize:    cfg.BatchSize,
+		NullValues:         cfg.NullValues,
+		OnInvalidValue:     csv.InvalidValuePolicy(strings.TrimSpace(cfg.OnInvalid)),
+	}, nil
+}
+
+// CsvToSQLConfigPreview returns a short sample of the SQL for a full config.
+func (s *FileService) CsvToSQLConfigPreview(fileID string, cfg CsvSqlConfig) (string, error) {
+	r, _, err := s.csvSampleReader(fileID)
+	if err != nil {
+		return "", err
+	}
+	opts, err := csvSqlOptions(cfg)
+	if err != nil {
+		return "", err
+	}
+	rep, err := csv.PreviewSQLConversionContext(context.Background(), r, csv.SQLPreviewOptions{
+		SQLConvertOptions: opts,
+		MaxBytes:          csvSampleBytes,
+		MaxRows:           20,
+	})
+	if err != nil {
+		return "", err
+	}
+	return rep.SQL, nil
+}
+
+// CsvToSQLConfigViaDialog streams the whole CSV to a .sql file using a full
+// column-mapping config (select/rename/type, insert mode, batch, null, policy).
+func (s *FileService) CsvToSQLConfigViaDialog(fileID string, cfg CsvSqlConfig) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	opts, err := csvSqlOptions(cfg)
+	if err != nil {
+		return TransformResult{}, err
+	}
+	dst, err := saveDialog("Save SQL as", sqlTableName(cfg.TableName)+".sql")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.ConvertToSQLFile(context.Background(), f.Path, dst, opts)
+	if err != nil {
+		return TransformResult{}, err
+	}
+	note := fmt.Sprintf("table %q · %d rows", sum.TableName, sum.RowsWritten)
+	if sum.SkippedRows > 0 || sum.SanitizedRows > 0 {
+		note += fmt.Sprintf(" (%d skipped, %d sanitized)", sum.SkippedRows, sum.SanitizedRows)
+	}
+	return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RowsWritten, Note: note}, nil
 }

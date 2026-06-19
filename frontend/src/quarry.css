@@ -824,7 +824,7 @@ body {
   white-space: pre;
 }
 
-.q-ttables { display: flex; flex-direction: column; gap: 3px; }
+.q-ttables { display: flex; flex-direction: column; gap: 3px; max-height: 260px; overflow-y: auto; }
 .q-ttable {
   display: flex;
   align-items: center;
@@ -836,7 +836,74 @@ body {
   font-family: var(--mono);
   font-size: 11.5px;
 }
-.q-ttable .q-tcol-n { flex: 1; }
+.q-ttable .q-tcol-n { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-tcol-sz { color: var(--muted); font-variant-numeric: tabular-nums; }
+.q-tbtns { display: flex; gap: 3px; }
+
+/* section heading inside tools */
+.q-tsection {
+  margin: 14px 0 4px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+}
+.q-tlabel-inline {
+  margin: 0;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.q-num {
+  width: 70px;
+  padding: 5px 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12.5px;
+}
+
+/* CSV → SQL column config */
+.q-colcfg {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 240px;
+  overflow-y: auto;
+  padding: 2px;
+}
+.q-colrow {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.q-colrow-off {
+  opacity: 0.45;
+}
+.q-colname {
+  flex: 1;
+  min-width: 0;
+  padding: 4px 7px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.q-coltype {
+  width: 118px;
+  flex-shrink: 0;
+  padding: 4px 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
 
 /* ---- CSV grid (spreadsheet view) ---- */
 .q-gridwrap {
