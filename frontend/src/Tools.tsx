@@ -44,12 +44,14 @@ function presetArgLabels(name: string): string[] {
 interface Props {
   fileId: string;
   detected: string;
+  analysis: SqlSummaryResult | null;
+  onAnalyze: (fileId: string) => Promise<SqlSummaryResult>;
   onNotice: (s: string) => void;
   onError: (s: string) => void;
   onClose: () => void;
 }
 
-export default function Tools({ fileId, detected, onNotice, onError, onClose }: Props) {
+export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice, onError, onClose }: Props) {
   const d = detected.toLowerCase();
   const isCsv = d === "csv" || d === "tsv";
 
@@ -70,8 +72,8 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
   const [onInvalid, setOnInvalid] = useState("fail");
   const [sqlPreviewText, setSqlPreviewText] = useState("");
 
-  // SQL state
-  const [sqlSummary, setSqlSummary] = useState<SqlSummaryResult | null>(null);
+  // SQL state (analysis is lifted to App; shared with palette + X-ray)
+  const sqlSummary = analysis;
   const [find, setFind] = useState("");
   const [repl, setRepl] = useState("");
   const [regex, setRegex] = useState(false);
@@ -83,7 +85,7 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    setInspect(null); setSchema([]); setPreview(null); setCols([]); setSqlSummary(null); setSqlPreviewText("");
+    setInspect(null); setSchema([]); setPreview(null); setCols([]); setSqlPreviewText("");
     if (!isCsv) {
       (async () => {
         try {
@@ -178,8 +180,7 @@ export default function Tools({ fileId, detected, onNotice, onError, onClose }: 
     setBusy(true);
     onNotice("Analyzing dump…");
     try {
-      const s = (await FileService.SqlAnalyze(fileId)) as SqlSummaryResult;
-      setSqlSummary(s);
+      const s = await onAnalyze(fileId);
       onNotice(`Found ${s.tables.length} tables`);
     } catch (e: any) {
       onError(String(e?.message ?? e));

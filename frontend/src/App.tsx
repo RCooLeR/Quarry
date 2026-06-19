@@ -11,6 +11,8 @@ import MenuBar from "./MenuBar";
 import type { MenuDef, MenuItem } from "./MenuBar";
 import CommandPalette from "./CommandPalette";
 import type { Command } from "./CommandPalette";
+import XRay from "./XRay";
+import type { XRayRegion } from "./XRay";
 import "./quarry.css";
 
 interface Tab {
@@ -26,6 +28,9 @@ interface StagedEditData {
   old: string;
   new: string;
 }
+
+interface SqlTableInfo { name: string; createOffset: number; insertOffset: number; bytes: number; }
+interface SqlSummaryResult { tables: SqlTableInfo[]; createTables: number; insertTables: number; definerCount: number; header: boolean; }
 
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -77,6 +82,8 @@ function App() {
   const [hexView, setHexView] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [analyses, setAnalyses] = useState<Record<string, SqlSummaryResult>>({});
+  const [xrayOn, setXrayOn] = useState(true);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -148,6 +155,14 @@ function App() {
     } catch {
       setStagedEdits([]);
     }
+  };
+
+  // Run (or re-run) SQL analysis and cache it per file; shared by the Tools
+  // panel, the command palette (jump-to-table), and the file X-ray.
+  const analyze = async (fileId: string): Promise<SqlSummaryResult> => {
+    const s = (await FileService.SqlAnalyze(fileId)) as SqlSummaryResult;
+    setAnalyses((prev) => ({ ...prev, [fileId]: s }));
+    return s;
   };
 
   const showMeta = async (meta: FileMetaData) => {
@@ -410,6 +425,8 @@ function App() {
       label: "View",
       items: [
         { label: "Sidebar", shortcut: "Ctrl+B", checked: !sidebarCollapsed, onClick: () => setSidebarCollapsed((v) => !v) },
+        { label: "File map (X-ray)", checked: xrayOn, onClick: () => setXrayOn((v) => !v) },
+        { label: "Command palette…", shortcut: "Ctrl+P", onClick: () => setPaletteOpen(true) },
         { separator: true },
         { label: "Plain text", checked: !hexView && !gridView, disabled: !hasFiles, onClick: showText },
         { label: "Hex view", checked: hexView, disabled: !hasFiles, onClick: () => { setGridView(false); setHexView((v) => !v); } },
@@ -442,6 +459,30 @@ function App() {
     { id: "grid", group: "View", label: "Toggle grid view", run: () => { setHexView(false); setGridView((v) => !v); } },
     { id: "tools", group: "Tools", label: (isCsv || isSql) ? "Toggle data tools panel" : "Data tools (CSV/SQL only)", run: () => (isCsv || isSql) && setToolsOpen((v) => !v) },
   ];
+
+  // File X-ray regions + table-jump commands, from cached analysis of the active file.
+  const analysis = activeId ? analyses[activeId] : null;
+  const xrayRegions: XRayRegion[] = [];
+  if (analysis && activeTab) {
+    const sorted = analysis.tables
+      .map((t) => ({ off: t.createOffset >= 0 ? t.createOffset : t.insertOffset, name: t.name, bytes: t.bytes }))
+      .filter((t) => t.off >= 0)
+      .sort((x, y) => x.off - y.off);
+    for (let i = 0; i < sorted.length; i++) {
+      const t = sorted[i];
+      const end = t.bytes > 0 ? t.off + t.bytes : sorted[i + 1]?.off ?? activeTab.meta.size;
+      xrayRegions.push({ start: t.off, end, name: t.name });
+    }
+  }
+  const seekTo = (byte: number) => void editorRef.current?.gotoByte(byte);
+  if (analysis) {
+    for (const t of analysis.tables.slice(0, 300)) {
+      const off = t.createOffset >= 0 ? t.createOffset : t.insertOffset;
+      if (off >= 0) {
+        commands.push({ id: "tbl:" + t.name, group: "Table", label: "Jump to " + t.name, hint: fmtBytes(t.bytes), run: () => seekTo(off) });
+      }
+    }
+  }
 
   return (
     <div className="q-app">
@@ -500,7 +541,17 @@ function App() {
           />
         )}
         <div className="q-stage">
-          <div className="q-editor" ref={hostRef} />
+          <div className={"q-editor" + (xrayOn && hasFiles ? " q-editor-xray" : "")} ref={hostRef} />
+
+          {xrayOn && activeTab && status && (
+            <XRay
+              size={activeTab.meta.size}
+              regions={xrayRegions}
+              vpStart={status.startByte}
+              vpEnd={status.endByte}
+              onSeek={seekTo}
+            />
+          )}
 
         {gridView && activeTab && ["csv", "tsv"].includes(activeTab.meta.detected.toLowerCase()) && (
           <CsvGrid key={activeTab.fileId} fileId={activeTab.fileId} onError={setError} />
@@ -587,6 +638,8 @@ function App() {
             key={activeTab.fileId}
             fileId={activeTab.fileId}
             detected={activeTab.meta.detected}
+            analysis={activeId ? analyses[activeId] ?? null : null}
+            onAnalyze={analyze}
             onNotice={setNotice}
             onError={setError}
             onClose={() => setToolsOpen(false)}

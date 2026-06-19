@@ -198,6 +198,42 @@ body {
   inset: 0;
   overflow: hidden;
 }
+.q-editor-xray {
+  right: 22px;
+}
+
+/* ---- file X-ray rail ---- */
+.q-xray {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 22px;
+  z-index: 6;
+  background: var(--panel);
+  border-left: 1px solid var(--border);
+  cursor: pointer;
+}
+.q-xray-band {
+  position: absolute;
+  left: 3px;
+  right: 3px;
+  border-radius: 2px;
+  min-height: 2px;
+}
+.q-xray-band:hover {
+  left: 0;
+  right: 0;
+}
+.q-xray-vp {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border: 1px solid var(--text);
+  background: rgba(205, 214, 228, 0.14);
+  border-radius: 2px;
+  pointer-events: none;
+}
 
 .q-editor .cm-editor {
   height: 100%;
