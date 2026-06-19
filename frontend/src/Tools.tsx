@@ -81,6 +81,7 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const [presets, setPresets] = useState<string[]>([]);
   const [preset, setPreset] = useState("");
   const [pa, setPa] = useState<string[]>(["", "", "", ""]);
+  const [sampleRows, setSampleRows] = useState(100);
 
   const [busy, setBusy] = useState(false);
 
@@ -192,6 +193,7 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const doSchema = (name: string) => run(async () => (await FileService.SqlExtractSchemaViaDialog(fileId, name)) as TransformResult);
   const doData = (name: string) => run(async () => (await FileService.SqlExtractDataViaDialog(fileId, name)) as TransformResult);
   const doSplit = () => run(async () => (await FileService.SqlSplitByTableViaDialog(fileId)) as TransformResult);
+  const doSample = () => run(async () => (await FileService.SqlSampleFixtureViaDialog(fileId, sampleRows)) as TransformResult);
   const doReplace = () => run(async () => (await FileService.SqlReplaceViaDialog(fileId, find, repl, regex, ci, false)) as TransformResult);
   const doPreset = () => run(async () => (await FileService.SqlApplyPresetViaDialog(fileId, preset, pa[0], pa[1], pa[2], pa[3])) as TransformResult);
 
@@ -301,6 +303,11 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
                 <div className="q-trow">
                   <button className="q-btn" disabled={busy} onClick={doSplit} title="Write one .sql file per table into a folder">Split by table → folder</button>
                   <button className="q-btn" disabled={busy} onClick={() => doSchema("")} title="Export the whole-dump schema (DDL only)">Whole schema</button>
+                </div>
+                <div className="q-trow">
+                  <button className="q-btn q-btn-primary" disabled={busy} onClick={doSample} title="Small shareable dump: each table's DDL + first N rows">Dev fixture →</button>
+                  <label className="q-tlabel q-tlabel-inline">rows/table</label>
+                  <input className="q-num" type="number" min={1} value={sampleRows} onChange={(e) => setSampleRows(Math.max(1, Number(e.target.value) || 1))} />
                 </div>
                 <label className="q-tlabel">Tables ({sqlSummary.tables.length}) — extract / schema / data</label>
                 <div className="q-ttables">

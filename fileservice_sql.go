@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -271,6 +272,156 @@ func exportRanges(doc *document.FileDocument, dst string, ranges [][2]int64) (in
 		return total, err
 	}
 	return total, out.Sync()
+}
+
+// SqlSampleFixtureViaDialog writes a small "dev fixture" dump: each table's DDL
+// plus only its first rowsPerTable INSERT rows. Turns a prod dump into a tiny,
+// shareable seed without ever materialising the whole file.
+func (s *FileService) SqlSampleFixtureViaDialog(fileID string, rowsPerTable int) (TransformResult, error) {
+	f, summary, err := s.sqlSummaryFor(fileID)
+	if err != nil {
+		return TransformResult{}, err
+	}
+	if rowsPerTable <= 0 {
+		rowsPerTable = 100
+	}
+	ranges, err := sqlextract.PlanTableRanges(summary, f.Doc.Size(), sqlextract.PlanOptions{})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	dst, err := saveDialog("Save dev fixture as", "fixture.sql")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+
+	out, err := os.Create(dst)
+	if err != nil {
+		return TransformResult{}, err
+	}
+	defer out.Close()
+	bw := bufio.NewWriterSize(out, 1<<20)
+
+	// Leading preamble (SET NAMES / charset) so the fixture re-imports cleanly.
+	if len(ranges) > 0 && ranges[0].StartOffset > 0 {
+		if err := copyRange(bw, f.Doc, 0, ranges[0].StartOffset); err != nil {
+			return TransformResult{}, err
+		}
+	}
+	for _, r := range ranges {
+		sch := schemaRegion(r)
+		if err := copyRange(bw, f.Doc, sch[0], sch[1]); err != nil {
+			return TransformResult{}, err
+		}
+		dat := dataRegion(r)
+		if dat[1] > dat[0] {
+			sample, err := sampleInsertRows(f.Doc, dat[0], dat[1], rowsPerTable)
+			if err != nil {
+				return TransformResult{}, err
+			}
+			if _, err := bw.Write(sample); err != nil {
+				return TransformResult{}, err
+			}
+		}
+	}
+	if err := bw.Flush(); err != nil {
+		return TransformResult{}, err
+	}
+	if err := out.Sync(); err != nil {
+		return TransformResult{}, err
+	}
+	info, _ := os.Stat(dst)
+	var size int64
+	if info != nil {
+		size = info.Size()
+	}
+	return TransformResult{
+		OutputPath:     dst,
+		RecordsWritten: int64(len(ranges)),
+		Note:           fmt.Sprintf("%d tables · ≤%d rows each · %s", len(ranges), rowsPerTable, fmtByteCount(size)),
+	}, nil
+}
+
+// copyRange streams doc[start:end) into bw.
+func copyRange(bw *bufio.Writer, doc *document.FileDocument, start, end int64) error {
+	if end <= start {
+		return nil
+	}
+	_, err := io.Copy(bw, io.NewSectionReader(doc, start, end-start))
+	return err
+}
+
+// sampleInsertRows returns the prefix of an INSERT region doc[start:end) that
+// contains the first maxRows value tuples, terminated as valid SQL. It counts
+// top-level "(...)" tuples, respecting single-quoted strings with backslash and
+// doubled-quote escapes, and reads the region in chunks so it stops early.
+func sampleInsertRows(r io.ReaderAt, start, end int64, maxRows int) ([]byte, error) {
+	var out bytes.Buffer
+	rows, depth := 0, 0
+	inStr, esc := false, false
+	pos := start
+	const chunk = 256 * 1024
+	buf := make([]byte, chunk)
+	for pos < end && rows < maxRows {
+		want := int64(chunk)
+		if want > end-pos {
+			want = end - pos
+		}
+		n, err := r.ReadAt(buf[:want], pos)
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		if n == 0 {
+			break
+		}
+		stop := -1
+		for i := 0; i < n; i++ {
+			c := buf[i]
+			if inStr {
+				if esc {
+					esc = false
+				} else if c == '\\' {
+					esc = true
+				} else if c == '\'' {
+					inStr = false
+				}
+				continue
+			}
+			switch c {
+			case '\'':
+				inStr = true
+			case '(':
+				depth++
+			case ')':
+				if depth > 0 {
+					depth--
+					if depth == 0 {
+						rows++
+						if rows >= maxRows {
+							stop = i + 1
+						}
+					}
+				}
+			}
+			if stop >= 0 {
+				break
+			}
+		}
+		if stop >= 0 {
+			out.Write(buf[:stop])
+			break
+		}
+		out.Write(buf[:n])
+		pos += int64(n)
+	}
+	trimmed := bytes.TrimRight(out.Bytes(), " \t\r\n,")
+	if len(trimmed) == 0 {
+		return nil, nil
+	}
+	tail := []byte(";\n")
+	if trimmed[len(trimmed)-1] == ';' {
+		tail = []byte("\n")
+	}
+	return append(trimmed, tail...), nil
 }
 
 // SqlReplaceViaDialog streams a find/replace (plain or regex) to a new file —
