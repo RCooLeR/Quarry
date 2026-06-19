@@ -704,6 +704,7 @@ function App() {
             fileId={activeTab.fileId}
             detected={activeTab.meta.detected}
             analysis={activeId ? analyses[activeId] ?? null : null}
+            otherFiles={tabs.filter((t) => t.fileId !== activeTab.fileId).map((t) => ({ id: t.fileId, name: t.meta.path.replace(/^.*[\\/]/, ""), detected: t.meta.detected }))}
             onAnalyze={analyze}
             onNotice={setNotice}
             onError={setError}

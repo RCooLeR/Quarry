@@ -16,6 +16,8 @@ import (
 	sqlanalyze "github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
 	sqlextract "github.com/quarry/quarry-wails3/internal/plugins/sql/extract"
 	sqlpreset "github.com/quarry/quarry-wails3/internal/plugins/sql/preset"
+	sqlreshape "github.com/quarry/quarry-wails3/internal/plugins/sql/reshape"
+	sqlschemadiff "github.com/quarry/quarry-wails3/internal/plugins/sql/schemadiff"
 	"github.com/quarry/quarry-wails3/internal/replace"
 	"github.com/quarry/quarry-wails3/internal/session"
 )
@@ -531,6 +533,106 @@ func (s *FileService) SqlReplaceViaDialog(fileID, find, replaceWith string, rege
 		RecordsWritten: sum.Matches,
 		Note:           fmt.Sprintf("%d replacements", sum.Matches),
 	}, nil
+}
+
+// SqlReshapeInsertsViaDialog rewrites INSERT row layout, streaming to a new file.
+// mode "single" explodes extended INSERTs into one row each (good for line diffs);
+// mode "multi" batches consecutive single-row INSERTs (good for fast re-import).
+func (s *FileService) SqlReshapeInsertsViaDialog(fileID, mode string, batchSize int) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	m := sqlreshape.ModeSingleRow
+	defName := "single-row.sql"
+	if strings.EqualFold(strings.TrimSpace(mode), "multi") {
+		m = sqlreshape.ModeMultiRow
+		defName = "batched.sql"
+	}
+	dst, err := saveDialog("Save reshaped SQL as", defName)
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := sqlreshape.ReshapeInsertsFile(context.Background(), f.Path, dst, sqlreshape.Options{
+		Mode:      m,
+		BatchSize: batchSize,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{
+		OutputPath:     dst,
+		RecordsRead:    sum.StatementsRead,
+		RecordsWritten: sum.StatementsWritten,
+		Note:           sqlreshape.FormatNote(m, sum),
+	}, nil
+}
+
+// SqlSchemaDiffResult is the structural diff between two dumps.
+type SqlSchemaDiffResult struct {
+	FileA          string                       `json:"fileA"`
+	FileB          string                       `json:"fileB"`
+	AddedTables    []string                     `json:"addedTables"`
+	RemovedTables  []string                     `json:"removedTables"`
+	ChangedTables  []sqlschemadiff.TableDiff    `json:"changedTables"`
+	UnchangedCount int                          `json:"unchangedCount"`
+}
+
+// SqlSchemaDiff compares the table/column structure of two analyzed dumps
+// (A = baseline, B = new). Both must be analyzed first.
+func (s *FileService) SqlSchemaDiff(fileIDA, fileIDB string) (SqlSchemaDiffResult, error) {
+	fa, ta, err := s.parsedSchema(fileIDA)
+	if err != nil {
+		return SqlSchemaDiffResult{}, err
+	}
+	fb, tb, err := s.parsedSchema(fileIDB)
+	if err != nil {
+		return SqlSchemaDiffResult{}, err
+	}
+	res := sqlschemadiff.Diff(ta, tb)
+	return SqlSchemaDiffResult{
+		FileA:          baseName(fa.Path),
+		FileB:          baseName(fb.Path),
+		AddedTables:    res.AddedTables,
+		RemovedTables:  res.RemovedTables,
+		ChangedTables:  res.ChangedTables,
+		UnchangedCount: res.UnchangedCount,
+	}, nil
+}
+
+// parsedSchema reads each table's CREATE TABLE DDL from a dump and parses its
+// columns, using the cached analysis for byte ranges.
+func (s *FileService) parsedSchema(fileID string) (*session.File, []sqlschemadiff.Table, error) {
+	f, summary, err := s.sqlSummaryFor(fileID)
+	if err != nil {
+		return nil, nil, err
+	}
+	ranges, err := sqlextract.PlanTableRanges(summary, f.Doc.Size(), sqlextract.PlanOptions{})
+	if err != nil {
+		return nil, nil, err
+	}
+	tables := make([]sqlschemadiff.Table, 0, len(ranges))
+	for _, r := range ranges {
+		reg := schemaRegion(r)
+		if reg[1] <= reg[0] {
+			tables = append(tables, sqlschemadiff.Table{Name: r.Name})
+			continue
+		}
+		ddl, rerr := f.Doc.ReadRange(reg[0], reg[1])
+		if rerr != nil {
+			return nil, nil, rerr
+		}
+		tables = append(tables, sqlschemadiff.Table{Name: r.Name, Columns: sqlschemadiff.ParseColumns(ddl)})
+	}
+	return f, tables, nil
+}
+
+func baseName(p string) string {
+	p = strings.ReplaceAll(p, "\\", "/")
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // SqlListPresets returns the available SQL cleanup preset names.

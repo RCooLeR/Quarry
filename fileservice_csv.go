@@ -498,6 +498,94 @@ func (s *FileService) CsvRedactViaDialog(fileID, delimiter string, hasHeader boo
 	}, nil
 }
 
+// CsvFilterViaDialog writes a new CSV keeping only rows where the chosen column
+// matches op/value (eq, ne, contains, gt, lt, empty, nonempty). Source untouched.
+func (s *FileService) CsvFilterViaDialog(fileID, delimiter string, hasHeader bool, column int, op, value string, negate bool) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	dst, err := saveDialog("Save filtered CSV as", "filtered.csv")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.FilterRowsFile(context.Background(), f.Path, dst, csv.FilterOptions{
+		Delimiter: delimiterRune(delimiter),
+		HasHeader: hasHeader,
+		Column:    column,
+		Op:        strings.TrimSpace(op),
+		Value:     value,
+		Negate:    negate,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{
+		OutputPath:     dst,
+		RecordsRead:    sum.RecordsRead,
+		RecordsWritten: sum.RecordsWritten,
+		Note:           "rows matching filter kept",
+	}, nil
+}
+
+// CsvDedupeViaDialog writes a new CSV dropping duplicate rows — by a key column
+// (keyColumn>=0) or the whole row (keyColumn<0). First occurrence wins.
+func (s *FileService) CsvDedupeViaDialog(fileID, delimiter string, hasHeader bool, keyColumn int) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	dst, err := saveDialog("Save deduplicated CSV as", "deduped.csv")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.DedupeRowsFile(context.Background(), f.Path, dst, csv.DedupeOptions{
+		Delimiter: delimiterRune(delimiter),
+		HasHeader: hasHeader,
+		KeyColumn: keyColumn,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	dropped := sum.RecordsRead - sum.RecordsWritten
+	return TransformResult{
+		OutputPath:     dst,
+		RecordsRead:    sum.RecordsRead,
+		RecordsWritten: sum.RecordsWritten,
+		Note:           fmt.Sprintf("%d duplicate rows removed", dropped),
+	}, nil
+}
+
+// CsvSampleViaDialog writes a new CSV keeping every Nth data row (header kept),
+// for shrinking a huge dump to a representative slice.
+func (s *FileService) CsvSampleViaDialog(fileID, delimiter string, hasHeader bool, everyN int) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if everyN <= 0 {
+		everyN = 10
+	}
+	dst, err := saveDialog("Save sampled CSV as", "sampled.csv")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.SampleRowsFile(context.Background(), f.Path, dst, csv.SampleOptions{
+		Delimiter: delimiterRune(delimiter),
+		HasHeader: hasHeader,
+		EveryN:    everyN,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{
+		OutputPath:     dst,
+		RecordsRead:    sum.RecordsRead,
+		RecordsWritten: sum.RecordsWritten,
+		Note:           fmt.Sprintf("kept every %dth row", everyN),
+	}, nil
+}
+
 // CsvToSQLConfigPreview returns a short sample of the SQL for a full config.
 func (s *FileService) CsvToSQLConfigPreview(fileID string, cfg CsvSqlConfig) (string, error) {
 	r, _, err := s.csvSampleReader(fileID)

@@ -46,17 +46,24 @@ function presetArgLabels(name: string): string[] {
   return [];
 }
 
+interface OtherFile { id: string; name: string; detected: string; }
+
+interface ColumnChange { name: string; old: string; new: string; }
+interface TableDiff { name: string; addedColumns: { name: string; definition: string }[]; removedColumns: { name: string; definition: string }[]; changedColumns: ColumnChange[]; }
+interface SqlSchemaDiffResult { fileA: string; fileB: string; addedTables: string[]; removedTables: string[]; changedTables: TableDiff[]; unchangedCount: number; }
+
 interface Props {
   fileId: string;
   detected: string;
   analysis: SqlSummaryResult | null;
+  otherFiles: OtherFile[];
   onAnalyze: (fileId: string) => Promise<SqlSummaryResult>;
   onNotice: (s: string) => void;
   onError: (s: string) => void;
   onClose: () => void;
 }
 
-export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice, onError, onClose }: Props) {
+export default function Tools({ fileId, detected, analysis, otherFiles, onAnalyze, onNotice, onError, onClose }: Props) {
   const d = detected.toLowerCase();
   const isCsv = d === "csv" || d === "tsv";
 
@@ -80,6 +87,13 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const [redactFixed, setRedactFixed] = useState("REDACTED");
   const [profile, setProfile] = useState<CsvProfileResult | null>(null);
   const [lint, setLint] = useState<SqlLintResult | null>(null);
+  // filter / dedupe / sample
+  const [filterCol, setFilterCol] = useState(0);
+  const [filterOp, setFilterOp] = useState("contains");
+  const [filterVal, setFilterVal] = useState("");
+  const [filterNeg, setFilterNeg] = useState(false);
+  const [dedupeKey, setDedupeKey] = useState(-1);
+  const [sampleEvery, setSampleEvery] = useState(10);
 
   // SQL state (analysis is lifted to App; shared with palette + X-ray)
   const sqlSummary = analysis;
@@ -91,6 +105,10 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const [preset, setPreset] = useState("");
   const [pa, setPa] = useState<string[]>(["", "", "", ""]);
   const [sampleRows, setSampleRows] = useState(100);
+  const [reshapeMode, setReshapeMode] = useState("single");
+  const [reshapeBatch, setReshapeBatch] = useState(100);
+  const [diffTarget, setDiffTarget] = useState("");
+  const [diff, setDiff] = useState<SqlSchemaDiffResult | null>(null);
 
   const [busy, setBusy] = useState(false);
 
@@ -190,6 +208,13 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const doProfile = async () => {
     try { setProfile((await FileService.CsvProfile(fileId, delim, hasHeader)) as CsvProfileResult); } catch (e: any) { onError(String(e?.message ?? e)); }
   };
+  const needsValue = !(filterOp === "empty" || filterOp === "nonempty");
+  const doFilter = () =>
+    run(async () => (await FileService.CsvFilterViaDialog(fileId, delim, hasHeader, filterCol, filterOp, filterVal, filterNeg)) as TransformResult);
+  const doDedupe = () =>
+    run(async () => (await FileService.CsvDedupeViaDialog(fileId, delim, hasHeader, dedupeKey)) as TransformResult);
+  const doSampleCsv = () =>
+    run(async () => (await FileService.CsvSampleViaDialog(fileId, delim, hasHeader, sampleEvery)) as TransformResult);
 
   // SQL tools
   const doAnalyze = async () => {
@@ -214,6 +239,23 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   };
   const doReplace = () => run(async () => (await FileService.SqlReplaceViaDialog(fileId, find, repl, regex, ci, false)) as TransformResult);
   const doPreset = () => run(async () => (await FileService.SqlApplyPresetViaDialog(fileId, preset, pa[0], pa[1], pa[2], pa[3])) as TransformResult);
+  const doReshape = () => run(async () => (await FileService.SqlReshapeInsertsViaDialog(fileId, reshapeMode, reshapeBatch)) as TransformResult);
+  const doDiff = async () => {
+    if (!diffTarget) return;
+    setBusy(true);
+    onNotice("Diffing schemas…");
+    try {
+      const r = (await FileService.SqlSchemaDiff(fileId, diffTarget)) as SqlSchemaDiffResult;
+      setDiff(r);
+      const changes = r.addedTables.length + r.removedTables.length + r.changedTables.length;
+      onNotice(changes === 0 ? "Schemas are identical" : `${changes} table changes`);
+    } catch (e: any) {
+      onError(String(e?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const sqlOthers = otherFiles.filter((o) => ["sql"].includes(o.detected.toLowerCase()));
 
   const delims = DELIMS.some((x) => x.value === delim) ? DELIMS : [{ value: delim, label: `Detected (${JSON.stringify(delim)})` }, ...DELIMS];
   const typeOptions = (t: string) => (SQL_TYPES.includes(t) ? SQL_TYPES : [t, ...SQL_TYPES]);
@@ -329,6 +371,41 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
               <button className="q-btn q-btn-primary" disabled={busy || redactCols.length === 0} onClick={doRedact}>Redact →</button>
             </div>
 
+            <div className="q-tsection">Filter / dedupe / sample → new CSV</div>
+            <div className="q-trow">
+              <select className="q-select" value={filterCol} onChange={(e) => setFilterCol(Number(e.target.value))}>
+                {schema.map((c, i) => (<option key={i} value={i}>{c.name}</option>))}
+              </select>
+              <select className="q-select" value={filterOp} onChange={(e) => setFilterOp(e.target.value)}>
+                <option value="contains">contains</option>
+                <option value="eq">equals</option>
+                <option value="ne">not equals</option>
+                <option value="gt">&gt; (number)</option>
+                <option value="lt">&lt; (number)</option>
+                <option value="empty">is empty</option>
+                <option value="nonempty">is not empty</option>
+              </select>
+            </div>
+            <div className="q-trow">
+              {needsValue && <input className="q-select" placeholder="value" value={filterVal} onChange={(e) => setFilterVal(e.target.value)} />}
+              <label className="q-check"><input type="checkbox" checked={filterNeg} onChange={(e) => setFilterNeg(e.target.checked)} /> invert</label>
+              <button className="q-btn q-btn-primary" disabled={busy || schema.length === 0} onClick={doFilter}>Filter rows →</button>
+            </div>
+            <div className="q-trow">
+              <label className="q-tlabel q-tlabel-inline">Dedupe by</label>
+              <select className="q-select" value={dedupeKey} onChange={(e) => setDedupeKey(Number(e.target.value))}>
+                <option value={-1}>whole row</option>
+                {schema.map((c, i) => (<option key={i} value={i}>{c.name}</option>))}
+              </select>
+              <button className="q-btn" disabled={busy} onClick={doDedupe}>Dedupe →</button>
+            </div>
+            <div className="q-trow">
+              <label className="q-tlabel q-tlabel-inline">Keep every</label>
+              <input className="q-num" type="number" min={2} value={sampleEvery} onChange={(e) => setSampleEvery(Math.max(2, Number(e.target.value) || 2))} />
+              <label className="q-tlabel q-tlabel-inline">th row</label>
+              <button className="q-btn" disabled={busy} onClick={doSampleCsv}>Sample →</button>
+            </div>
+
             <div className="q-tsection">Profile (sampled)</div>
             <button className="q-btn" disabled={busy} onClick={() => void doProfile()}>Profile columns</button>
             {profile && (
@@ -422,6 +499,58 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
             <div className="q-trow">
               <button className="q-btn q-btn-primary" disabled={busy || !preset} onClick={doPreset}>Apply preset</button>
             </div>
+
+            <div className="q-tsection">Reshape INSERTs → new file</div>
+            <div className="q-trow">
+              <select className="q-select" value={reshapeMode} onChange={(e) => setReshapeMode(e.target.value)}>
+                <option value="single">Explode → one row per INSERT</option>
+                <option value="multi">Batch → extended INSERTs</option>
+              </select>
+              {reshapeMode === "multi" && (
+                <>
+                  <label className="q-tlabel q-tlabel-inline">rows/INSERT</label>
+                  <input className="q-num" type="number" min={1} value={reshapeBatch} onChange={(e) => setReshapeBatch(Math.max(1, Number(e.target.value) || 1))} />
+                </>
+              )}
+            </div>
+            <div className="q-trow">
+              <button className="q-btn q-btn-primary" disabled={busy} onClick={doReshape}>Reshape → file</button>
+              <span className="q-thint">{reshapeMode === "single" ? "one row per line — great for diffs" : "fewer, larger INSERTs — faster import"}</span>
+            </div>
+
+            <div className="q-tsection">Schema diff (vs another open dump)</div>
+            {sqlOthers.length === 0 ? (
+              <div className="q-thint">Open a second .sql dump to compare.</div>
+            ) : (
+              <>
+                <div className="q-trow">
+                  <select className="q-select" value={diffTarget} onChange={(e) => setDiffTarget(e.target.value)}>
+                    <option value="">choose a dump…</option>
+                    {sqlOthers.map((o) => (<option key={o.id} value={o.id}>{o.name}</option>))}
+                  </select>
+                  <button className="q-btn q-btn-primary" disabled={busy || !diffTarget} onClick={() => void doDiff()}>Diff schemas</button>
+                </div>
+                <div className="q-thint">Both dumps must be analyzed first (Analyze dump).</div>
+                {diff && (
+                  <div className="q-profile">
+                    <div className="q-thint">{diff.fileA} → {diff.fileB} · {diff.unchangedCount} unchanged</div>
+                    {diff.addedTables.length > 0 && <div className="q-lint q-lint-info"><span className="q-lint-t">+ {diff.addedTables.length} tables</span><span className="q-thint">{diff.addedTables.join(", ")}</span></div>}
+                    {diff.removedTables.length > 0 && <div className="q-lint q-lint-warn"><span className="q-lint-t">− {diff.removedTables.length} tables</span><span className="q-thint">{diff.removedTables.join(", ")}</span></div>}
+                    {diff.changedTables.map((t, i) => (
+                      <div className="q-prof" key={i}>
+                        <div className="q-prof-h"><span className="q-tcol-n">{t.name}</span></div>
+                        {t.addedColumns.length > 0 && <div className="q-thint">+ {t.addedColumns.map((c) => c.name).join(", ")}</div>}
+                        {t.removedColumns.length > 0 && <div className="q-thint">− {t.removedColumns.map((c) => c.name).join(", ")}</div>}
+                        {t.changedColumns.map((c, j) => (<div className="q-thint" key={j}>~ {c.name}: {c.old} → {c.new}</div>))}
+                      </div>
+                    ))}
+                    {diff.addedTables.length === 0 && diff.removedTables.length === 0 && diff.changedTables.length === 0 && (
+                      <div className="q-thint">No structural differences.</div>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
           </>
         )}
       </div>
