@@ -6,6 +6,9 @@ import Tools from "./Tools";
 import CsvGrid from "./CsvGrid";
 import HexView from "./HexView";
 import DiffView from "./DiffView";
+import Sidebar from "./Sidebar";
+import MenuBar from "./MenuBar";
+import type { MenuDef, MenuItem } from "./MenuBar";
 import "./quarry.css";
 
 interface Tab {
@@ -32,11 +35,6 @@ function fmtBytes(n: number): string {
     i++;
   }
   return `${v.toFixed(v < 10 ? 2 : 1)} ${units[i]}`;
-}
-
-function baseName(p: string): string {
-  const i = Math.max(p.lastIndexOf("/"), p.lastIndexOf("\\"));
-  return i >= 0 ? p.slice(i + 1) : p;
 }
 
 function snippet(s: string): string {
@@ -75,6 +73,7 @@ function App() {
   const [toolsOpen, setToolsOpen] = useState(false);
   const [gridView, setGridView] = useState(false);
   const [hexView, setHexView] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -103,6 +102,14 @@ function App() {
         e.preventDefault();
         setSearchOpen(false);
         setGotoOpen(true);
+      } else if (mod && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        setSidebarCollapsed((v) => !v);
+      } else if (mod && e.key.toLowerCase() === "w") {
+        if (activeIdRef.current) {
+          e.preventDefault();
+          void closeTab(activeIdRef.current);
+        }
       } else if (e.key === "Escape") {
         setSearchOpen(false);
         setGotoOpen(false);
@@ -346,6 +353,72 @@ function App() {
   const activeTab = tabs.find((t) => t.fileId === activeId);
   const editCount = staging?.editCount ?? 0;
   const hasEdits = editCount > 0 || dirty;
+  const detected = (activeTab?.meta.detected ?? "").toLowerCase();
+  const isCsv = detected === "csv" || detected === "tsv";
+  const isSql = detected === "sql";
+  const openSearch = () => { setGotoOpen(false); setSearchOpen(true); };
+  const openGoto = () => { setSearchOpen(false); setGotoOpen(true); };
+  const showText = () => { setHexView(false); setGridView(false); };
+
+  const toolsMenuItems = (): MenuItem[] => {
+    if (isCsv) {
+      return [
+        { label: "CSV → SQL converter…", onClick: () => setToolsOpen(true) },
+        { label: "CSV column tools…", onClick: () => setToolsOpen(true) },
+      ];
+    }
+    if (isSql) {
+      return [
+        { label: "Analyze & extract tables…", onClick: () => setToolsOpen(true) },
+        { label: "Find & replace…", onClick: () => setToolsOpen(true) },
+        { label: "Cleanup presets…", onClick: () => setToolsOpen(true) },
+      ];
+    }
+    return [{ label: "No data tools for this file type", disabled: true }];
+  };
+
+  const menus: MenuDef[] = [
+    {
+      label: "File",
+      items: [
+        { label: "Open file…", shortcut: "Ctrl+O", onClick: () => void openViaDialog() },
+        { label: "Close tab", shortcut: "Ctrl+W", disabled: !activeTab, onClick: () => activeId && void closeTab(activeId) },
+        { separator: true },
+        { label: "Patch in place", disabled: !staging?.inPlaceEligible, onClick: () => void saveInPlace() },
+        { label: "Save copy…", disabled: !hasEdits, onClick: () => void saveCopy() },
+        { label: "Discard edits", disabled: !hasEdits, onClick: () => void discardEdits() },
+      ],
+    },
+    {
+      label: "Edit",
+      items: [
+        { label: "Find…", shortcut: "Ctrl+F", disabled: !hasFiles, onClick: openSearch },
+        { label: "Go to line / offset…", shortcut: "Ctrl+G", disabled: !hasFiles, onClick: openGoto },
+        { separator: true },
+        { label: "Edit mode", checked: editMode, disabled: !activeTab?.meta.editable, onClick: () => void toggleEdit() },
+        { label: "Diff panel", checked: diffOpen, disabled: !hasEdits, onClick: () => void toggleDiff() },
+      ],
+    },
+    {
+      label: "View",
+      items: [
+        { label: "Sidebar", shortcut: "Ctrl+B", checked: !sidebarCollapsed, onClick: () => setSidebarCollapsed((v) => !v) },
+        { separator: true },
+        { label: "Plain text", checked: !hexView && !gridView, disabled: !hasFiles, onClick: showText },
+        { label: "Hex view", checked: hexView, disabled: !hasFiles, onClick: () => { setGridView(false); setHexView((v) => !v); } },
+        { label: "Grid view", checked: gridView, disabled: !isCsv, onClick: () => { setHexView(false); setGridView((v) => !v); } },
+        { separator: true },
+        { label: "Data tools panel", checked: toolsOpen, disabled: !(isCsv || isSql), onClick: () => setToolsOpen((v) => !v) },
+      ],
+    },
+    { label: "Tools", items: toolsMenuItems() },
+    {
+      label: "Help",
+      items: [
+        { label: "About Quarry", onClick: () => setNotice("Quarry — a streaming editor and toolkit for very large SQL/CSV dumps. Files are never fully loaded; windows stream as you scroll.") },
+      ],
+    },
+  ];
 
   return (
     <div className="q-app">
@@ -354,28 +427,11 @@ function App() {
           <img className="q-brand-mark" src="/logos/symbol.png" alt="Quarry" />
           <span className="q-brand-name">Quarry</span>
         </div>
+        <MenuBar menus={menus} />
         <div className="q-spacer" />
         {hasFiles && (
           <>
-            <button className="q-btn" title="Find (Ctrl+F)" onClick={() => { setGotoOpen(false); setSearchOpen(true); }}>
-              Find
-            </button>
-            <button className="q-btn" title="Go to (Ctrl+G)" onClick={() => { setSearchOpen(false); setGotoOpen(true); }}>
-              Go to
-            </button>
-            <button className={"q-btn" + (hexView ? " q-btn-on" : "")} title="Hex view" onClick={() => setHexView((v) => { const n = !v; if (n) setGridView(false); return n; })}>
-              {hexView ? "Text" : "Hex"}
-            </button>
-            {["csv", "tsv"].includes((activeTab?.meta.detected ?? "").toLowerCase()) && (
-              <button className={"q-btn" + (gridView ? " q-btn-on" : "")} title="Spreadsheet grid view" onClick={() => setGridView((v) => { const n = !v; if (n) setHexView(false); return n; })}>
-                {gridView ? "Text" : "Grid"}
-              </button>
-            )}
-            {["csv", "tsv", "sql"].includes((activeTab?.meta.detected ?? "").toLowerCase()) && (
-              <button className={"q-btn" + (toolsOpen ? " q-btn-on" : "")} title="CSV / SQL data tools" onClick={() => setToolsOpen((v) => !v)}>
-                Tools
-              </button>
-            )}
+            <button className="q-btn" title="Find (Ctrl+F)" onClick={openSearch}>Find</button>
             {activeTab?.meta.editable && (
               <button className={"q-btn" + (editMode ? " q-btn-on" : "")} title="Toggle editing" onClick={() => void toggleEdit()}>
                 {editMode ? "Editing" : "Edit"}
@@ -385,9 +441,6 @@ function App() {
               <>
                 <button className={"q-btn" + (diffOpen ? " q-btn-on" : "")} onClick={() => void toggleDiff()}>
                   Diff ({editCount})
-                </button>
-                <button className="q-btn" title="Discard all staged edits" onClick={() => void discardEdits()}>
-                  Discard
                 </button>
                 <button
                   className="q-btn q-btn-primary"
@@ -409,29 +462,22 @@ function App() {
         </button>
       </header>
 
-      {hasFiles && (
-        <div className="q-tabs">
-          {tabs.map((t) => (
-            <div
-              key={t.fileId}
-              className={"q-tab" + (t.fileId === activeId ? " q-tab-active" : "")}
-              onClick={() => void activate(t.fileId)}
-              title={t.meta.path}
-            >
-              <span className="q-tab-name">{baseName(t.meta.path)}</span>
-              <span className="q-tab-close" onClick={(e) => void closeTab(t.fileId, e)}>
-                ×
-              </span>
-            </div>
-          ))}
-        </div>
-      )}
-
       {error && <div className="q-error">{error}</div>}
       {notice && <div className="q-notice">{notice}</div>}
 
-      <div className="q-stage">
-        <div className="q-editor" ref={hostRef} />
+      <div className="q-body">
+        {hasFiles && (
+          <Sidebar
+            tabs={tabs}
+            activeId={activeId}
+            collapsed={sidebarCollapsed}
+            onActivate={(id) => void activate(id)}
+            onClose={(id, e) => void closeTab(id, e)}
+            onToggle={() => setSidebarCollapsed((v) => !v)}
+          />
+        )}
+        <div className="q-stage">
+          <div className="q-editor" ref={hostRef} />
 
         {gridView && activeTab && ["csv", "tsv"].includes(activeTab.meta.detected.toLowerCase()) && (
           <CsvGrid key={activeTab.fileId} fileId={activeTab.fileId} onError={setError} />
@@ -549,6 +595,7 @@ function App() {
             <p className="q-empty-hint">The file is never fully loaded — windows stream as you scroll.</p>
           </div>
         )}
+        </div>
       </div>
 
       <footer className="q-status">
