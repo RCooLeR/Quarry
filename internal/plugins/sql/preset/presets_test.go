@@ -83,11 +83,73 @@ func TestBuildChangeCharsetPresetWithCollation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Mode != ModeBatch {
-		t.Fatalf("mode = %q", cfg.Mode)
+	if cfg.Mode != ModeRegexBatch {
+		t.Fatalf("mode = %q, want regex-batch", cfg.Mode)
 	}
-	if len(cfg.BatchRules) != 5 {
-		t.Fatalf("len(rules) = %d, want 5", len(cfg.BatchRules))
+	if len(cfg.BatchRules) != 3 { // charset + set names + collation
+		t.Fatalf("len(rules) = %d, want 3", len(cfg.BatchRules))
+	}
+}
+
+// The regex rules must rewrite the spaced / CHARACTER SET / backtick forms the
+// old literal preset missed, and must NOT rewrite an already-correct value.
+func TestChangeCharsetPresetRewritesVariants(t *testing.T) {
+	cfg, err := Build(ChangeCharsetPreset, "utf8", "utf8mb4", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	apply := func(in string) string {
+		out := in
+		for _, rule := range cfg.BatchRules {
+			re := regexp.MustCompile(string(rule.Find))
+			out = re.ReplaceAllString(out, string(rule.Replace))
+		}
+		return out
+	}
+	cases := map[string]string{
+		"CHARSET=utf8":            "CHARSET=utf8mb4",
+		"CHARSET = utf8":          "CHARSET = utf8mb4",
+		"DEFAULT CHARSET=utf8":    "DEFAULT CHARSET=utf8mb4",
+		"DEFAULT CHARSET = utf8":  "DEFAULT CHARSET = utf8mb4",
+		"CHARACTER SET utf8":      "CHARACTER SET utf8mb4",
+		"CHARSET=`utf8`":          "CHARSET=`utf8mb4`",
+		"SET NAMES utf8":          "SET NAMES utf8mb4",
+		"charset=UTF8":            "charset=utf8mb4", // case-insensitive keyword + value
+		"CHARSET=utf8mb4":         "CHARSET=utf8mb4",  // already correct, must be untouched
+		"CHARSET=utf8mb4_general": "CHARSET=utf8mb4_general",
+	}
+	for in, want := range cases {
+		if got := apply(in); got != want {
+			t.Fatalf("apply(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestChangeCharsetPresetRewritesCollation(t *testing.T) {
+	cfg, err := Build(ChangeCharsetPreset, "utf8", "utf8mb4", "utf8_general_ci", "utf8mb4_general_ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var collate *regexp.Regexp
+	var repl string
+	for _, rule := range cfg.BatchRules {
+		if rule.Name == "COLLATE" {
+			collate = regexp.MustCompile(string(rule.Find))
+			repl = string(rule.Replace)
+		}
+	}
+	if collate == nil {
+		t.Fatal("no COLLATE rule built")
+	}
+	for in, want := range map[string]string{
+		"COLLATE=utf8_general_ci":       "COLLATE=utf8mb4_general_ci",
+		"COLLATE utf8_general_ci":       "COLLATE utf8mb4_general_ci",
+		"COLLATE = `utf8_general_ci`":   "COLLATE = `utf8mb4_general_ci`",
+		"COLLATE=utf8mb4_general_ci":    "COLLATE=utf8mb4_general_ci",
+	} {
+		if got := collate.ReplaceAllString(in, repl); got != want {
+			t.Fatalf("collate apply(%q) = %q, want %q", in, got, want)
+		}
 	}
 }
 

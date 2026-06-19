@@ -37,7 +37,11 @@ func (s *FileService) SqlAnalyze(fileID string) (SqlSummaryResult, error) {
 	if !ok {
 		return SqlSummaryResult{}, fmt.Errorf("unknown file id %q", fileID)
 	}
-	summary, err := sqlanalyze.AnalyzeFile(context.Background(), f.Path, sqlanalyze.Options{})
+	// Reuse the document's already-open descriptor (it satisfies ReaderAtSize)
+	// instead of AnalyzeFile reopening the path. NOTE: this still reads the whole
+	// file once; fusing the analyze pass with line indexing to avoid the second
+	// full read is a separate, larger change.
+	summary, err := sqlanalyze.Analyze(context.Background(), f.Doc, sqlanalyze.Options{})
 	if err != nil {
 		return SqlSummaryResult{}, err
 	}
@@ -153,6 +157,10 @@ func (s *FileService) SqlApplyPresetViaDialog(fileID, name, a1, a2, a3, a4 strin
 	case sqlpreset.ModeRegex:
 		rules := []replace.BatchRule{{Name: name, Find: []byte(cfg.Search), Replace: []byte(cfg.Replace)}}
 		sum, err = replace.ReplaceBatchRegexpFile(context.Background(), f.Path, dst, rules,
+			replace.FileOptions{CaseInsensitive: ci, WholeWord: cfg.WholeWord},
+			replace.RegexOptions{CaseInsensitive: ci})
+	case sqlpreset.ModeRegexBatch:
+		sum, err = replace.ReplaceBatchRegexpFile(context.Background(), f.Path, dst, cfg.BatchRules,
 			replace.FileOptions{CaseInsensitive: ci, WholeWord: cfg.WholeWord},
 			replace.RegexOptions{CaseInsensitive: ci})
 	case sqlpreset.ModeBatch:

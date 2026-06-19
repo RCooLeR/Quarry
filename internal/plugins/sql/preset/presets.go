@@ -3,6 +3,7 @@ package preset
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	replacepkg "github.com/quarry/quarry-wails3/internal/replace"
@@ -11,9 +12,10 @@ import (
 type Mode string
 
 const (
-	ModePlain Mode = "plain"
-	ModeRegex Mode = "regex"
-	ModeBatch Mode = "batch"
+	ModePlain      Mode = "plain"
+	ModeRegex      Mode = "regex"
+	ModeBatch      Mode = "batch"
+	ModeRegexBatch Mode = "regex-batch" // multiple regex rules in one streaming pass
 )
 
 const (
@@ -69,25 +71,19 @@ func Build(name string, arg1 string, arg2 string, arg3 string, arg4 string) (Con
 		if arg1 == "" || arg2 == "" {
 			return Config{}, errors.New("charset preset needs old and new charset values")
 		}
-		rules := []replacepkg.BatchRule{
-			{Name: "CHARSET", Find: []byte("CHARSET=" + arg1), Replace: []byte("CHARSET=" + arg2), Priority: 0},
-			{Name: "DEFAULT CHARSET", Find: []byte("DEFAULT CHARSET=" + arg1), Replace: []byte("DEFAULT CHARSET=" + arg2), Priority: 1},
-			{Name: "SET NAMES", Find: []byte("SET NAMES " + arg1), Replace: []byte("SET NAMES " + arg2), Priority: 2},
-		}
+		rules := charsetRules(arg1, arg2)
 		if arg3 != "" || arg4 != "" {
 			if arg3 == "" || arg4 == "" {
 				return Config{}, errors.New("collation preset needs both old and new collation values")
 			}
-			rules = append(rules,
-				replacepkg.BatchRule{Name: "COLLATE", Find: []byte("COLLATE=" + arg3), Replace: []byte("COLLATE=" + arg4), Priority: 3},
-				replacepkg.BatchRule{Name: "COLLATE spaced", Find: []byte("COLLATE " + arg3), Replace: []byte("COLLATE " + arg4), Priority: 4},
-			)
+			rules = append(rules, collationRule(arg3, arg4, len(rules)))
 		}
 		return Config{
-			Mode:          ModeBatch,
+			Mode:          ModeRegexBatch,
 			BatchRules:    rules,
-			CaseSensitive: true,
-			Summary:       "Rewrite SQL charset and optional collation declarations.",
+			Regex:         true,
+			CaseSensitive: false,
+			Summary:       "Rewrite charset/collation declarations (CHARSET=, DEFAULT CHARSET, CHARACTER SET, SET NAMES, COLLATE), including spaced and backtick-quoted forms.",
 		}, nil
 	case ConvertEnginePreset:
 		return Config{
@@ -110,6 +106,38 @@ func Build(name string, arg1 string, arg2 string, arg3 string, arg4 string) (Con
 		}, nil
 	default:
 		return Config{}, errors.New("unknown SQL preset")
+	}
+}
+
+// charsetRules builds regex rules that rewrite every charset declaration the
+// analyzer recognizes (CHARSET=, DEFAULT CHARSET, CHARACTER SET, SET NAMES),
+// tolerating spaces, an optional '=', and backtick quoting. The keyword/separator
+// prefix is captured (group 1) and re-emitted so the original form is preserved;
+// a trailing \b stops utf8 -> utf8mb4 from rewriting an existing utf8mb4.
+func charsetRules(oldVal, newVal string) []replacepkg.BatchRule {
+	oldQ := regexp.QuoteMeta(oldVal)
+	return []replacepkg.BatchRule{
+		{
+			Name:     "CHARSET / CHARACTER SET",
+			Find:     []byte("(?i)((?:DEFAULT\\s+)?(?:CHARSET|CHARACTER\\s+SET)\\s*=?\\s*`?)" + oldQ + "\\b"),
+			Replace:  []byte("${1}" + newVal),
+			Priority: 0,
+		},
+		{
+			Name:     "SET NAMES",
+			Find:     []byte("(?i)(SET\\s+NAMES\\s+`?)" + oldQ + "\\b"),
+			Replace:  []byte("${1}" + newVal),
+			Priority: 1,
+		},
+	}
+}
+
+func collationRule(oldVal, newVal string, priority int) replacepkg.BatchRule {
+	return replacepkg.BatchRule{
+		Name:     "COLLATE",
+		Find:     []byte("(?i)(COLLATE\\s*=?\\s*`?)" + regexp.QuoteMeta(oldVal) + "\\b"),
+		Replace:  []byte("${1}" + newVal),
+		Priority: priority,
 	}
 }
 
