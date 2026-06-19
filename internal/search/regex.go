@@ -62,6 +62,7 @@ func FindRegexp(ctx context.Context, r ReaderAtSize, re *regexp.Regexp, opts Reg
 	size := r.Size()
 	startOffset := clampOffset(opts.StartOffset, size)
 	hits := 0
+	var window []byte // reused across chunks (grow-only), like the plain path
 
 	for off := startOffset; off < size; {
 		select {
@@ -82,7 +83,11 @@ func FindRegexp(ctx context.Context, r ReaderAtSize, re *regexp.Regexp, opts Reg
 		if windowEnd > size {
 			windowEnd = size
 		}
-		window := make([]byte, windowEnd-windowStart)
+		need := windowEnd - windowStart
+		if int64(cap(window)) < need {
+			window = make([]byte, need)
+		}
+		window = window[:need]
 		readWindow, windowErr := r.ReadAt(window, windowStart)
 		if windowErr != nil && !errors.Is(windowErr, io.EOF) {
 			return windowErr
@@ -148,6 +153,7 @@ func FindRegexpBackward(ctx context.Context, r ReaderAtSize, re *regexp.Regexp, 
 
 	hits := 0
 	var matches []Match
+	var window []byte // reused across chunks (grow-only)
 
 	for off := int64(0); off < endOffset; {
 		select {
@@ -168,7 +174,11 @@ func FindRegexpBackward(ctx context.Context, r ReaderAtSize, re *regexp.Regexp, 
 		if windowEnd > endOffset {
 			windowEnd = endOffset
 		}
-		window := make([]byte, windowEnd-windowStart)
+		need := windowEnd - windowStart
+		if int64(cap(window)) < need {
+			window = make([]byte, need)
+		}
+		window = window[:need]
 		readWindow, windowErr := r.ReadAt(window, windowStart)
 		if windowErr != nil && !errors.Is(windowErr, io.EOF) {
 			return windowErr

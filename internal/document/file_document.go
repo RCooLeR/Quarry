@@ -141,6 +141,7 @@ func OpenFileContextWithOptions(ctx context.Context, path string, options OpenOp
 	if err != nil {
 		return nil, err
 	}
+	f = applyReadHint(f, path) // widen OS read-ahead for sequential full-file passes
 	closeOnError := func(err error) (*FileDocument, error) {
 		_ = f.Close()
 		return nil, err

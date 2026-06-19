@@ -139,22 +139,40 @@ func SplitByLineCount(ctx context.Context, doc *document.FileDocument, sourcePat
 		return summary, writeSplitManifest(summary)
 	}
 
+	// Carry the running byte offset forward instead of re-resolving the part's
+	// start line each iteration. Each part's end is the start of the line after
+	// its last line (a single line-offset lookup); the next part starts exactly
+	// there. This avoids the redundant double resolution and the per-part rescan
+	// from a stale index frontier on a not-yet-fully-indexed huge file.
 	startLine := int64(1)
+	startOffset, ok, err := doc.LineStartOffset(startLine)
+	if err != nil {
+		return failSplit(summary, err)
+	}
+	if !ok {
+		return summary, writeSplitManifest(summary)
+	}
 	done := int64(0)
 	for part := 1; ; part++ {
 		if ctx.Err() != nil {
 			return failSplit(summary, ctx.Err())
 		}
-		if _, ok, err := doc.LineStartOffset(startLine); err != nil {
+
+		nextStartLine := startLine + linesPerPart
+		endOffset, ok, err := doc.LineStartOffset(nextStartLine)
+		if err != nil {
 			return failSplit(summary, err)
-		} else if !ok {
+		}
+		if !ok || endOffset > total {
+			endOffset = total
+		}
+		if endOffset <= startOffset {
 			break
 		}
 
-		endLine := startLine + linesPerPart - 1
 		outputPath := partPath(outputBasePath, part)
 		baseDone := done
-		partSummary, err := ExportLineRange(ctx, doc, sourcePath, outputPath, startLine, endLine, Options{
+		partSummary, err := ExportByteRange(ctx, doc, sourcePath, outputPath, startOffset, endOffset, Options{
 			ComputeSHA256: opts.ComputeSHA256,
 			Progress: func(written int64, partTotal int64) {
 				if opts.Progress != nil {
@@ -176,10 +194,11 @@ func SplitByLineCount(ctx context.Context, doc *document.FileDocument, sourcePat
 			opts.Progress(done, total, summary.Parts)
 		}
 
-		if partSummary.EndOffset >= total {
+		if endOffset >= total {
 			break
 		}
-		startLine += linesPerPart
+		startOffset = endOffset
+		startLine = nextStartLine
 	}
 
 	if err := writeSplitManifest(summary); err != nil {
