@@ -67,6 +67,8 @@ function App() {
   const [wholeWord, setWholeWord] = useState(false);
   const [searching, setSearching] = useState(false);
   const [searchInfo, setSearchInfo] = useState("");
+  const [results, setResults] = useState<{ offset: number; length: number; line: number; preview: string }[] | null>(null);
+  const [resultsInfo, setResultsInfo] = useState("");
   const [gotoValue, setGotoValue] = useState("");
   const lastMatch = useRef<number | null>(null);
 
@@ -280,6 +282,43 @@ function App() {
       setSearchInfo(String(e?.message ?? e));
     } finally {
       setSearching(false);
+    }
+  };
+
+  const runSearchAll = async () => {
+    const q = query;
+    const id = activeIdRef.current;
+    if (!q.trim() || !id) return;
+    setSearching(true);
+    setResultsInfo("Searching whole file…");
+    setResults([]);
+    try {
+      const r = (await FileService.SearchAll(id, q, regex, caseSensitive, wholeWord, 1000)) as any;
+      if (r.unsupported) { setResultsInfo(r.message || "Unsupported for this encoding"); setResults(null); return; }
+      if (r.timedOut) { setResultsInfo("Timed out — narrow the query"); }
+      setResults(r.hits ?? []);
+      setResultsInfo(`${(r.hits ?? []).length}${r.truncated ? "+" : ""} matches`);
+    } catch (e: any) {
+      setResultsInfo(String(e?.message ?? e));
+      setResults(null);
+    } finally {
+      setSearching(false);
+    }
+  };
+
+  const harvest = async () => {
+    const q = query;
+    const id = activeIdRef.current;
+    if (!q.trim() || !id) return;
+    setBusy(true);
+    setNotice("");
+    try {
+      const r = await FileService.HarvestMatchesViaDialog(id, q, !caseSensitive);
+      if (r.outputPath) setNotice(`Extracted ${r.recordsWritten} matches → ${r.outputPath}`);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setBusy(false);
     }
   };
 
@@ -580,8 +619,34 @@ function App() {
             <button className={"q-toggle" + (regex ? " on" : "")} title="Regex" onClick={() => { setRegex((v) => !v); lastMatch.current = null; }}>.*</button>
             <button className="q-icon" title="Previous (Shift+Enter)" disabled={searching} onClick={() => void runFind("prev")}>↑</button>
             <button className="q-icon" title="Next (Enter)" disabled={searching} onClick={() => void runFind("next")}>↓</button>
+            <button className="q-icon" title="List all matches" disabled={searching} onClick={() => void runSearchAll()}>≡</button>
+            <button className="q-icon" title="Extract all regex matches → file" disabled={busy} onClick={() => void harvest()}>⤓</button>
             <span className="q-find-info">{searchInfo}</span>
-            <button className="q-icon" title="Close (Esc)" onClick={() => setSearchOpen(false)}>×</button>
+            <button className="q-icon" title="Close (Esc)" onClick={() => { setSearchOpen(false); setResults(null); }}>×</button>
+          </div>
+        )}
+
+        {searchOpen && results && hasFiles && (
+          <div className="q-results">
+            <div className="q-results-head">
+              <span>{resultsInfo}</span>
+              <span className="q-spacer" />
+              <button className="q-icon" title="Close" onClick={() => setResults(null)}>×</button>
+            </div>
+            <div className="q-results-body">
+              {results.length === 0 && <div className="q-results-empty">{resultsInfo || "No matches"}</div>}
+              {results.map((r, i) => (
+                <div
+                  key={i}
+                  className="q-result"
+                  title={`0x${r.offset.toString(16)}`}
+                  onClick={() => { lastMatch.current = r.offset; void editorRef.current?.showMatch(r.offset, r.length, query, regex, caseSensitive); }}
+                >
+                  <span className="q-result-line">{r.line}</span>
+                  <span className="q-result-text">{r.preview}</span>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/quarry/quarry-wails3/internal/encodingx"
 	sqlanalyze "github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
+	"github.com/quarry/quarry-wails3/internal/regexutil"
 	"github.com/quarry/quarry-wails3/internal/search"
 	"github.com/quarry/quarry-wails3/internal/session"
 )
@@ -213,6 +216,132 @@ func (s *FileService) find(fileID, query string, start int64, backward, regex, c
 	m := results[0]
 	line, _ := f.Doc.ApproxOffsetToLine(m.Offset)
 	return SearchHit{Found: true, Offset: m.Offset, Length: m.Length, Line: line}, nil
+}
+
+// SearchAllHit is one match in a whole-file search, with a preview line.
+type SearchAllHit struct {
+	Offset  int64  `json:"offset"`
+	Length  int    `json:"length"`
+	Line    int64  `json:"line"`
+	Preview string `json:"preview"`
+}
+
+// SearchAllResult holds up to MaxHits matches plus a truncation flag.
+type SearchAllResult struct {
+	Hits        []SearchAllHit `json:"hits"`
+	Truncated   bool           `json:"truncated"`
+	TimedOut    bool           `json:"timedOut"`
+	Unsupported bool           `json:"unsupported"`
+	Message     string         `json:"message"`
+}
+
+// SearchAll collects up to maxHits matches across the whole file with previews,
+// for a results panel. The query is encoded into the file's encoding first.
+func (s *FileService) SearchAll(fileID, query string, regex, caseSensitive, wholeWord bool, maxHits int) (SearchAllResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return SearchAllResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if strings.TrimSpace(query) == "" {
+		return SearchAllResult{}, nil
+	}
+	if maxHits <= 0 {
+		maxHits = 1000
+	}
+	enc := f.Doc.Metadata().Encoding
+	isUTF8 := enc == "" || strings.EqualFold(enc, "UTF-8")
+	var pattern []byte
+	if regex {
+		if !isUTF8 {
+			return SearchAllResult{Unsupported: true, Message: "Regex search isn't supported on " + enc + " files."}, nil
+		}
+		pattern = []byte(query)
+	} else if isUTF8 {
+		pattern = []byte(query)
+	} else {
+		encoded, encErr := encodingx.EncodeString(enc, query)
+		if encErr != nil {
+			return SearchAllResult{Unsupported: true, Message: "This term can't be searched in a " + enc + " file."}, nil
+		}
+		pattern = encoded
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
+	defer cancel()
+	var results []search.Result
+	var err error
+	if regex {
+		results, err = search.CollectRegexp(ctx, f.Doc, pattern, search.RegexOptions{MaxHits: maxHits, CaseInsensitive: !caseSensitive}, 160)
+	} else {
+		results, err = search.CollectPlain(ctx, f.Doc, pattern, search.PlainOptions{MaxHits: maxHits, CaseInsensitive: !caseSensitive, WholeWord: wholeWord}, 160)
+	}
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return SearchAllResult{TimedOut: true}, nil
+		}
+		return SearchAllResult{}, err
+	}
+	hits := make([]SearchAllHit, 0, len(results))
+	for _, m := range results {
+		line, _ := f.Doc.ApproxOffsetToLine(m.Offset)
+		preview := strings.TrimRight(strings.ReplaceAll(m.Preview, "\n", " "), " \t\r")
+		hits = append(hits, SearchAllHit{Offset: m.Offset, Length: m.Length, Line: line, Preview: preview})
+	}
+	return SearchAllResult{Hits: hits, Truncated: len(hits) >= maxHits}, nil
+}
+
+// HarvestMatchesViaDialog runs a regex over the whole file and writes every
+// match, one per line, to a chosen file — e.g. extract every email or id.
+func (s *FileService) HarvestMatchesViaDialog(fileID, pattern string, caseInsensitive bool) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	if strings.TrimSpace(pattern) == "" {
+		return TransformResult{}, errors.New("enter a regex pattern")
+	}
+	enc := f.Doc.Metadata().Encoding
+	if !(enc == "" || strings.EqualFold(enc, "UTF-8")) {
+		return TransformResult{}, fmt.Errorf("regex harvest needs a UTF-8 file (this file is %s)", enc)
+	}
+	re, err := regexutil.Compile([]byte(pattern), caseInsensitive)
+	if err != nil {
+		return TransformResult{}, err
+	}
+	dst, err := saveDialog("Save extracted matches as", "matches.txt")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	out, err := os.Create(dst)
+	if err != nil {
+		return TransformResult{}, err
+	}
+	defer out.Close()
+	bw := bufio.NewWriterSize(out, 1<<20)
+	var count int64
+	ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
+	defer cancel()
+	err = search.FindRegexp(ctx, f.Doc, re, search.RegexOptions{CaseInsensitive: caseInsensitive}, func(m search.Match) error {
+		b, rerr := f.Doc.ReadRange(m.Offset, m.Offset+int64(m.Length))
+		if rerr != nil {
+			return rerr
+		}
+		if _, werr := bw.Write(bytes.ReplaceAll(b, []byte("\n"), []byte(" "))); werr != nil {
+			return werr
+		}
+		count++
+		return bw.WriteByte('\n')
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	if err := bw.Flush(); err != nil {
+		return TransformResult{}, err
+	}
+	if err := out.Sync(); err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{OutputPath: dst, RecordsWritten: count, Note: fmt.Sprintf("%d matches", count)}, nil
 }
 
 // ResolveLine maps a 1-based line number to a byte offset (exact if the index
