@@ -428,6 +428,44 @@ func csvSqlOptions(cfg CsvSqlConfig) (csv.SQLConvertOptions, error) {
 	}, nil
 }
 
+// CsvRedactColumn is one column to mask in a redaction.
+type CsvRedactColumn struct {
+	Index int    `json:"index"`
+	Mode  string `json:"mode"` // null | fixed | hash | email
+}
+
+// CsvRedactViaDialog writes an anonymized copy of the CSV with the chosen columns
+// masked, for sharing a dataset without leaking PII. Source is never modified.
+func (s *FileService) CsvRedactViaDialog(fileID, delimiter string, hasHeader bool, columns []CsvRedactColumn, replacement string) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	cols := map[int]csv.RedactMode{}
+	for _, c := range columns {
+		cols[c.Index] = csv.RedactMode(strings.TrimSpace(c.Mode))
+	}
+	dst, err := saveDialog("Save redacted copy as", "redacted.csv")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.RedactColumnsFile(context.Background(), f.Path, dst, csv.RedactOptions{
+		Delimiter:   delimiterRune(delimiter),
+		HasHeader:   hasHeader,
+		Columns:     cols,
+		Replacement: replacement,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{
+		OutputPath:     dst,
+		RecordsRead:    sum.RecordsRead,
+		RecordsWritten: sum.RecordsWritten,
+		Note:           fmt.Sprintf("%d cells masked across %d columns", sum.CellsMasked, len(cols)),
+	}, nil
+}
+
 // CsvToSQLConfigPreview returns a short sample of the SQL for a full config.
 func (s *FileService) CsvToSQLConfigPreview(fileID string, cfg CsvSqlConfig) (string, error) {
 	r, _, err := s.csvSampleReader(fileID)

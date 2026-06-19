@@ -71,6 +71,8 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const [nullValue, setNullValue] = useState("NULL");
   const [onInvalid, setOnInvalid] = useState("fail");
   const [sqlPreviewText, setSqlPreviewText] = useState("");
+  const [redactModes, setRedactModes] = useState<Record<number, string>>({});
+  const [redactFixed, setRedactFixed] = useState("REDACTED");
 
   // SQL state (analysis is lifted to App; shared with palette + X-ray)
   const sqlSummary = analysis;
@@ -167,6 +169,9 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
     run(async () => (await FileService.CsvAddColumnViaDialog(fileId, delim, schema.length, addVal)) as TransformResult);
   const doConvert = () =>
     run(async () => (await FileService.CsvToSQLConfigViaDialog(fileId, buildConfig() as any)) as TransformResult);
+  const redactCols = Object.entries(redactModes).filter(([, m]) => m && m !== "off").map(([i, m]) => ({ index: Number(i), mode: m }));
+  const doRedact = () =>
+    run(async () => (await FileService.CsvRedactViaDialog(fileId, delim, hasHeader, redactCols as any, redactFixed)) as TransformResult);
   const doSqlPreview = async () => {
     try {
       const sql = (await FileService.CsvToSQLConfigPreview(fileId, buildConfig() as any)) as string;
@@ -288,6 +293,27 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
             <div className="q-trow">
               <input className="q-select" placeholder="constant value" value={addVal} onChange={(e) => setAddVal(e.target.value)} />
               <button className="q-btn" disabled={busy} onClick={doAdd}>Add column</button>
+            </div>
+
+            <div className="q-tsection">Redact / anonymize → new CSV</div>
+            <div className="q-colcfg">
+              {schema.map((c, i) => (
+                <div className="q-colrow" key={i}>
+                  <span className="q-colname" style={{ border: "none", background: "transparent" }}>{c.name}</span>
+                  <select className="q-coltype" value={redactModes[i] ?? "off"} onChange={(e) => setRedactModes((p) => ({ ...p, [i]: e.target.value }))}>
+                    <option value="off">keep</option>
+                    <option value="null">blank</option>
+                    <option value="fixed">fixed</option>
+                    <option value="hash">hash</option>
+                    <option value="email">email a***@…</option>
+                  </select>
+                </div>
+              ))}
+            </div>
+            <div className="q-trow">
+              <label className="q-tlabel q-tlabel-inline">fixed =</label>
+              <input className="q-select" value={redactFixed} onChange={(e) => setRedactFixed(e.target.value)} />
+              <button className="q-btn q-btn-primary" disabled={busy || redactCols.length === 0} onClick={doRedact}>Redact →</button>
             </div>
           </>
         ) : (
