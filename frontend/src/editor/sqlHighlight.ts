@@ -93,8 +93,3 @@ const sqlHighlightTheme = EditorView.theme({
 
 /** SQL highlighting extension (display-only, per visible line). */
 export const sqlHighlight = [sqlHighlightPlugin, sqlHighlightTheme];
-
-/** Returns the highlight extension for a detected file type, or [] for none. */
-export function highlightFor(detected: string) {
-  return detected.toLowerCase() === "sql" ? sqlHighlight : [];
-}

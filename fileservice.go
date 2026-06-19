@@ -90,8 +90,8 @@ func (s *FileService) OpenViaDialog() (FileMeta, error) {
 	path, err := application.Get().Dialog.OpenFile().
 		CanChooseFiles(true).
 		SetTitle("Open file in Quarry").
-		AddFilter("Data & dumps (*.sql, *.csv, *.tsv, *.log, *.txt, *.json)", "*.sql;*.csv;*.tsv;*.log;*.txt;*.json").
 		AddFilter("All files (*.*)", "*.*").
+		AddFilter("Data & dumps (*.sql, *.csv, *.tsv, *.log, *.txt, *.json)", "*.sql;*.csv;*.tsv;*.log;*.txt;*.json").
 		PromptForSingleSelection()
 	if err != nil {
 		return FileMeta{}, err
