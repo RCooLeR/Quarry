@@ -11,6 +11,7 @@ import (
 
 	"github.com/wailsapp/wails/v3/pkg/application"
 
+	"github.com/quarry/quarry-wails3/internal/encodingx"
 	sqlanalyze "github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
 	"github.com/quarry/quarry-wails3/internal/search"
 	"github.com/quarry/quarry-wails3/internal/session"
@@ -126,13 +127,18 @@ func (s *FileService) CloseFile(fileID string) error {
 	return s.reg.Close(fileID)
 }
 
-// SearchHit is one match (or a not-found / timed-out result).
+// SearchHit is one match (or a not-found / timed-out / unsupported result).
 type SearchHit struct {
 	Found    bool   `json:"found"`
 	Offset   int64  `json:"offset"`
 	Length   int    `json:"length"`
 	Line     int64  `json:"line"`     // approximate until the index is built
 	TimedOut bool   `json:"timedOut"` // search hit the time budget before finishing
+	// Unsupported is set when the query can't be searched in the file's encoding
+	// (e.g. regex over a UTF-16/Windows-125x file, or a term with characters not
+	// representable in that encoding) — so the UI can say so instead of "no matches".
+	Unsupported bool   `json:"unsupported"`
+	Message     string `json:"message"`
 }
 
 // FindNext finds the first match at/after fromByte (single streaming pass).
@@ -153,20 +159,41 @@ func (s *FileService) find(fileID, query string, start int64, backward, regex, c
 	if strings.TrimSpace(query) == "" {
 		return SearchHit{}, nil
 	}
+	// The search engine scans the file's raw bytes, so the query must be encoded
+	// into the document's encoding first — otherwise a UTF-8 query never matches a
+	// UTF-16 / Windows-125x dump and the user gets a false "no matches".
+	enc := f.Doc.Metadata().Encoding
+	isUTF8 := enc == "" || strings.EqualFold(enc, "UTF-8")
+	var pattern []byte
+	if regex {
+		if !isUTF8 {
+			return SearchHit{Unsupported: true, Message: "Regex search isn't supported on " + enc + " files. Use plain text search, or convert the file to UTF-8."}, nil
+		}
+		pattern = []byte(query)
+	} else if isUTF8 {
+		pattern = []byte(query)
+	} else {
+		encoded, encErr := encodingx.EncodeString(enc, query)
+		if encErr != nil {
+			return SearchHit{Unsupported: true, Message: "This term can't be searched in a " + enc + " file."}, nil
+		}
+		pattern = encoded
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), searchTimeout)
 	defer cancel()
 
 	var results []search.Result
 	var err error
 	if regex {
-		results, err = search.CollectRegexp(ctx, f.Doc, []byte(query), search.RegexOptions{
+		results, err = search.CollectRegexp(ctx, f.Doc, pattern, search.RegexOptions{
 			StartOffset:     start,
 			MaxHits:         1,
 			Backward:        backward,
 			CaseInsensitive: !caseSensitive,
 		}, 0)
 	} else {
-		results, err = search.CollectPlain(ctx, f.Doc, []byte(query), search.PlainOptions{
+		results, err = search.CollectPlain(ctx, f.Doc, pattern, search.PlainOptions{
 			StartOffset:     start,
 			MaxHits:         1,
 			Backward:        backward,

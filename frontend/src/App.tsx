@@ -232,6 +232,10 @@ function App() {
         const before = lastMatch.current != null ? lastMatch.current : tab.startByte;
         hit = await FileService.FindPrev(id, q, before, regex, caseSensitive, wholeWord);
       }
+      if (hit.unsupported) {
+        setSearchInfo(hit.message || "Search not supported for this file's encoding");
+        return;
+      }
       if (hit.timedOut) {
         setSearchInfo("Timed out — narrow the query");
         return;
