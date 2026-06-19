@@ -347,6 +347,132 @@ func TestConvertToSQLRejectsUnsafeIdentifiers(t *testing.T) {
 	}
 }
 
+func TestConvertToSQLStripsUTF8BOM(t *testing.T) {
+	var out strings.Builder
+	_, err := ConvertToSQL(context.Background(), strings.NewReader("\xEF\xBB\xBFid,name\n1,alice\n"), &out, SQLConvertOptions{
+		TableName: "users",
+		HasHeader: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := out.String()
+	if strings.Contains(sql, "FEFF") {
+		t.Fatalf("BOM leaked into output: %q", sql)
+	}
+	if !strings.Contains(sql, "`id`") {
+		t.Fatalf("first column should be `id`, got: %q", sql)
+	}
+}
+
+func TestConvertToSQLRejectsUTF16Input(t *testing.T) {
+	// UTF-16LE BOM + "id\n" interleaved with NULs.
+	in := "\xFF\xFEi\x00d\x00\n\x00"
+	var out strings.Builder
+	_, err := ConvertToSQL(context.Background(), strings.NewReader(in), &out, SQLConvertOptions{
+		TableName: "t",
+		HasHeader: true,
+	})
+	if !errors.Is(err, ErrUTF16Input) {
+		t.Fatalf("err = %v, want ErrUTF16Input", err)
+	}
+}
+
+func TestConvertToSQLTrimsLeadingSpaceForNullMatch(t *testing.T) {
+	var out strings.Builder
+	_, err := ConvertToSQL(context.Background(), strings.NewReader("1, NULL\n"), &out, SQLConvertOptions{
+		TableName:  "t",
+		Columns:    []string{"a", "b"},
+		NullValues: []string{"NULL"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "'1', NULL)") {
+		t.Fatalf("unquoted ' NULL' should match the NULL set and emit NULL, got: %q", out.String())
+	}
+}
+
+func TestConvertToSQLKeepsQuotedLeadingSpace(t *testing.T) {
+	var out strings.Builder
+	_, err := ConvertToSQL(context.Background(), strings.NewReader("1,\" NULL\"\n"), &out, SQLConvertOptions{
+		TableName:  "t",
+		Columns:    []string{"a", "b"},
+		NullValues: []string{"NULL"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "' NULL'") {
+		t.Fatalf("quoted \" NULL\" should stay a string, got: %q", out.String())
+	}
+}
+
+func TestConvertToSQLReplacePolicySanitizes(t *testing.T) {
+	var out strings.Builder
+	summary, err := ConvertToSQL(context.Background(), strings.NewReader("1,bad\x01value\n"), &out, SQLConvertOptions{
+		TableName:      "t",
+		Columns:        []string{"id", "note"},
+		OnInvalidValue: InvalidValueReplace,
+	})
+	if err != nil {
+		t.Fatalf("replace policy should not error: %v", err)
+	}
+	if summary.SanitizedRows != 1 {
+		t.Fatalf("SanitizedRows = %d, want 1", summary.SanitizedRows)
+	}
+	if summary.RowsWritten != 1 {
+		t.Fatalf("RowsWritten = %d, want 1", summary.RowsWritten)
+	}
+	if strings.ContainsRune(out.String(), 0x01) {
+		t.Fatalf("control byte leaked into output: %q", out.String())
+	}
+}
+
+func TestConvertToSQLSkipRowPolicyDropsBadRecord(t *testing.T) {
+	var out strings.Builder
+	summary, err := ConvertToSQL(context.Background(), strings.NewReader("1,ok\n2,bad\x01value\n3,fine\n"), &out, SQLConvertOptions{
+		TableName:      "t",
+		Columns:        []string{"id", "note"},
+		OnInvalidValue: InvalidValueSkipRow,
+	})
+	if err != nil {
+		t.Fatalf("skip-row policy should not error: %v", err)
+	}
+	if summary.SkippedRows != 1 {
+		t.Fatalf("SkippedRows = %d, want 1", summary.SkippedRows)
+	}
+	if summary.RowsWritten != 2 {
+		t.Fatalf("RowsWritten = %d, want 2 (rows 1 and 3)", summary.RowsWritten)
+	}
+}
+
+func TestConvertToSQLFileKeepsPartialOutputOnDataError(t *testing.T) {
+	dir := t.TempDir()
+	input := filepath.Join(dir, "input.csv")
+	output := filepath.Join(dir, "output.sql")
+	// Rows 1-2 are clean; row 3 has a control byte. Default policy (fail) aborts
+	// at row 3, but the already-written rows must be retained.
+	if err := os.WriteFile(input, []byte("1,ok\n2,fine\n3,bad\x01value\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	_, err := ConvertToSQLFile(context.Background(), input, output, SQLConvertOptions{
+		TableName:       "t",
+		Columns:         []string{"id", "note"},
+		InsertBatchSize: 1,
+	})
+	if err == nil {
+		t.Fatal("expected a data error on row 3")
+	}
+	data, statErr := os.ReadFile(output)
+	if statErr != nil {
+		t.Fatalf("partial output should be retained on a data error: %v", statErr)
+	}
+	if !strings.Contains(string(data), "'ok'") {
+		t.Fatalf("partial output should contain the first written row, got: %q", string(data))
+	}
+}
+
 func TestConvertToSQLRejectsUnsafeFieldControlCharacters(t *testing.T) {
 	var out strings.Builder
 	_, err := ConvertToSQL(context.Background(), strings.NewReader("1,bad\x01value\n"), &out, SQLConvertOptions{

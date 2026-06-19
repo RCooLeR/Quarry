@@ -5,6 +5,35 @@ import (
 	"testing"
 )
 
+func TestClassifyLeadingZeroIntIsText(t *testing.T) {
+	cases := map[string]schemaKind{
+		"007":   schemaText,
+		"00123": schemaText,
+		"-0042": schemaText,
+		"0":     schemaInt,
+		"-0":    schemaInt,
+		"42":    schemaInt,
+		"3.14":  schemaFloat,
+		"true":  schemaBool,
+		"hello": schemaText,
+	}
+	for value, want := range cases {
+		if got := classifySchemaValue(value); got != want {
+			t.Fatalf("classifySchemaValue(%q) = %d, want %d", value, got, want)
+		}
+	}
+}
+
+func TestInferSchemaKeepsLeadingZeroColumnAsText(t *testing.T) {
+	report, err := InferSchema(strings.NewReader("zip\n007\n012\n10000\n"), SchemaOptions{HasHeader: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Columns) != 1 || report.Columns[0].SQLType != SQLTypeText {
+		t.Fatalf("columns = %+v, want a single TEXT column to preserve leading zeros", report.Columns)
+	}
+}
+
 func TestInferSchemaDetectsHeaderAndSQLTypes(t *testing.T) {
 	report, err := InferSchema(strings.NewReader("id,price,active,note\n1,12.50,true,hello\n2,14,false,NULL\n"), SchemaOptions{
 		HasHeader:  true,

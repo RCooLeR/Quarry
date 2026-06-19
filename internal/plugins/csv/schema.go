@@ -247,15 +247,34 @@ func classifySchemaValue(value string) schemaKind {
 	}
 	lower := strings.ToLower(value)
 	if lower == "true" || lower == "false" {
+		// NOTE: values are always emitted as quoted strings, and MySQL BOOLEAN is
+		// TINYINT(1), so 'true'/'false' coerce to 0 on import. BOOLEAN is kept for
+		// readability/back-compat; treat the CREATE TABLE type as a best-effort hint.
 		return schemaBool
 	}
 	if _, err := strconv.ParseInt(value, 10, 64); err == nil {
+		// A value like 007 / 00123 parses as an int but is almost certainly an
+		// identifier (zip/account/leading-zero id). Since values are stored as
+		// quoted strings, a BIGINT column would silently drop the leading zeros on
+		// import — so classify it as TEXT to preserve it.
+		if looksLikeLeadingZeroInt(value) {
+			return schemaText
+		}
 		return schemaInt
 	}
 	if parsed, err := strconv.ParseFloat(value, 64); err == nil && !math.IsNaN(parsed) && !math.IsInf(parsed, 0) {
 		return schemaFloat
 	}
 	return schemaText
+}
+
+// looksLikeLeadingZeroInt reports whether s is a multi-digit integer with a
+// leading zero (e.g. 007, -0042), which should be preserved as TEXT.
+func looksLikeLeadingZeroInt(s string) bool {
+	if len(s) > 0 && (s[0] == '+' || s[0] == '-') {
+		s = s[1:]
+	}
+	return len(s) > 1 && s[0] == '0'
 }
 
 func promoteSchemaKind(current, next schemaKind) schemaKind {

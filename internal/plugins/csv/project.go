@@ -71,11 +71,16 @@ func ProjectColumns(ctx context.Context, r io.Reader, w io.Writer, opts ProjectO
 		return ProjectSummary{}, err
 	}
 
-	counting := &countingReader{r: bufio.NewReader(r)}
+	br := bufio.NewReader(r)
+	if err := skipInputBOM(br); err != nil {
+		return ProjectSummary{}, err
+	}
+	counting := &countingReader{r: br}
 	reader := stdcsv.NewReader(counting)
 	reader.Comma = opts.Delimiter
 	reader.FieldsPerRecord = -1
 	reader.LazyQuotes = true
+	reader.TrimLeadingSpace = true
 	reader.ReuseRecord = false
 
 	writer := stdcsv.NewWriter(w)

@@ -20,6 +20,19 @@ type SQLDialect string
 
 const SQLDialectMySQL SQLDialect = "mysql"
 
+// InvalidValuePolicy controls what happens when a field contains a byte that
+// can't be emitted safely (a control char or invalid UTF-8).
+type InvalidValuePolicy string
+
+const (
+	// InvalidValueFail aborts the conversion (default — safest for correctness).
+	InvalidValueFail InvalidValuePolicy = "fail"
+	// InvalidValueSkipRow drops the offending record and continues.
+	InvalidValueSkipRow InvalidValuePolicy = "skip-row"
+	// InvalidValueReplace substitutes U+FFFD for the offending byte and continues.
+	InvalidValueReplace InvalidValuePolicy = "replace"
+)
+
 type SQLConvertOptions struct {
 	Delimiter          rune
 	TableName          string
@@ -31,7 +44,10 @@ type SQLConvertOptions struct {
 	IncludeCreateTable bool
 	ColumnTypes        []string
 	MaxFieldBytes      int64
-	Progress           func(SQLConvertProgress)
+	// OnInvalidValue selects how to handle un-emittable field bytes. Empty means
+	// InvalidValueFail.
+	OnInvalidValue InvalidValuePolicy
+	Progress       func(SQLConvertProgress)
 }
 
 type SQLConvertProgress struct {
@@ -49,6 +65,10 @@ type SQLConvertSummary struct {
 	Dialect            SQLDialect
 	Delimiter          rune
 	CreateTableWritten bool
+	// SkippedRows / SanitizedRows count records dropped or repaired under a
+	// non-fail OnInvalidValue policy.
+	SkippedRows   int64
+	SanitizedRows int64
 }
 
 type SQLPreviewOptions struct {
@@ -81,14 +101,22 @@ func ConvertToSQL(ctx context.Context, r io.Reader, w io.Writer, opts SQLConvert
 		return SQLConvertSummary{}, err
 	}
 
-	counting := &countingReader{r: bufio.NewReader(r)}
+	br := bufio.NewReader(r)
+	if err := skipInputBOM(br); err != nil {
+		return SQLConvertSummary{}, err
+	}
+	counting := &countingReader{r: br}
 	reader := stdcsv.NewReader(counting)
 	reader.Comma = opts.Delimiter
 	reader.FieldsPerRecord = -1
 	reader.LazyQuotes = true
+	reader.TrimLeadingSpace = true
 	reader.ReuseRecord = false
 
 	writer := bufio.NewWriter(w)
+	// Flush whatever has been written on every exit so a partial output left after
+	// a mid-stream error is as complete as the data processed so far.
+	defer func() { _ = writer.Flush() }()
 	summary := SQLConvertSummary{
 		TableName: opts.TableName,
 		Dialect:   opts.Dialect,
@@ -156,10 +184,17 @@ func ConvertToSQL(ctx context.Context, r io.Reader, w io.Writer, opts SQLConvert
 			return summary, fmt.Errorf("record %d: %w", summary.RecordsRead, err)
 		}
 
-		tuple, err := sqlValuesTuple(record, nulls)
+		tuple, skip, sanitized, err := sqlValuesTuple(record, nulls, opts.OnInvalidValue)
 		if err != nil {
 			summary.BytesRead = counting.n
 			return summary, fmt.Errorf("record %d: %w", summary.RecordsRead, err)
+		}
+		if skip {
+			summary.SkippedRows++
+			continue
+		}
+		if sanitized {
+			summary.SanitizedRows++
 		}
 		batch = append(batch, tuple)
 		if len(batch) >= opts.InsertBatchSize {
@@ -305,6 +340,7 @@ func limitedSQLPreviewInput(ctx context.Context, data []byte, delimiter rune, ha
 	reader.Comma = delimiter
 	reader.FieldsPerRecord = -1
 	reader.LazyQuotes = true
+	reader.TrimLeadingSpace = true // keep preview consistent with ConvertToSQL output
 	reader.ReuseRecord = false
 
 	var out strings.Builder
@@ -435,6 +471,15 @@ func ConvertToSQLFile(ctx context.Context, inputPath, outputPath string, opts SQ
 
 	summary, err := ConvertToSQL(ctx, input, output, opts)
 	if err != nil {
+		// Discard the output on cancellation/timeout or if nothing was written;
+		// otherwise KEEP the partial output (potentially hours of work) so the
+		// user can inspect or resume rather than losing everything to one bad row.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || summary.RowsWritten == 0 {
+			return summary, err
+		}
+		_ = output.Sync()
+		_ = output.Close()
+		cleanup = false
 		return summary, err
 	}
 	if err := output.Sync(); err != nil {
@@ -536,20 +581,32 @@ func normalizeSQLColumnTypes(types []string, columns int) []string {
 	return normalized
 }
 
-func sqlValuesTuple(record []string, nulls map[string]struct{}) (string, error) {
+// errInvalidSQLValue marks a field that can't be emitted safely; the policy
+// decides whether that fails the job, skips the row, or sanitizes the value.
+var errInvalidSQLValue = errors.New("field contains an unsafe byte")
+
+// sqlValuesTuple builds the VALUES tuple for a record. Under InvalidValueSkipRow
+// it returns skip=true when any field is unsafe; under InvalidValueReplace it
+// returns sanitized=true when any field was repaired; otherwise an unsafe field
+// is a fatal error.
+func sqlValuesTuple(record []string, nulls map[string]struct{}, policy InvalidValuePolicy) (tuple string, skip bool, sanitized bool, err error) {
 	values := make([]string, len(record))
 	for i, value := range record {
 		if _, ok := nulls[value]; ok {
 			values[i] = "NULL"
 			continue
 		}
-		quoted, err := quoteSQLString(value)
-		if err != nil {
-			return "", fmt.Errorf("field %d: %w", i+1, err)
+		quoted, repaired, qerr := quoteSQLValue(value, policy)
+		if qerr != nil {
+			if policy == InvalidValueSkipRow {
+				return "", true, false, nil
+			}
+			return "", false, false, fmt.Errorf("field %d: %w", i+1, qerr)
 		}
+		sanitized = sanitized || repaired
 		values[i] = quoted
 	}
-	return "(" + strings.Join(values, ", ") + ")", nil
+	return "(" + strings.Join(values, ", ") + ")", false, sanitized, nil
 }
 
 func validateSQLRecordFieldSizes(record []string, maxFieldBytes int64) error {
@@ -636,14 +693,30 @@ func quoteSQLIdentifier(identifier string) (string, error) {
 	return "`" + strings.ReplaceAll(identifier, "`", "``") + "`", nil
 }
 
+// quoteSQLString quotes a value, failing on any unsafe byte (the strict default).
 func quoteSQLString(value string) (string, error) {
+	out, _, err := quoteSQLValue(value, InvalidValueFail)
+	return out, err
+}
+
+// quoteSQLValue quotes a value into a MySQL string literal. An unsafe byte (a
+// control char or invalid UTF-8) either fails (default), or — under
+// InvalidValueReplace — is replaced with U+FFFD and sanitized is set true. Under
+// InvalidValueSkipRow it returns errInvalidSQLValue so the caller drops the row.
+func quoteSQLValue(value string, policy InvalidValuePolicy) (out string, sanitized bool, err error) {
 	var b strings.Builder
 	b.Grow(len(value) + 2)
 	b.WriteByte('\'')
 	for i := 0; i < len(value); {
 		r, size := utf8.DecodeRuneInString(value[i:])
 		if r == utf8.RuneError && size == 1 {
-			return "", fmt.Errorf("invalid UTF-8 byte 0x%02X cannot be emitted safely", value[i])
+			if policy == InvalidValueReplace {
+				b.WriteRune('�')
+				sanitized = true
+				i++
+				continue
+			}
+			return "", false, fmt.Errorf("invalid UTF-8 byte 0x%02X cannot be emitted safely: %w", value[i], errInvalidSQLValue)
 		}
 		switch r {
 		case 0:
@@ -664,14 +737,20 @@ func quoteSQLString(value string) (string, error) {
 			b.WriteString("''")
 		default:
 			if r < 0x20 || r == 0x7F {
-				return "", fmt.Errorf("control character U+%04X cannot be emitted safely", r)
+				if policy == InvalidValueReplace {
+					b.WriteRune('�')
+					sanitized = true
+					i += size
+					continue
+				}
+				return "", false, fmt.Errorf("control character U+%04X cannot be emitted safely: %w", r, errInvalidSQLValue)
 			}
 			b.WriteString(value[i : i+size])
 		}
 		i += size
 	}
 	b.WriteByte('\'')
-	return b.String(), nil
+	return b.String(), sanitized, nil
 }
 
 func validateSQLIdentifiers(label string, identifiers []string) error {
