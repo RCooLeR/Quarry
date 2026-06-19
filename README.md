@@ -1,59 +1,95 @@
-# Welcome to Your New Wails3 Project!
+# Quarry
 
-Congratulations on generating your Wails3 application! This README will guide you through the next steps to get your project up and running.
+Quarry is a Windows-first desktop editor and toolkit for **very large** text
+files — multi-gigabyte (400 GB+) SQL dumps, CSV/TSV exports, and logs that no
+ordinary editor can open.
 
-## Getting Started
+It never reads the whole file into memory. The editor holds only bounded,
+line-aligned **windows** that stream in as you scroll and navigate by byte
+offset, so a 4 KB file and a 400 GB file cost roughly the same. On top of that
+streaming core sits a workbench of data tools: SQL dump analysis and extraction,
+flexible CSV↔SQL conversion, streaming search/replace/harvest, row transforms,
+and export bridges.
 
-1. Navigate to your project directory in the terminal.
+Built with **Go + [Wails v3](https://v3.wails.io/) + React + TypeScript +
+[CodeMirror 6](https://codemirror.net/)**.
 
-2. To run your application in development mode, use the following command:
+## Highlights
 
-   ```
-   wails3 dev
-   ```
+- **Open anything, instantly** — files are memory-mapped in spirit, not loaded;
+  first paint doesn't wait for indexing. Indexing and analysis are background,
+  cancellable, and optional.
+- **Editing without rewriting the file** — length-preserving edits can be
+  *patched in place* (with a backup); anything else streams a full edited copy.
+- **SQL dump workbench** — analyze tables/charsets/DEFINER, extract a table or
+  its schema/data, split a dump per table, sample a tiny dev fixture, lint for
+  re-import problems, reshape extended↔single-row INSERTs, and diff two dumps'
+  schemas.
+- **CSV workbench** — delimiter detection, schema inference, a spreadsheet grid,
+  a convertcsv-style CSV→SQL builder, column transforms, filter/dedupe/sample,
+  redact/anonymize, and a column profiler.
+- **Export bridges** — CSV → JSONL, SQLite, or Excel (.xlsx); copy a preview as
+  a Markdown table.
+- **Fast navigation** — command palette, go-to line/offset/percent, a file
+  X-ray minimap, bookmarks, and jump-to-table.
+- **Ops polish** — cancellable background jobs with a progress toast,
+  follow-tail of growing files, recent files, session restore, drag-and-drop
+  open, and a light/dark theme.
 
-   This will start your application and enable hot-reloading for both frontend and backend changes.
+> **Safety invariant:** every transform and export writes to a **new** file
+> (temp file + atomic rename). The only in-place write is the explicit
+> length-preserving *patch in place*, which keeps a backup. Quarry never
+> silently mutates your source.
 
-3. To build your application for production, use:
+## Quick start
 
-   ```
-   wails3 build
-   ```
+Prerequisites: [Go](https://go.dev/) 1.26+, [Node.js](https://nodejs.org/) +
+npm, the [Wails v3 CLI](https://v3.wails.io/getting-started/installation/), and
+[Task](https://taskfile.dev/) (optional but convenient).
 
-   This will create a production-ready executable in the `build` directory.
+```sh
+# run in development (hot reload for Go + frontend)
+task dev          # or: wails3 dev
 
-## Exploring Wails3 Features
+# production build → bin/quarry.exe
+task build        # or: wails3 build
 
-Now that you have your project set up, it's time to explore the features that Wails3 offers:
+# run the tests
+go test ./...
+```
 
-1. **Check out the examples**: The best way to learn is by example. Visit the `examples` directory in the `v3/examples` directory to see various sample applications.
+See **[docs/getting-started.md](docs/getting-started.md)** for details.
 
-2. **Run an example**: To run any of the examples, navigate to the example's directory and use:
+## Project layout
 
-   ```
-   go run .
-   ```
+```
+.
+├── main.go              # Wails app: window, dark title bar, file-drop bridge
+├── fileservice*.go      # FileService — the Go↔frontend binding layer
+├── jobs.go              # cancellable background-job manager
+├── internal/            # the streaming engine (no UI dependencies)
+│   ├── document/        # FileDocument: bounded windowed reads + chunk cache
+│   ├── lineindex/       # sparse line index (approx → exact line numbers)
+│   ├── search/ replace/ # streaming, encoding-aware find / replace
+│   ├── exportx/         # byte-range export
+│   ├── manualedit/ inplace/ editwindow/   # staged edits & in-place patching
+│   └── plugins/
+│       ├── csv/         # inspect, schema, convert, transform, export
+│       └── sql/         # analyze, extract, preset, reshape, schemadiff
+└── frontend/src/        # React UI
+    ├── editor/QuarryEditor.ts   # the CodeMirror windowed editor surface
+    ├── App.tsx          # workbench shell, menus, panels
+    └── Tools.tsx        # the data-tools panel (CSV / SQL)
+```
 
-   Note: Some examples may be under development during the alpha phase.
+## Documentation
 
-3. **Explore the documentation**: Visit the [Wails3 documentation](https://v3.wails.io/) for in-depth guides and API references.
+- [Documentation index](docs/index.md)
+- [Getting started](docs/getting-started.md) — install, build, run, open a file
+- [Features & tools](docs/features.md) — the full editor + workbench reference
+- [Architecture](docs/architecture.md) — how streaming, editing, and bindings work
+- [Development](docs/development.md) — build, test, bindings, adding a tool
 
-4. **Join the community**: Have questions or want to share your progress? Join the [Wails Discord](https://discord.gg/JDdSxwjhGf) or visit the [Wails discussions on GitHub](https://github.com/wailsapp/wails/discussions).
+## License
 
-## Project Structure
-
-Take a moment to familiarize yourself with your project structure:
-
-- `frontend/`: Contains your frontend code (HTML, CSS, JavaScript/TypeScript)
-- `main.go`: The entry point of your Go backend
-- `app.go`: Define your application structure and methods here
-- `wails.json`: Configuration file for your Wails project
-
-## Next Steps
-
-1. Modify the frontend in the `frontend/` directory to create your desired UI.
-2. Add backend functionality in `main.go`.
-3. Use `wails3 dev` to see your changes in real-time.
-4. When ready, build your application with `wails3 build`.
-
-Happy coding with Wails3! If you encounter any issues or have questions, don't hesitate to consult the documentation or reach out to the Wails community.
+See the repository for license details.
