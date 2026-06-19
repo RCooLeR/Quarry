@@ -586,6 +586,96 @@ func (s *FileService) CsvSampleViaDialog(fileID, delimiter string, hasHeader boo
 	}, nil
 }
 
+// CsvExportJSONLViaDialog streams the CSV to newline-delimited JSON.
+func (s *FileService) CsvExportJSONLViaDialog(fileID, delimiter string, hasHeader, numberKeys bool) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	dst, err := saveDialog("Export JSON Lines as", "export.jsonl")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.ExportJSONLFile(context.Background(), f.Path, dst, csv.JSONLOptions{
+		Delimiter:  delimiterRune(delimiter),
+		HasHeader:  hasHeader,
+		NumberKeys: numberKeys,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: "JSON Lines"}, nil
+}
+
+// CsvExportSQLiteViaDialog streams the CSV into a new SQLite .db file.
+func (s *FileService) CsvExportSQLiteViaDialog(fileID, delimiter string, hasHeader bool, tableName string, typedCells bool) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	dst, err := saveDialog("Export SQLite database as", "export.db")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.ExportSQLiteFile(context.Background(), f.Path, dst, csv.SQLiteOptions{
+		Delimiter:  delimiterRune(delimiter),
+		HasHeader:  hasHeader,
+		TableName:  sqlTableName(tableName),
+		TypedCells: typedCells,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: fmt.Sprintf("table %q", sqlTableName(tableName))}, nil
+}
+
+// CsvExportXLSXViaDialog streams the CSV into a new .xlsx workbook.
+func (s *FileService) CsvExportXLSXViaDialog(fileID, delimiter string, hasHeader bool, sheetName string, typedCells bool) (TransformResult, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return TransformResult{}, fmt.Errorf("unknown file id %q", fileID)
+	}
+	dst, err := saveDialog("Export Excel workbook as", "export.xlsx")
+	if err != nil || strings.TrimSpace(dst) == "" {
+		return TransformResult{}, err
+	}
+	sum, err := csv.ExportXLSXFile(context.Background(), f.Path, dst, csv.XLSXOptions{
+		Delimiter:  delimiterRune(delimiter),
+		HasHeader:  hasHeader,
+		SheetName:  strings.TrimSpace(sheetName),
+		TypedCells: typedCells,
+	})
+	if err != nil {
+		return TransformResult{}, err
+	}
+	note := "Excel workbook"
+	if sum.Truncated {
+		note = fmt.Sprintf("Excel workbook (truncated at %d rows — sheet limit)", sum.RecordsWritten)
+	}
+	return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: note}, nil
+}
+
+// CsvMarkdownPreview returns the current preview as a Markdown table (for copy).
+func (s *FileService) CsvMarkdownPreview(fileID, delimiter string, hasHeader bool, maxRows int) (string, error) {
+	r, _, err := s.csvSampleReader(fileID)
+	if err != nil {
+		return "", err
+	}
+	if maxRows <= 0 {
+		maxRows = 50
+	}
+	rep, err := csv.PreviewRowsContext(context.Background(), r, csv.PreviewOptions{
+		Delimiter: delimiterRune(delimiter),
+		HasHeader: hasHeader,
+		MaxBytes:  csvSampleBytes,
+		MaxRows:   maxRows,
+	})
+	if err != nil {
+		return "", err
+	}
+	return csv.MarkdownPreview(rep.Header, rep.Rows), nil
+}
+
 // CsvToSQLConfigPreview returns a short sample of the SQL for a full config.
 func (s *FileService) CsvToSQLConfigPreview(fileID string, cfg CsvSqlConfig) (string, error) {
 	r, _, err := s.csvSampleReader(fileID)

@@ -215,6 +215,21 @@ export default function Tools({ fileId, detected, analysis, otherFiles, onAnalyz
     run(async () => (await FileService.CsvDedupeViaDialog(fileId, delim, hasHeader, dedupeKey)) as TransformResult);
   const doSampleCsv = () =>
     run(async () => (await FileService.CsvSampleViaDialog(fileId, delim, hasHeader, sampleEvery)) as TransformResult);
+  const doExportJsonl = () =>
+    run(async () => (await FileService.CsvExportJSONLViaDialog(fileId, delim, hasHeader, true)) as TransformResult);
+  const doExportSqlite = () =>
+    run(async () => (await FileService.CsvExportSQLiteViaDialog(fileId, delim, hasHeader, tableName, true)) as TransformResult);
+  const doExportXlsx = () =>
+    run(async () => (await FileService.CsvExportXLSXViaDialog(fileId, delim, hasHeader, tableName, true)) as TransformResult);
+  const doCopyMarkdown = async () => {
+    try {
+      const md = (await FileService.CsvMarkdownPreview(fileId, delim, hasHeader, 50)) as string;
+      await navigator.clipboard.writeText(md);
+      onNotice("Copied preview as Markdown");
+    } catch (e: any) {
+      onError(String(e?.message ?? e));
+    }
+  };
 
   // SQL tools
   const doAnalyze = async () => {
@@ -404,6 +419,16 @@ export default function Tools({ fileId, detected, analysis, otherFiles, onAnalyz
               <input className="q-num" type="number" min={2} value={sampleEvery} onChange={(e) => setSampleEvery(Math.max(2, Number(e.target.value) || 2))} />
               <label className="q-tlabel q-tlabel-inline">th row</label>
               <button className="q-btn" disabled={busy} onClick={doSampleCsv}>Sample →</button>
+            </div>
+
+            <div className="q-tsection">Export → JSONL / SQLite / Excel</div>
+            <div className="q-trow">
+              <button className="q-btn" disabled={busy} onClick={doExportJsonl} title="Newline-delimited JSON, one object per row">JSONL</button>
+              <button className="q-btn" disabled={busy} onClick={doExportSqlite} title="SQLite .db with one table">SQLite</button>
+              <button className="q-btn" disabled={busy} onClick={doExportXlsx} title="Excel .xlsx (≤1,048,576 rows)">Excel</button>
+            </div>
+            <div className="q-trow">
+              <button className="q-btn" disabled={busy} onClick={() => void doCopyMarkdown()} title="Copy the preview as a Markdown table">Copy preview as Markdown</button>
             </div>
 
             <div className="q-tsection">Profile (sampled)</div>
