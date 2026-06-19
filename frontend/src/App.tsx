@@ -96,6 +96,7 @@ function App() {
     try { return JSON.parse(localStorage.getItem("quarry.bookmarks") || "{}"); } catch { return {}; }
   });
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
+  const [following, setFollowing] = useState(false);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -159,6 +160,36 @@ function App() {
   }, [theme]);
 
   const toggleTheme = () => setTheme((t) => (t === "light" ? "dark" : "light"));
+
+  // Tail/follow: poll the active file's size; when it grows, reload from disk
+  // and jump to the new end. Stops automatically when editing (reload would
+  // discard staged edits) or when the active file changes.
+  useEffect(() => {
+    if (!following) return;
+    const id = activeId;
+    if (!id) return;
+    let lastSize = tabsRef.current.find((t) => t.fileId === id)?.meta.size ?? 0;
+    let stop = false;
+    const tick = async () => {
+      if (stop) return;
+      try {
+        const size = (await FileService.FileSize(id)) as number;
+        if (size > lastSize) {
+          lastSize = size;
+          const m = (await FileService.RefreshFile(id)) as FileMetaData;
+          setTabs((prev) => prev.map((t) => (t.fileId === id ? { ...t, meta: { ...t.meta, size: m.size } } : t)));
+          tabsRef.current = tabsRef.current.map((t) => (t.fileId === id ? { ...t, meta: { ...t.meta, size: m.size } } : t));
+          await editorRef.current?.gotoByte(m.size);
+        }
+      } catch { /* file may be momentarily locked; retry next tick */ }
+    };
+    const h = window.setInterval(() => void tick(), 1500);
+    return () => { stop = true; window.clearInterval(h); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [following, activeId]);
+
+  // Following reloads from disk, so turn it off as soon as the user starts editing.
+  useEffect(() => { if (editMode && following) setFollowing(false); }, [editMode]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Open a file by path (used by drag-drop and session restore).
   const openFilePath = async (p: string) => {
@@ -580,6 +611,7 @@ function App() {
         { label: "File map (X-ray)", checked: xrayOn, onClick: () => setXrayOn((v) => !v) },
         { label: "Bookmarks", disabled: !hasFiles, checked: bookmarksOpen, onClick: () => setBookmarksOpen((v) => !v) },
         { label: "Add bookmark here", disabled: !activeTab, onClick: addBookmark },
+        { label: "Follow tail (live)", disabled: !hasFiles || hasEdits, checked: following, onClick: () => setFollowing((v) => !v) },
         { label: "Command palette…", shortcut: "Ctrl+P", onClick: () => setPaletteOpen(true) },
         { label: "Light theme", checked: theme === "light", onClick: toggleTheme },
         { separator: true },
@@ -612,6 +644,7 @@ function App() {
     { id: "theme", group: "View", label: theme === "light" ? "Switch to dark theme" : "Switch to light theme", run: toggleTheme },
     { id: "bookmark", group: "View", label: "Add bookmark here", run: addBookmark },
     { id: "bookmarks", group: "View", label: "Toggle bookmarks panel", run: () => setBookmarksOpen((v) => !v) },
+    { id: "follow", group: "View", label: following ? "Stop following tail" : "Follow tail (live)", run: () => setFollowing((v) => !v) },
     { id: "text", group: "View", label: "Plain text view", run: showText },
     { id: "hex", group: "View", label: "Toggle hex view", run: () => { setGridView(false); setHexView((v) => !v); } },
     { id: "grid", group: "View", label: "Toggle grid view", run: () => { setHexView(false); setGridView((v) => !v); } },
@@ -892,6 +925,7 @@ function App() {
             <span>{activeTab.meta.encoding || "?"}</span>
             <span>{activeTab.meta.detected || "plain"}</span>
             <span className="q-spacer" />
+            {following && <span className="q-edit-flag" title="Following file tail">● live</span>}
             {editMode && <span className="q-edit-flag">{dirty ? "● editing" : "editing"}</span>}
             {hasEdits && (
               <span className="q-edit-flag">

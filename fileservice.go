@@ -130,6 +130,41 @@ func (s *FileService) CloseFile(fileID string) error {
 	return s.reg.Close(fileID)
 }
 
+// FileSize re-stats the file on disk and returns its current size. Cheap — used
+// to poll a growing file (tail/follow) without reopening it.
+func (s *FileService) FileSize(fileID string) (int64, error) {
+	f, ok := s.reg.Get(fileID)
+	if !ok {
+		return 0, fmt.Errorf("unknown file id %q", fileID)
+	}
+	st, err := f.Doc.CurrentFileState()
+	if err != nil {
+		return 0, err
+	}
+	return st.Size, nil
+}
+
+// RefreshFile reloads the file from disk under the same id (fresh size + line
+// index), for following a growing file or picking up external changes. Any
+// staged edits are discarded, so callers should confirm before using it on a
+// file with pending edits.
+func (s *FileService) RefreshFile(fileID string) (FileMeta, error) {
+	f, err := s.reg.Reopen(fileID)
+	if err != nil {
+		return FileMeta{}, err
+	}
+	m := f.Doc.Metadata()
+	return FileMeta{
+		FileID:   f.ID,
+		Path:     m.Path,
+		Size:     m.Size,
+		Encoding: m.Encoding,
+		Detected: m.FileType,
+		Binary:   m.Binary,
+		Editable: !m.Binary && editableEncoding(m.Encoding, m.LineEnding),
+	}, nil
+}
+
 // SearchHit is one match (or a not-found / timed-out / unsupported result).
 type SearchHit struct {
 	Found    bool   `json:"found"`
