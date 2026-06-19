@@ -381,11 +381,17 @@ func collectRegexpMatches(ctx context.Context, r ReaderAtSize, re *regexp.Regexp
 	return results, nil
 }
 
+// collectRegexPrefix iterates matches with a moving cursor (FindSubmatchIndex)
+// instead of materializing every match up front (FindAllSubmatchIndex), so peak
+// memory stays bounded by the window rather than the match count on dense inputs.
 func collectRegexPrefix(window []byte, processLimit int, re *regexp.Regexp, windowStart int64, emit func(offset int64, length int) bool) (int, error) {
-	locs := re.FindAllSubmatchIndex(window, -1)
 	consumed := processLimit
-	for _, loc := range locs {
-		start, end := loc[0], loc[1]
+	for pos := 0; pos <= len(window); {
+		loc := re.FindSubmatchIndex(window[pos:])
+		if loc == nil {
+			break
+		}
+		start, end := loc[0]+pos, loc[1]+pos
 		if end > processLimit {
 			if start < processLimit {
 				consumed = start
@@ -395,15 +401,29 @@ func collectRegexPrefix(window []byte, processLimit int, re *regexp.Regexp, wind
 		if emit(windowStart+int64(start), end-start) {
 			return consumed, nil
 		}
+		if loc[1] > loc[0] {
+			pos = end
+		} else {
+			pos = end + 1 // zero-width match: advance to avoid an infinite loop
+		}
 	}
 	return consumed, nil
 }
 
+// writeRegexPrefix streams matches one at a time with a moving cursor and reuses
+// a single Expand scratch buffer, so a dense replace (e.g. a frequent token in a
+// 16 MiB window) no longer allocates the full match-index slice plus a fresh
+// expansion per match — keeping per-chunk allocation bounded by the window size.
 func writeRegexPrefix(dst io.Writer, window []byte, processLimit int, re *regexp.Regexp, repl []byte) (consumed int, count int, err error) {
 	cursor := 0
 	consumed = processLimit
-	for _, loc := range re.FindAllSubmatchIndex(window, -1) {
-		start, end := loc[0], loc[1]
+	var scratch []byte
+	for pos := 0; pos <= len(window); {
+		loc := re.FindSubmatchIndex(window[pos:])
+		if loc == nil {
+			break
+		}
+		start, end := loc[0]+pos, loc[1]+pos
 		if end > processLimit {
 			safeEnd := processLimit
 			if start < safeEnd {
@@ -422,11 +442,17 @@ func writeRegexPrefix(dst io.Writer, window []byte, processLimit int, re *regexp
 		if _, err := dst.Write(window[cursor:start]); err != nil {
 			return 0, count, err
 		}
-		if _, err := dst.Write(re.Expand(nil, repl, window, loc)); err != nil {
+		scratch = re.Expand(scratch[:0], repl, window[pos:], loc)
+		if _, err := dst.Write(scratch); err != nil {
 			return 0, count, err
 		}
 		cursor = end
 		count++
+		if loc[1] > loc[0] {
+			pos = end
+		} else {
+			pos = end + 1 // zero-width match: advance to avoid an infinite loop
+		}
 	}
 	if cursor < processLimit {
 		if _, err := dst.Write(window[cursor:processLimit]); err != nil {

@@ -101,23 +101,34 @@ func FindRegexp(ctx context.Context, r ReaderAtSize, re *regexp.Regexp, opts Reg
 			break
 		}
 
-		locs := re.FindAllIndex(window, -1)
+		// Moving cursor instead of FindAllIndex(window, -1): stop as soon as we hit
+		// MaxHits (FindNext uses MaxHits=1) instead of finding every match in the
+		// whole window first.
 		reachedMaxHits := false
-		for _, loc := range locs {
-			absStart := windowStart + int64(loc[0])
-			if absStart < off {
-				continue
+		for pos := 0; pos <= len(window); {
+			loc := re.FindIndex(window[pos:])
+			if loc == nil {
+				break
 			}
+			mStart, mEnd := loc[0]+pos, loc[1]+pos
+			absStart := windowStart + int64(mStart)
 			if absStart >= primaryEnd {
 				break
 			}
-			if err := emit(Match{Offset: absStart, Length: loc[1] - loc[0]}); err != nil {
-				return err
+			if absStart >= off {
+				if err := emit(Match{Offset: absStart, Length: mEnd - mStart}); err != nil {
+					return err
+				}
+				hits++
+				if opts.MaxHits > 0 && hits >= opts.MaxHits {
+					reachedMaxHits = true
+					break
+				}
 			}
-			hits++
-			if opts.MaxHits > 0 && hits >= opts.MaxHits {
-				reachedMaxHits = true
-				break
+			if loc[1] > loc[0] {
+				pos = mEnd
+			} else {
+				pos = mEnd + 1 // zero-width match: advance to avoid an infinite loop
 			}
 		}
 
