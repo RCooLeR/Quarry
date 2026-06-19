@@ -33,6 +33,43 @@ func TestParseColumnsHandlesCommaInType(t *testing.T) {
 	}
 }
 
+func TestParseColumnsBacktickKeywordName(t *testing.T) {
+	ddl := []byte("CREATE TABLE `settings` (`id` int, `key` varchar(50), `value` text, PRIMARY KEY (`id`));")
+	cols := ParseColumns(ddl)
+	if len(cols) != 3 {
+		t.Fatalf("want 3 columns, got %d: %+v", len(cols), cols)
+	}
+	names := []string{cols[0].Name, cols[1].Name, cols[2].Name}
+	if names[1] != "key" {
+		t.Fatalf("backtick column `key` was dropped: %+v", names)
+	}
+	// real constraint clauses (bare keywords) must still be skipped
+	if len(cols) != 3 {
+		t.Fatalf("PRIMARY KEY clause leaked as a column: %+v", cols)
+	}
+}
+
+func TestDiffBacktickKeywordColumnChange(t *testing.T) {
+	a := []Table{{Name: "settings", Columns: ParseColumns([]byte("CREATE TABLE `settings` (`id` int, `key` varchar(50));"))}}
+	b := []Table{{Name: "settings", Columns: ParseColumns([]byte("CREATE TABLE `settings` (`id` int, `key` varchar(100));"))}}
+	res := Diff(a, b)
+	if len(res.ChangedTables) != 1 || len(res.ChangedTables[0].ChangedColumns) != 1 {
+		t.Fatalf("change on `key` column not detected: %+v", res)
+	}
+}
+
+func TestDiffCaseInsensitiveTableNames(t *testing.T) {
+	a := []Table{{Name: "Users", Columns: []Column{{Name: "id", Definition: "int"}}}}
+	b := []Table{{Name: "users", Columns: []Column{{Name: "id", Definition: "bigint"}}}}
+	res := Diff(a, b)
+	if len(res.AddedTables) != 0 || len(res.RemovedTables) != 0 {
+		t.Fatalf("Users/users treated as different tables: %+v", res)
+	}
+	if len(res.ChangedTables) != 1 {
+		t.Fatalf("column change across case-different table name missed: %+v", res)
+	}
+}
+
 func TestDiff(t *testing.T) {
 	a := []Table{
 		{Name: "users", Columns: []Column{{Name: "id", Definition: "int"}, {Name: "name", Definition: "varchar(50)"}}},

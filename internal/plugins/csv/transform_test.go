@@ -102,6 +102,28 @@ func TestDedupeRowsWholeRow(t *testing.T) {
 	}
 }
 
+func TestDedupeRaggedRowsNotCollapsed(t *testing.T) {
+	// Rows shorter than the key column must NOT all collapse to one "duplicate",
+	// and an empty key cell must be distinct from a missing key cell.
+	src := writeTemp(t, "in.csv", "id,email\n1,a@x.com\nshort1\nshort2\n4,\n5,\n")
+	dst := filepath.Join(t.TempDir(), "out.csv")
+	sum, err := DedupeRowsFile(context.Background(), src, dst, DedupeOptions{
+		Delimiter: ',', HasHeader: true, KeyColumn: 1,
+	})
+	if err != nil {
+		t.Fatalf("dedupe: %v", err)
+	}
+	got := readAll(t, dst)
+	// header + a@x.com + short1 + short2 + first empty-key row (4,) — the second
+	// empty-key row (5,) is a real duplicate key "" so it is dropped.
+	if !strings.Contains(got, "short1") || !strings.Contains(got, "short2") {
+		t.Fatalf("distinct short rows were collapsed: %q", got)
+	}
+	if sum.RecordsWritten != 5 {
+		t.Fatalf("written = %d, want 5\n%s", sum.RecordsWritten, got)
+	}
+}
+
 func TestSampleRowsFile(t *testing.T) {
 	var sb strings.Builder
 	sb.WriteString("n\n")

@@ -54,22 +54,22 @@ func Diff(a, b []Table) Result {
 	am := indexTables(a)
 	bm := indexTables(b)
 	var res Result
-	for name := range bm {
-		if _, ok := am[name]; !ok {
-			res.AddedTables = append(res.AddedTables, name)
+	for key, bt := range bm {
+		if _, ok := am[key]; !ok {
+			res.AddedTables = append(res.AddedTables, bt.Name)
 		}
 	}
-	for name := range am {
-		if _, ok := bm[name]; !ok {
-			res.RemovedTables = append(res.RemovedTables, name)
+	for key, at := range am {
+		if _, ok := bm[key]; !ok {
+			res.RemovedTables = append(res.RemovedTables, at.Name)
 		}
 	}
-	for name, at := range am {
-		bt, ok := bm[name]
+	for key, at := range am {
+		bt, ok := bm[key]
 		if !ok {
 			continue
 		}
-		td := diffTable(name, at, bt)
+		td := diffTable(at.Name, at, bt)
 		if td.Changed() {
 			res.ChangedTables = append(res.ChangedTables, td)
 		} else {
@@ -104,10 +104,12 @@ func diffTable(name string, a, b Table) TableDiff {
 	return td
 }
 
+// indexTables keys by lower-cased name so two dumps that differ only in table
+// name case are compared as the same table (matching the column-level contract).
 func indexTables(ts []Table) map[string]Table {
 	m := make(map[string]Table, len(ts))
 	for _, t := range ts {
-		m[t.Name] = t
+		m[strings.ToLower(t.Name)] = t
 	}
 	return m
 }
@@ -149,11 +151,14 @@ func ParseColumns(ddl []byte) []Column {
 		if e == "" {
 			continue
 		}
-		name, rest, ok := leadingIdentifier(e)
+		name, rest, quoted, ok := leadingIdentifier(e)
 		if !ok {
 			continue
 		}
-		if constraintKeywords[strings.ToLower(name)] {
+		// A bare leading keyword (KEY, PRIMARY, UNIQUE, …) is a table constraint,
+		// not a column — but a backtick-quoted identifier with the same spelling
+		// (e.g. a column literally named `key`) IS a column.
+		if !quoted && constraintKeywords[strings.ToLower(name)] {
 			continue
 		}
 		cols = append(cols, Column{Name: name, Definition: normalizeDef(rest)})
@@ -272,29 +277,31 @@ func splitTopLevel(s string) []string {
 }
 
 // leadingIdentifier reads the first identifier (backtick-quoted or bare) of a
-// column entry and returns it plus the remainder (the type/modifiers).
-func leadingIdentifier(e string) (name, rest string, ok bool) {
+// column entry and returns it, the remainder (type/modifiers), and whether it
+// was backtick-quoted (a quoted leading token is always a column, never a
+// table-constraint clause).
+func leadingIdentifier(e string) (name, rest string, quoted, ok bool) {
 	e = strings.TrimSpace(e)
 	if e == "" {
-		return "", "", false
+		return "", "", false, false
 	}
 	if e[0] == '`' {
 		end := strings.IndexByte(e[1:], '`')
 		if end < 0 {
-			return "", "", false
+			return "", "", false, false
 		}
 		name = e[1 : 1+end]
 		rest = strings.TrimSpace(e[2+end:])
-		return name, rest, true
+		return name, rest, true, true
 	}
 	i := 0
 	for i < len(e) && isIdentByte(e[i]) {
 		i++
 	}
 	if i == 0 {
-		return "", "", false
+		return "", "", false, false
 	}
-	return e[:i], strings.TrimSpace(e[i:]), true
+	return e[:i], strings.TrimSpace(e[i:]), false, true
 }
 
 func isIdentByte(c byte) bool {

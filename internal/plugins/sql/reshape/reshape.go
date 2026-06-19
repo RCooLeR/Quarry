@@ -92,9 +92,46 @@ func ReshapeInsertsFile(ctx context.Context, srcPath, dstPath string, opts Optio
 	return sum, nil
 }
 
+// out is a write sink that remembers the last byte written, so a reshaped
+// statement can guarantee it starts on a fresh line (otherwise a verbatim
+// statement ending in ';' would run into the next reshaped INSERT).
+type out struct {
+	w    *bufio.Writer
+	last byte
+}
+
+func (o *out) str(s string) error {
+	if len(s) == 0 {
+		return nil
+	}
+	if _, err := o.w.WriteString(s); err != nil {
+		return err
+	}
+	o.last = s[len(s)-1]
+	return nil
+}
+
+func (o *out) bytes(p []byte) error {
+	if len(p) == 0 {
+		return nil
+	}
+	if _, err := o.w.Write(p); err != nil {
+		return err
+	}
+	o.last = p[len(p)-1]
+	return nil
+}
+
+func (o *out) ensureNL() error {
+	if o.last != '\n' {
+		return o.str("\n")
+	}
+	return nil
+}
+
 // batcher coalesces single-row INSERTs that share a prefix into extended ones.
 type batcher struct {
-	w         *bufio.Writer
+	o         *out
 	batchSize int
 	prefix    string
 	tuples    []string
@@ -105,13 +142,16 @@ func (b *batcher) flush() error {
 	if len(b.tuples) == 0 {
 		return nil
 	}
-	if _, err := b.w.WriteString(b.prefix); err != nil {
+	if err := b.o.ensureNL(); err != nil {
 		return err
 	}
-	if _, err := b.w.WriteString(strings.Join(b.tuples, ",")); err != nil {
+	if err := b.o.str(b.prefix); err != nil {
 		return err
 	}
-	if _, err := b.w.WriteString(";\n"); err != nil {
+	if err := b.o.str(strings.Join(b.tuples, ",")); err != nil {
+		return err
+	}
+	if err := b.o.str(";\n"); err != nil {
 		return err
 	}
 	b.sum.StatementsWritten++
@@ -136,7 +176,8 @@ func (b *batcher) add(prefix string, tuples []string) error {
 
 func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts Options) (Summary, error) {
 	var sum Summary
-	bat := &batcher{w: w, batchSize: opts.BatchSize, sum: &sum}
+	o := &out{w: w, last: '\n'}
+	bat := &batcher{o: o, batchSize: opts.BatchSize, sum: &sum}
 	var stmt bytes.Buffer
 	lex := lexer{}
 	overflow := false // current statement exceeded the buffer cap; pass through
@@ -147,8 +188,7 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 				return err
 			}
 		}
-		_, err := w.Write(p)
-		return err
+		return o.bytes(p)
 	}
 
 	flushStatement := func() error {
@@ -167,13 +207,16 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 			return bat.add(prefix, tuples)
 		default: // ModeSingleRow
 			for _, t := range tuples {
-				if _, err := w.WriteString(prefix); err != nil {
+				if err := o.ensureNL(); err != nil {
 					return err
 				}
-				if _, err := w.WriteString(t); err != nil {
+				if err := o.str(prefix); err != nil {
 					return err
 				}
-				if _, err := w.WriteString(";\n"); err != nil {
+				if err := o.str(t); err != nil {
+					return err
+				}
+				if err := o.str(";\n"); err != nil {
 					return err
 				}
 				sum.StatementsWritten++
@@ -193,7 +236,7 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 			c := buf[i]
 			atTop := lex.step(c)
 			if overflow {
-				if err := w.WriteByte(c); err != nil {
+				if err := o.bytes(buf[i : i+1]); err != nil {
 					return sum, err
 				}
 				if atTop && c == ';' {
@@ -375,13 +418,12 @@ func sameFile(a, b string) (bool, error) {
 // returns ok=false for anything that is not an INSERT…VALUES statement, which
 // the caller then copies through unchanged.
 func parseInsert(stmt []byte) (prefix string, tuples []string, ok bool) {
-	// Find the start of the statement keyword, skipping leading whitespace and
-	// any leading comments/whitespace we accumulated before it.
-	i := 0
-	for i < len(stmt) && isSpace(stmt[i]) {
-		i++
-	}
-	rest := stmt[i:]
+	// Skip leading whitespace AND comments. mysqldump prefixes each table's data
+	// with a "-- Dumping data for table `x`" comment block that gets buffered
+	// together with the following INSERT (comments have no ';' terminator), so
+	// without skipping them the keyword test below would fail and the INSERT —
+	// usually the largest one — would be copied through unreshaped.
+	rest := stmt[skipLeadingTrivia(stmt):]
 	if !hasFold(rest, "insert") {
 		return "", nil, false
 	}
@@ -408,6 +450,41 @@ func parseInsert(stmt []byte) (prefix string, tuples []string, ok bool) {
 
 func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v'
+}
+
+// skipLeadingTrivia returns the index of the first byte that is not leading
+// whitespace, a '--' or '#' line comment, or a '/* */' block comment.
+func skipLeadingTrivia(b []byte) int {
+	i := 0
+	for i < len(b) {
+		c := b[i]
+		switch {
+		case isSpace(c):
+			i++
+		case c == '#':
+			for i < len(b) && b[i] != '\n' {
+				i++
+			}
+		case c == '-' && i+1 < len(b) && b[i+1] == '-':
+			i += 2
+			for i < len(b) && b[i] != '\n' {
+				i++
+			}
+		case c == '/' && i+1 < len(b) && b[i+1] == '*':
+			i += 2
+			for i+1 < len(b) && !(b[i] == '*' && b[i+1] == '/') {
+				i++
+			}
+			if i+1 < len(b) {
+				i += 2 // consume the closing */
+			} else {
+				i = len(b)
+			}
+		default:
+			return i
+		}
+	}
+	return i
 }
 
 func lower(c byte) byte {

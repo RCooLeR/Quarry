@@ -3,6 +3,7 @@ package csv
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -27,6 +28,27 @@ func TestExportJSONL(t *testing.T) {
 	}
 	if !strings.Contains(lines[0], `"name":"alice"`) || !strings.Contains(lines[0], `"id":1`) {
 		t.Fatalf("first object wrong: %q", lines[0])
+	}
+}
+
+func TestExportJSONLNonFiniteAndBigInt(t *testing.T) {
+	// NaN/Inf must not abort the export, and an integer past int64 must not be
+	// silently turned into a lossy float — both stay strings.
+	src := writeTemp(t, "in.csv", "a,b,c,d\nNaN,Inf,12345678901234567890,3.5\n")
+	dst := filepath.Join(t.TempDir(), "out.jsonl")
+	_, err := ExportJSONLFile(context.Background(), src, dst, JSONLOptions{Delimiter: ',', HasHeader: true, NumberKeys: true})
+	if err != nil {
+		t.Fatalf("export aborted on NaN/Inf/bigint: %v", err)
+	}
+	got := readAll(t, dst)
+	if !strings.Contains(got, `"a":"NaN"`) || !strings.Contains(got, `"b":"Inf"`) {
+		t.Fatalf("NaN/Inf not kept as strings: %q", got)
+	}
+	if !strings.Contains(got, `"c":"12345678901234567890"`) {
+		t.Fatalf("over-int64 integer not kept as string: %q", got)
+	}
+	if !strings.Contains(got, `"d":3.5`) {
+		t.Fatalf("genuine float not emitted as number: %q", got)
 	}
 }
 
@@ -83,12 +105,48 @@ func TestExportSQLite(t *testing.T) {
 	}
 }
 
-func TestExportSQLiteRefusesExisting(t *testing.T) {
-	src := writeTemp(t, "in.csv", "a\n1\n")
-	dst := writeTemp(t, "exists.db", "x")
-	_, err := ExportSQLiteFile(context.Background(), src, dst, SQLiteOptions{HasHeader: true})
-	if err == nil {
-		t.Fatal("expected refusal to overwrite existing file")
+func TestExportSQLiteOverwritesExisting(t *testing.T) {
+	// The Save dialog already confirms "replace", so an existing destination is
+	// overwritten (via temp + atomic rename), not refused.
+	src := writeTemp(t, "in.csv", "id,name\n1,alice\n")
+	dst := writeTemp(t, "exists.db", "not a database")
+	if _, err := ExportSQLiteFile(context.Background(), src, dst, SQLiteOptions{Delimiter: ',', HasHeader: true, TableName: "t"}); err != nil {
+		t.Fatalf("overwrite failed: %v", err)
+	}
+	db, err := sql.Open("sqlite", dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatalf("query overwritten db: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("row count = %d, want 1", n)
+	}
+}
+
+func TestExportOverwriteAndNoLeftoverTemp(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "in.csv")
+	if err := os.WriteFile(src, []byte("id,name\n1,alice\n2,bob\n"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	dst := filepath.Join(dir, "out.jsonl")
+	// Pre-create the destination; the export must replace it.
+	if err := os.WriteFile(dst, []byte("STALE"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ExportJSONLFile(context.Background(), src, dst, JSONLOptions{Delimiter: ',', HasHeader: true}); err != nil {
+		t.Fatalf("overwrite: %v", err)
+	}
+	got := readAll(t, dst)
+	if strings.Contains(got, "STALE") {
+		t.Fatalf("destination not overwritten: %q", got)
+	}
+	if _, err := os.Stat(tempOutputPath(dst)); err == nil {
+		t.Fatal("temp .quarry-part file was left behind")
 	}
 }
 

@@ -180,6 +180,9 @@ function App() {
           const m = (await FileService.RefreshFile(id)) as FileMetaData;
           setTabs((prev) => prev.map((t) => (t.fileId === id ? { ...t, meta: { ...t.meta, size: m.size } } : t)));
           tabsRef.current = tabsRef.current.map((t) => (t.fileId === id ? { ...t, meta: { ...t.meta, size: m.size } } : t));
+          // The editor is a single shared instance; if the user switched tabs
+          // during the awaits, don't yank the now-active file to this file's end.
+          if (stop || activeIdRef.current !== id) return;
           await editorRef.current?.gotoByte(m.size);
         }
       } catch { /* file may be momentarily locked; retry next tick */ }

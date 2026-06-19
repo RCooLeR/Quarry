@@ -43,6 +43,13 @@ func (s *FileService) withJob(title string, fn func(ctx context.Context, progres
 	ctx, cancel := context.WithCancel(context.Background())
 
 	jm.mu.Lock()
+	if jm.id != "" {
+		// Only one in-flight transform is tracked/cancellable at a time; a second
+		// would overwrite the first's cancel handle and make it uncancellable.
+		jm.mu.Unlock()
+		cancel()
+		return TransformResult{}, fmt.Errorf("another transform is already running (%s)", jm.title)
+	}
 	jm.seq++
 	id := fmt.Sprintf("job%d", jm.seq)
 	jm.id = id

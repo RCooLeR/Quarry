@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 
 	_ "modernc.org/sqlite" // pure-Go SQLite driver (no cgo)
@@ -47,10 +46,11 @@ func ExportSQLiteFile(ctx context.Context, srcPath, dstPath string, opts SQLiteO
 	} else if same {
 		return ExportSummary{}, errors.New("output path must be different from input path")
 	}
-	// SQLite opens/creates the file; require a fresh path so we never clobber.
-	if _, err := os.Stat(dstPath); err == nil {
-		return ExportSummary{}, fmt.Errorf("output file already exists: %s", dstPath)
-	} else if !errors.Is(err, os.ErrNotExist) {
+	// Build the DB at a temp path, then rename over dstPath on success — so an
+	// existing destination is replaced only when the export completes, and a
+	// leftover temp from a prior crash never corrupts a new DB.
+	tmpPath := tempOutputPath(dstPath)
+	if err := os.Remove(tmpPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return ExportSummary{}, err
 	}
 
@@ -63,7 +63,7 @@ func ExportSQLiteFile(ctx context.Context, srcPath, dstPath string, opts SQLiteO
 	cleanup := true
 	defer func() {
 		if cleanup {
-			_ = os.Remove(dstPath)
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -104,7 +104,7 @@ func ExportSQLiteFile(ctx context.Context, srcPath, dstPath string, opts SQLiteO
 		colNames[i] = columnKey(header, i)
 	}
 
-	db, err := sql.Open("sqlite", dstPath)
+	db, err := sql.Open("sqlite", tmpPath)
 	if err != nil {
 		return ExportSummary{}, err
 	}
@@ -205,6 +205,9 @@ func ExportSQLiteFile(ctx context.Context, srcPath, dstPath string, opts SQLiteO
 	if err := db.Close(); err != nil {
 		return sum, err
 	}
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		return sum, err
+	}
 	cleanup = false
 	return sum, nil
 }
@@ -232,20 +235,6 @@ func insertSQL(table string, cols []string) string {
 }
 
 // typedCell binds numeric-looking cells as int64/float64 so SQLite stores them
-// with numeric storage class; everything else stays text.
-func typedCell(s string) any {
-	t := strings.TrimSpace(s)
-	if t == "" {
-		return s
-	}
-	if len(t) > 1 && t[0] == '0' && t[1] != '.' {
-		return s // preserve leading-zero strings (zip codes, ids)
-	}
-	if n, err := strconv.ParseInt(t, 10, 64); err == nil {
-		return n
-	}
-	if f, err := strconv.ParseFloat(t, 64); err == nil {
-		return f
-	}
-	return s
-}
+// with numeric storage class; everything else stays text. See numericCell for
+// the (shared) rules on leading zeros, int64 overflow, and non-finite values.
+func typedCell(s string) any { return numericCell(s) }

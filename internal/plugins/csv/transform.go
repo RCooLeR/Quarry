@@ -5,7 +5,6 @@ import (
 	"context"
 	stdcsv "encoding/csv"
 	"errors"
-	"hash/fnv"
 	"io"
 	"os"
 	"strconv"
@@ -26,8 +25,15 @@ type rowTransform struct {
 	in      *os.File
 	out     *os.File
 	cleanup bool
+	tmpPath string
 	dstPath string
 }
+
+// tempOutputPath is the scratch file a transform/export writes to before it is
+// atomically renamed over the destination on success. Writing to a temp file
+// means the Save dialog's confirmed "replace" overwrites the target only when
+// the new output completed — a failed/cancelled run never destroys it.
+func tempOutputPath(dst string) string { return dst + ".quarry-part" }
 
 func openRowTransform(srcPath, dstPath string, delim rune) (*rowTransform, error) {
 	if delim == 0 {
@@ -42,7 +48,8 @@ func openRowTransform(srcPath, dstPath string, delim rune) (*rowTransform, error
 	if err != nil {
 		return nil, err
 	}
-	out, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	tmpPath := tempOutputPath(dstPath)
+	out, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
 	if err != nil {
 		_ = in.Close()
 		return nil, err
@@ -51,7 +58,7 @@ func openRowTransform(srcPath, dstPath string, delim rune) (*rowTransform, error
 	if err := skipInputBOM(br); err != nil {
 		_ = in.Close()
 		_ = out.Close()
-		_ = os.Remove(dstPath)
+		_ = os.Remove(tmpPath)
 		return nil, err
 	}
 	reader := stdcsv.NewReader(br)
@@ -62,7 +69,7 @@ func openRowTransform(srcPath, dstPath string, delim rune) (*rowTransform, error
 	bw := bufio.NewWriter(out)
 	writer := stdcsv.NewWriter(bw)
 	writer.Comma = delim
-	return &rowTransform{reader: reader, writer: writer, bw: bw, in: in, out: out, cleanup: true, dstPath: dstPath}, nil
+	return &rowTransform{reader: reader, writer: writer, bw: bw, in: in, out: out, cleanup: true, tmpPath: tmpPath, dstPath: dstPath}, nil
 }
 
 func (t *rowTransform) finish() error {
@@ -79,6 +86,9 @@ func (t *rowTransform) finish() error {
 	if err := t.out.Close(); err != nil {
 		return err
 	}
+	if err := os.Rename(t.tmpPath, t.dstPath); err != nil {
+		return err
+	}
 	t.cleanup = false
 	return nil
 }
@@ -87,7 +97,7 @@ func (t *rowTransform) close() {
 	_ = t.in.Close()
 	if t.cleanup {
 		_ = t.out.Close()
-		_ = os.Remove(t.dstPath)
+		_ = os.Remove(t.tmpPath)
 	}
 }
 
@@ -191,6 +201,23 @@ func FilterRowsFile(ctx context.Context, srcPath, dstPath string, opts FilterOpt
 	return sum, nil
 }
 
+// dedupeKey builds a collision-free seen-set key. A leading marker byte
+// distinguishes the three cases so they never alias each other:
+//   - keyColumn present  → 'k' + the cell
+//   - keyColumn missing  (row too short) → 'r' + the full NUL-joined row
+//   - whole-row dedupe   → 'w' + the full NUL-joined row
+// Without this, a short row (no key cell) and a row with an empty key cell would
+// share the same key and collapse together — silent data loss on ragged dumps.
+func dedupeKey(rec []string, keyColumn int) string {
+	if keyColumn >= 0 {
+		if keyColumn < len(rec) {
+			return "k\x00" + rec[keyColumn]
+		}
+		return "r\x00" + strings.Join(rec, "\x00")
+	}
+	return "w\x00" + strings.Join(rec, "\x00")
+}
+
 // DedupeOptions drops duplicate rows, by the whole row or by a key column.
 type DedupeOptions struct {
 	Delimiter rune
@@ -199,8 +226,9 @@ type DedupeOptions struct {
 	Progress  func(records int64)
 }
 
-// DedupeRowsFile keeps the first occurrence of each row/key. Remembers seen keys
-// in memory (a hash set) — memory grows with the number of distinct rows.
+// DedupeRowsFile keeps the first occurrence of each row/key. The seen-set is
+// keyed on the exact key/row bytes (not a lossy hash), so distinct rows are
+// never collapsed by a collision; memory grows with the number of distinct keys.
 func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOptions) (TransformSummary, error) {
 	t, err := openRowTransform(srcPath, dstPath, opts.Delimiter)
 	if err != nil {
@@ -208,7 +236,7 @@ func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOpt
 	}
 	defer t.close()
 	sum := TransformSummary{Delimiter: opts.Delimiter}
-	seen := map[uint64]struct{}{}
+	seen := map[string]struct{}{}
 	first := true
 	for {
 		if err := contextErr(ctx); err != nil {
@@ -232,18 +260,7 @@ func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOpt
 			continue
 		}
 		first = false
-		h := fnv.New64a()
-		if opts.KeyColumn >= 0 {
-			if opts.KeyColumn < len(rec) {
-				_, _ = h.Write([]byte(rec[opts.KeyColumn]))
-			}
-		} else {
-			for _, c := range rec {
-				_, _ = h.Write([]byte(c))
-				_, _ = h.Write([]byte{0})
-			}
-		}
-		k := h.Sum64()
+		k := dedupeKey(rec, opts.KeyColumn)
 		if _, dup := seen[k]; dup {
 			continue
 		}

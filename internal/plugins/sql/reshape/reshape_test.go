@@ -93,6 +93,49 @@ func TestNonInsertCopiedVerbatim(t *testing.T) {
 	}
 }
 
+func TestExplodeAfterLeadingComment(t *testing.T) {
+	// mysqldump prefixes each table's data with a comment block + blank line.
+	in := "--\n-- Dumping data for table `users`\n--\n\nINSERT INTO `users` VALUES (1,'a'),(2,'b'),(3,'c');\n"
+	out, sum := run(t, in, Options{Mode: ModeSingleRow})
+	lines := nonEmptyLines(out)
+	if len(lines) != 3 {
+		t.Fatalf("want 3 single-row inserts, got %d:\n%s", len(lines), out)
+	}
+	if sum.InsertsRewritten != 1 || sum.RowsSeen != 3 {
+		t.Fatalf("comment-prefixed INSERT not reshaped: %+v", sum)
+	}
+	for _, l := range lines {
+		if !strings.HasPrefix(l, "INSERT INTO `users` VALUES (") {
+			t.Fatalf("line not reshaped: %q", l)
+		}
+	}
+}
+
+func TestHashAndBlockCommentBeforeInsert(t *testing.T) {
+	for _, in := range []string{
+		"# a hash comment\nINSERT INTO `t` VALUES (1),(2);\n",
+		"/* block\n comment */ INSERT INTO `t` VALUES (1),(2);\n",
+	} {
+		out, sum := run(t, in, Options{Mode: ModeSingleRow})
+		if sum.InsertsRewritten != 1 || strings.Count(out, "INSERT INTO `t` VALUES (") != 2 {
+			t.Fatalf("comment form not reshaped for %q ->\n%s", in, out)
+		}
+	}
+}
+
+func TestNoMergeAfterVerbatimStatement(t *testing.T) {
+	// A verbatim statement ends in ';' with no newline; the following reshaped
+	// INSERT must still start on its own line.
+	in := "LOCK TABLES `t` WRITE;\nINSERT INTO `t` VALUES (1),(2);\n"
+	out, _ := run(t, in, Options{Mode: ModeSingleRow})
+	if strings.Contains(out, ";INSERT") {
+		t.Fatalf("verbatim statement merged with reshaped INSERT:\n%s", out)
+	}
+	if strings.Count(out, "INSERT INTO `t` VALUES (") != 2 {
+		t.Fatalf("insert not exploded:\n%s", out)
+	}
+}
+
 func TestRejectsSamePath(t *testing.T) {
 	dir := t.TempDir()
 	src := filepath.Join(dir, "x.sql")

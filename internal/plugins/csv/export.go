@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -46,7 +47,8 @@ func ExportJSONLFile(ctx context.Context, srcPath, dstPath string, opts JSONLOpt
 		return ExportSummary{}, err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	tmpPath := tempOutputPath(dstPath)
+	out, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
 	if err != nil {
 		return ExportSummary{}, err
 	}
@@ -54,7 +56,7 @@ func ExportJSONLFile(ctx context.Context, srcPath, dstPath string, opts JSONLOpt
 	defer func() {
 		if cleanup {
 			_ = out.Close()
-			_ = os.Remove(dstPath)
+			_ = os.Remove(tmpPath)
 		}
 	}()
 
@@ -117,6 +119,9 @@ func ExportJSONLFile(ctx context.Context, srcPath, dstPath string, opts JSONLOpt
 	if err := out.Close(); err != nil {
 		return sum, err
 	}
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		return sum, err
+	}
 	cleanup = false
 	return sum, nil
 }
@@ -128,24 +133,36 @@ func columnKey(header []string, i int) string {
 	return fmt.Sprintf("col%d", i+1)
 }
 
-// maybeNumber returns a float64/int for numeric-looking cells, else the string.
-func maybeNumber(s string) any {
+// numericCell returns an int64/float64 for numeric-looking cells, else the
+// original string. Shared by JSONL/SQLite/xlsx typed export so they agree.
+//
+//   - leading-zero integers (zip codes, IDs) stay TEXT
+//   - integers that overflow int64 stay TEXT rather than becoming a lossy float
+//   - a float is only attempted when the token actually looks fractional
+//     ('.', 'e', 'E'); this also keeps "NaN"/"Inf"/"Infinity" as TEXT
+//   - non-finite results (e.g. "1e999" → +Inf) stay TEXT so encoders that can't
+//     represent them (encoding/json) never see them
+func numericCell(s string) any {
 	t := strings.TrimSpace(s)
 	if t == "" {
 		return s
 	}
-	// Reject leading-zero integers (e.g. zip codes) so they aren't mangled.
 	if len(t) > 1 && t[0] == '0' && t[1] != '.' {
 		return s
 	}
 	if n, err := strconv.ParseInt(t, 10, 64); err == nil {
 		return n
 	}
-	if f, err := strconv.ParseFloat(t, 64); err == nil {
-		return f
+	if strings.ContainsAny(t, ".eE") {
+		if f, err := strconv.ParseFloat(t, 64); err == nil && !math.IsInf(f, 0) && !math.IsNaN(f) {
+			return f
+		}
 	}
 	return s
 }
+
+// maybeNumber is the JSONL spelling of numericCell.
+func maybeNumber(s string) any { return numericCell(s) }
 
 // MarkdownPreview renders a small set of rows as a GitHub-flavored Markdown
 // table. Used for "copy as Markdown" of the current preview (bounded).

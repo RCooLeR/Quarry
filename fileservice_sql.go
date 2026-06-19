@@ -611,14 +611,28 @@ func (s *FileService) parsedSchema(fileID string) (*session.File, []sqlschemadif
 	if err != nil {
 		return nil, nil, err
 	}
+	// A CREATE TABLE statement is small; bound the read so a table whose data
+	// region wasn't delimited (no detected INSERT) can't force a multi-GB read
+	// that ReadRange rejects and aborts the whole diff.
+	const ddlMaxBytes = 8 << 20
 	tables := make([]sqlschemadiff.Table, 0, len(ranges))
 	for _, r := range ranges {
+		// No CREATE TABLE → schema is unknown; emit an empty-column table rather
+		// than parsing INSERT data rows as if they were column definitions.
+		if r.CreateOffset < 0 {
+			tables = append(tables, sqlschemadiff.Table{Name: r.Name})
+			continue
+		}
 		reg := schemaRegion(r)
 		if reg[1] <= reg[0] {
 			tables = append(tables, sqlschemadiff.Table{Name: r.Name})
 			continue
 		}
-		ddl, rerr := f.Doc.ReadRange(reg[0], reg[1])
+		end := reg[1]
+		if end-reg[0] > ddlMaxBytes {
+			end = reg[0] + ddlMaxBytes
+		}
+		ddl, rerr := f.Doc.ReadRange(reg[0], end)
 		if rerr != nil {
 			return nil, nil, rerr
 		}

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/xuri/excelize/v2"
@@ -51,11 +50,11 @@ func ExportXLSXFile(ctx context.Context, srcPath, dstPath string, opts XLSXOptio
 	} else if same {
 		return XLSXSummary{}, errors.New("output path must be different from input path")
 	}
-	if _, err := os.Stat(dstPath); err == nil {
-		return XLSXSummary{}, errors.New("output file already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return XLSXSummary{}, err
-	}
+	// Write to a temp path and rename over dstPath on success, so the Save
+	// dialog's confirmed overwrite replaces the target only on completion. The
+	// temp path keeps an .xlsx extension because excelize picks the workbook
+	// format from the file name.
+	tmpPath := dstPath + ".quarry-part.xlsx"
 
 	in, err := os.Open(srcPath)
 	if err != nil {
@@ -124,25 +123,14 @@ func ExportXLSXFile(ctx context.Context, srcPath, dstPath string, opts XLSXOptio
 	if err := sw.Flush(); err != nil {
 		return sum, err
 	}
-	if err := fx.SaveAs(dstPath); err != nil {
+	if err := fx.SaveAs(tmpPath); err != nil {
+		return sum, err
+	}
+	if err := os.Rename(tmpPath, dstPath); err != nil {
+		_ = os.Remove(tmpPath)
 		return sum, err
 	}
 	return sum, nil
 }
 
-func typedCellXLSX(s string) any {
-	t := strings.TrimSpace(s)
-	if t == "" {
-		return s
-	}
-	if len(t) > 1 && t[0] == '0' && t[1] != '.' {
-		return s
-	}
-	if n, err := strconv.ParseInt(t, 10, 64); err == nil {
-		return n
-	}
-	if f, err := strconv.ParseFloat(t, 64); err == nil {
-		return f
-	}
-	return s
-}
+func typedCellXLSX(s string) any { return numericCell(s) }
