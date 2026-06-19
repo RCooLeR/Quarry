@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Events } from "@wailsio/runtime";
 import { FileService } from "../bindings/github.com/quarry/quarry-wails3";
 import { QuarryEditor } from "./editor/QuarryEditor";
 import type { FileMetaData, StagingStateData, WindowStatus } from "./editor/QuarryEditor";
@@ -86,6 +87,7 @@ function App() {
   const [paletteOpen, setPaletteOpen] = useState(false);
   const [analyses, setAnalyses] = useState<Record<string, SqlSummaryResult>>({});
   const [xrayOn, setXrayOn] = useState(true);
+  const [theme, setTheme] = useState<string>(() => localStorage.getItem("quarry.theme") || "dark");
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -94,12 +96,13 @@ function App() {
 
   useEffect(() => {
     if (!hostRef.current) return;
+    const initialTheme = localStorage.getItem("quarry.theme") || "dark";
     const ed = new QuarryEditor(hostRef.current, {
       onStatus: setStatus,
       onDirty: setDirty,
       onStaging: (s) => setStaging(s),
       onMode: (on) => setEditMode(on),
-    });
+    }, initialTheme);
     editorRef.current = ed;
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
@@ -138,6 +141,41 @@ function App() {
       editorRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Apply the theme to the document root + editor whenever it changes.
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    localStorage.setItem("quarry.theme", theme);
+    editorRef.current?.setTheme(theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme((t) => (t === "light" ? "dark" : "light"));
+
+  // Open a file by path (used by drag-drop and session restore).
+  const openFilePath = async (p: string) => {
+    if (!p.trim()) return;
+    setError("");
+    setBusy(true);
+    try {
+      const meta = (await FileService.OpenFile(p)) as FileMetaData;
+      await showMeta(meta);
+    } catch (e: any) {
+      setError(String(e?.message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const openFileRef = useRef(openFilePath);
+  openFileRef.current = openFilePath;
+
+  // Native file drops (Wails) → open each dropped path.
+  useEffect(() => {
+    const off = Events.On("quarry:files-dropped", (e: any) => {
+      const files = (e?.data ?? []) as string[];
+      void (async () => { for (const f of files) await openFileRef.current(f); })();
+    });
+    return () => { try { off(); } catch { /* ignore */ } };
   }, []);
 
   const refreshStaging = async (fileId: string) => {
@@ -326,11 +364,16 @@ function App() {
     const v = gotoValue.trim();
     const id = activeIdRef.current;
     if (!v || !id) return;
+    const tab = tabsRef.current.find((t) => t.fileId === id);
     let offset: number | null = null;
-    if (/^0x[0-9a-f]+$/i.test(v)) offset = parseInt(v.slice(2), 16);
+    const pct = v.match(/^(\d{1,3}(?:\.\d+)?)\s*%$/);
+    if (pct && tab) {
+      const p = Math.max(0, Math.min(100, parseFloat(pct[1])));
+      offset = Math.floor((tab.meta.size * p) / 100);
+    } else if (/^0x[0-9a-f]+$/i.test(v)) offset = parseInt(v.slice(2), 16);
     else if (/^\d+$/.test(v)) offset = await FileService.ResolveLine(id, parseInt(v, 10));
     if (offset == null || Number.isNaN(offset)) {
-      setSearchInfo("Enter a line number or 0xHEX offset");
+      setSearchInfo("Enter a line number, 0xHEX offset, or NN%");
       return;
     }
     lastMatch.current = null;
@@ -466,6 +509,7 @@ function App() {
         { label: "Sidebar", shortcut: "Ctrl+B", checked: !sidebarCollapsed, onClick: () => setSidebarCollapsed((v) => !v) },
         { label: "File map (X-ray)", checked: xrayOn, onClick: () => setXrayOn((v) => !v) },
         { label: "Command palette…", shortcut: "Ctrl+P", onClick: () => setPaletteOpen(true) },
+        { label: "Light theme", checked: theme === "light", onClick: toggleTheme },
         { separator: true },
         { label: "Plain text", checked: !hexView && !gridView, disabled: !hasFiles, onClick: showText },
         { label: "Hex view", checked: hexView, disabled: !hasFiles, onClick: () => { setGridView(false); setHexView((v) => !v); } },
@@ -493,6 +537,7 @@ function App() {
     { id: "goto", group: "Edit", label: "Go to line / offset…", hint: "Ctrl+G", run: openGoto },
     { id: "edit", group: "Edit", label: editMode ? "Turn editing off" : "Turn editing on", run: () => void toggleEdit() },
     { id: "sidebar", group: "View", label: "Toggle sidebar", hint: "Ctrl+B", run: () => setSidebarCollapsed((v) => !v) },
+    { id: "theme", group: "View", label: theme === "light" ? "Switch to dark theme" : "Switch to light theme", run: toggleTheme },
     { id: "text", group: "View", label: "Plain text view", run: showText },
     { id: "hex", group: "View", label: "Toggle hex view", run: () => { setGridView(false); setHexView((v) => !v); } },
     { id: "grid", group: "View", label: "Toggle grid view", run: () => { setHexView(false); setGridView((v) => !v); } },
@@ -524,7 +569,7 @@ function App() {
   }
 
   return (
-    <div className="q-app">
+    <div className="q-app" data-file-drop-target>
       <header className="q-top">
         <div className="q-brand">
           <img className="q-brand-mark" src="/logos/symbol.png" alt="Quarry" />
@@ -655,7 +700,7 @@ function App() {
             <input
               className="q-find-input"
               autoFocus
-              placeholder="Go to line, or 0xHEX byte offset"
+              placeholder="Go to line, 0xHEX byte offset, or NN%"
               value={gotoValue}
               spellCheck={false}
               onChange={(e) => setGotoValue(e.target.value)}

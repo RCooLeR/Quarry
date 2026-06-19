@@ -139,11 +139,34 @@ const quarryTheme = EditorView.theme(
   { dark: true },
 );
 
+const quarryThemeLight = EditorView.theme(
+  {
+    "&": { height: "100%", fontSize: "13px", color: "#1d2530", backgroundColor: "#fbfcfe" },
+    ".cm-scroller": { fontFamily: "'JetBrains Mono','Cascadia Code',Consolas,monospace", lineHeight: "1.5" },
+    ".cm-gutters": { backgroundColor: "#f0f3f7", color: "#8893a5", border: "none" },
+    ".cm-byteGutter": { padding: "0 10px", color: "#2f6fd0", fontVariantNumeric: "tabular-nums" },
+    ".cm-lineNumbers .cm-gutterElement": { padding: "0 8px", minWidth: "3ch" },
+    ".cm-activeLineGutter": { backgroundColor: "#e6ebf2" },
+    ".cm-search-match": {
+      backgroundColor: "rgba(43,182,196,0.28)",
+      outline: "1px solid rgba(31,153,166,0.8)",
+      borderRadius: "2px",
+    },
+    "&.cm-editing .cm-content": { caretColor: "#1f99a6" },
+  },
+  { dark: false },
+);
+
+export function editorThemeFor(theme: string) {
+  return theme === "light" ? quarryThemeLight : quarryTheme;
+}
+
 export class QuarryEditor {
   private view: EditorView;
   private cb: EditorCallbacks;
   private editableC = new Compartment();
   private langC = new Compartment();
+  private themeC = new Compartment();
 
   private fileId = "";
   private startByte = 0;
@@ -165,7 +188,7 @@ export class QuarryEditor {
   private editWinOrigLen = 0;
   private flushTimer: number | null = null;
 
-  constructor(parent: HTMLElement, cb: EditorCallbacks) {
+  constructor(parent: HTMLElement, cb: EditorCallbacks, theme: string = "dark") {
     this.cb = cb;
     const ref = this.ref;
     const self = this;
@@ -218,7 +241,7 @@ export class QuarryEditor {
         this.editableC.of([EditorState.readOnly.of(true), EditorView.editable.of(false)]),
         this.langC.of([]),
         edgeWatcher,
-        quarryTheme,
+        this.themeC.of(editorThemeFor(theme)),
       ],
     });
 
@@ -380,6 +403,11 @@ export class QuarryEditor {
   /** Swap the syntax-highlighting extension to match the file type. */
   private setLanguage(detected: string, path: string): void {
     this.view.dispatch({ effects: this.langC.reconfigure(highlightFor(detected, path)) });
+  }
+
+  /** Swap the editor color theme ("dark" | "light"). */
+  setTheme(theme: string): void {
+    this.view.dispatch({ effects: this.themeC.reconfigure(editorThemeFor(theme)) });
   }
 
   destroy(): void {

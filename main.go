@@ -5,6 +5,7 @@ import (
 	"log"
 
 	"github.com/wailsapp/wails/v3/pkg/application"
+	"github.com/wailsapp/wails/v3/pkg/events"
 )
 
 // Wails embeds the built frontend (frontend/dist) into the binary.
@@ -50,16 +51,25 @@ func main() {
 		DarkModeInactive: &application.WindowTheme{TitleBarColour: titleBar, TitleTextColour: titleTextDim, BorderColour: titleBar},
 	}
 
-	app.Window.NewWithOptions(application.WebviewWindowOptions{
+	win := app.Window.NewWithOptions(application.WebviewWindowOptions{
 		Title:            "Quarry",
 		Width:            1280,
 		Height:           820,
 		BackgroundColour: application.NewRGB(18, 22, 28),
 		URL:              "/",
+		EnableFileDrop:   true, // drop files onto [data-file-drop-target] to open
 		Windows: application.WindowsWindow{
 			Theme:       application.Dark,
 			CustomTheme: darkTitleBar,
 		},
+	})
+
+	// Bridge native file drops to the frontend: it opens each dropped path.
+	win.OnWindowEvent(events.Common.WindowFilesDropped, func(e *application.WindowEvent) {
+		files := e.Context().DroppedFiles()
+		if len(files) > 0 {
+			win.EmitEvent("quarry:files-dropped", files)
+		}
 	})
 
 	if err := app.Run(); err != nil {
