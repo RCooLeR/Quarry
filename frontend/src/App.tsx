@@ -97,6 +97,7 @@ function App() {
   });
   const [bookmarksOpen, setBookmarksOpen] = useState(false);
   const [following, setFollowing] = useState(false);
+  const [job, setJob] = useState<{ id: string; title: string; records: number; note: string } | null>(null);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -215,6 +216,23 @@ function App() {
       void (async () => { for (const f of files) await openFileRef.current(f); })();
     });
     return () => { try { off(); } catch { /* ignore */ } };
+  }, []);
+
+  // Long-transform job lifecycle (progress toast + cancel).
+  useEffect(() => {
+    const offStart = Events.On("quarry:job-start", (e: any) => {
+      const d = e?.data ?? {};
+      setJob({ id: d.id, title: d.title || "Working", records: 0, note: "" });
+    });
+    const offProg = Events.On("quarry:job-progress", (e: any) => {
+      const d = e?.data ?? {};
+      setJob((j) => (j && j.id === d.id ? { ...j, records: d.records ?? j.records, note: d.note ?? j.note } : j));
+    });
+    const offEnd = Events.On("quarry:job-end", (e: any) => {
+      const d = e?.data ?? {};
+      setJob((j) => (j && j.id === d.id ? null : j));
+    });
+    return () => { try { offStart(); offProg(); offEnd(); } catch { /* ignore */ } };
   }, []);
 
   const pushRecent = (p: string) => {
@@ -719,6 +737,16 @@ function App() {
 
       {error && <div className="q-error">{error}</div>}
       {notice && <div className="q-notice">{notice}</div>}
+
+      {job && (
+        <div className="q-job">
+          <span className="q-job-spin" />
+          <span className="q-job-title">{job.title}…</span>
+          {job.records > 0 && <span className="q-job-count">{job.records.toLocaleString()} {job.note || "rows"}</span>}
+          <span className="q-spacer" />
+          <button className="q-btn" onClick={() => void FileService.CancelJob()}>Cancel</button>
+        </div>
+      )}
 
       <div className="q-body">
         {hasFiles && (

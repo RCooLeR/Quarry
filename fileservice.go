@@ -52,6 +52,9 @@ type FileService struct {
 
 	sqlMu      sync.Mutex
 	sqlSummary map[string]sqlanalyze.Summary // cached SQL dump analysis per file id
+
+	jobOnce sync.Once
+	jobMgr  *jobManager
 }
 
 // NewFileService constructs the service with an empty session registry.

@@ -22,6 +22,7 @@ type SQLiteOptions struct {
 	TableName  string
 	BatchSize  int
 	TypedCells bool // bind numeric cells as INTEGER/REAL (else everything TEXT)
+	Progress   func(records int64)
 }
 
 // ExportSQLiteFile streams a CSV into a new SQLite database file with one table.
@@ -169,6 +170,7 @@ func ExportSQLiteFile(ctx context.Context, srcPath, dstPath string, opts SQLiteO
 			return fail(err)
 		}
 		sum.RecordsRead++
+		reportEvery(opts.Progress, sum.RecordsRead, 50000)
 		if err := insert(rec); err != nil {
 			return fail(err)
 		}

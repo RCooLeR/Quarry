@@ -99,6 +99,14 @@ type FilterOptions struct {
 	Op        string // eq | ne | contains | gt | lt | empty | nonempty
 	Value     string
 	Negate    bool
+	Progress  func(records int64)
+}
+
+// reportEvery throttles a progress callback to multiples of n records.
+func reportEvery(p func(records int64), records, n int64) {
+	if p != nil && records%n == 0 {
+		p(records)
+	}
 }
 
 func rowMatches(cell, op, value string) bool {
@@ -152,6 +160,7 @@ func FilterRowsFile(ctx context.Context, srcPath, dstPath string, opts FilterOpt
 			return sum, err
 		}
 		sum.RecordsRead++
+		reportEvery(opts.Progress, sum.RecordsRead, 50000)
 		if first && opts.HasHeader {
 			first = false
 			if err := t.writer.Write(rec); err != nil {
@@ -187,6 +196,7 @@ type DedupeOptions struct {
 	Delimiter rune
 	HasHeader bool
 	KeyColumn int // <0 = dedupe by whole row
+	Progress  func(records int64)
 }
 
 // DedupeRowsFile keeps the first occurrence of each row/key. Remembers seen keys
@@ -212,6 +222,7 @@ func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOpt
 			return sum, err
 		}
 		sum.RecordsRead++
+		reportEvery(opts.Progress, sum.RecordsRead, 50000)
 		if first && opts.HasHeader {
 			first = false
 			if err := t.writer.Write(rec); err != nil {
@@ -253,6 +264,7 @@ type SampleOptions struct {
 	Delimiter rune
 	HasHeader bool
 	EveryN    int
+	Progress  func(records int64)
 }
 
 // SampleRowsFile keeps every Nth data row (header preserved).
@@ -280,6 +292,7 @@ func SampleRowsFile(ctx context.Context, srcPath, dstPath string, opts SampleOpt
 			return sum, err
 		}
 		sum.RecordsRead++
+		reportEvery(opts.Progress, sum.RecordsRead, 50000)
 		if first && opts.HasHeader {
 			first = false
 			if err := t.writer.Write(rec); err != nil {

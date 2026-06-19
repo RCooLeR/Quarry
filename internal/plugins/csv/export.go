@@ -18,6 +18,7 @@ type JSONLOptions struct {
 	Delimiter  rune
 	HasHeader  bool
 	NumberKeys bool // emit numeric-looking cells as JSON numbers, not strings
+	Progress   func(records int64)
 }
 
 // ExportSummary reports a tabular export result.
@@ -86,6 +87,7 @@ func ExportJSONLFile(ctx context.Context, srcPath, dstPath string, opts JSONLOpt
 			return sum, err
 		}
 		sum.RecordsRead++
+		reportEvery(opts.Progress, sum.RecordsRead, 50000)
 		if first && opts.HasHeader {
 			first = false
 			header = append([]string(nil), rec...)

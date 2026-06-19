@@ -22,6 +22,7 @@ type XLSXOptions struct {
 	HasHeader  bool
 	SheetName  string
 	TypedCells bool // write numeric cells as numbers, not text
+	Progress   func(records int64)
 }
 
 // XLSXSummary reports an .xlsx export, including whether the row cap truncated.
@@ -97,6 +98,7 @@ func ExportXLSXFile(ctx context.Context, srcPath, dstPath string, opts XLSXOptio
 			return sum, err
 		}
 		sum.RecordsRead++
+		reportEvery(opts.Progress, sum.RecordsRead, 50000)
 		if rowNum > xlsxMaxRows {
 			sum.Truncated = true
 			break

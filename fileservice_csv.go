@@ -481,21 +481,24 @@ func (s *FileService) CsvRedactViaDialog(fileID, delimiter string, hasHeader boo
 	if err != nil || strings.TrimSpace(dst) == "" {
 		return TransformResult{}, err
 	}
-	sum, err := csv.RedactColumnsFile(context.Background(), f.Path, dst, csv.RedactOptions{
-		Delimiter:   delimiterRune(delimiter),
-		HasHeader:   hasHeader,
-		Columns:     cols,
-		Replacement: replacement,
+	return s.withJob("Redact CSV", func(ctx context.Context, progress func(int64, string)) (TransformResult, error) {
+		sum, err := csv.RedactColumnsFile(ctx, f.Path, dst, csv.RedactOptions{
+			Delimiter:   delimiterRune(delimiter),
+			HasHeader:   hasHeader,
+			Columns:     cols,
+			Replacement: replacement,
+			Progress:    func(r int64, _ int64) { progress(r, "rows read") },
+		})
+		if err != nil {
+			return TransformResult{}, err
+		}
+		return TransformResult{
+			OutputPath:     dst,
+			RecordsRead:    sum.RecordsRead,
+			RecordsWritten: sum.RecordsWritten,
+			Note:           fmt.Sprintf("%d cells masked across %d columns", sum.CellsMasked, len(cols)),
+		}, nil
 	})
-	if err != nil {
-		return TransformResult{}, err
-	}
-	return TransformResult{
-		OutputPath:     dst,
-		RecordsRead:    sum.RecordsRead,
-		RecordsWritten: sum.RecordsWritten,
-		Note:           fmt.Sprintf("%d cells masked across %d columns", sum.CellsMasked, len(cols)),
-	}, nil
 }
 
 // CsvFilterViaDialog writes a new CSV keeping only rows where the chosen column
@@ -509,23 +512,26 @@ func (s *FileService) CsvFilterViaDialog(fileID, delimiter string, hasHeader boo
 	if err != nil || strings.TrimSpace(dst) == "" {
 		return TransformResult{}, err
 	}
-	sum, err := csv.FilterRowsFile(context.Background(), f.Path, dst, csv.FilterOptions{
-		Delimiter: delimiterRune(delimiter),
-		HasHeader: hasHeader,
-		Column:    column,
-		Op:        strings.TrimSpace(op),
-		Value:     value,
-		Negate:    negate,
+	return s.withJob("Filter CSV", func(ctx context.Context, progress func(int64, string)) (TransformResult, error) {
+		sum, err := csv.FilterRowsFile(ctx, f.Path, dst, csv.FilterOptions{
+			Delimiter: delimiterRune(delimiter),
+			HasHeader: hasHeader,
+			Column:    column,
+			Op:        strings.TrimSpace(op),
+			Value:     value,
+			Negate:    negate,
+			Progress:  func(r int64) { progress(r, "rows read") },
+		})
+		if err != nil {
+			return TransformResult{}, err
+		}
+		return TransformResult{
+			OutputPath:     dst,
+			RecordsRead:    sum.RecordsRead,
+			RecordsWritten: sum.RecordsWritten,
+			Note:           "rows matching filter kept",
+		}, nil
 	})
-	if err != nil {
-		return TransformResult{}, err
-	}
-	return TransformResult{
-		OutputPath:     dst,
-		RecordsRead:    sum.RecordsRead,
-		RecordsWritten: sum.RecordsWritten,
-		Note:           "rows matching filter kept",
-	}, nil
 }
 
 // CsvDedupeViaDialog writes a new CSV dropping duplicate rows — by a key column
@@ -539,21 +545,24 @@ func (s *FileService) CsvDedupeViaDialog(fileID, delimiter string, hasHeader boo
 	if err != nil || strings.TrimSpace(dst) == "" {
 		return TransformResult{}, err
 	}
-	sum, err := csv.DedupeRowsFile(context.Background(), f.Path, dst, csv.DedupeOptions{
-		Delimiter: delimiterRune(delimiter),
-		HasHeader: hasHeader,
-		KeyColumn: keyColumn,
+	return s.withJob("Deduplicate CSV", func(ctx context.Context, progress func(int64, string)) (TransformResult, error) {
+		sum, err := csv.DedupeRowsFile(ctx, f.Path, dst, csv.DedupeOptions{
+			Delimiter: delimiterRune(delimiter),
+			HasHeader: hasHeader,
+			KeyColumn: keyColumn,
+			Progress:  func(r int64) { progress(r, "rows read") },
+		})
+		if err != nil {
+			return TransformResult{}, err
+		}
+		dropped := sum.RecordsRead - sum.RecordsWritten
+		return TransformResult{
+			OutputPath:     dst,
+			RecordsRead:    sum.RecordsRead,
+			RecordsWritten: sum.RecordsWritten,
+			Note:           fmt.Sprintf("%d duplicate rows removed", dropped),
+		}, nil
 	})
-	if err != nil {
-		return TransformResult{}, err
-	}
-	dropped := sum.RecordsRead - sum.RecordsWritten
-	return TransformResult{
-		OutputPath:     dst,
-		RecordsRead:    sum.RecordsRead,
-		RecordsWritten: sum.RecordsWritten,
-		Note:           fmt.Sprintf("%d duplicate rows removed", dropped),
-	}, nil
 }
 
 // CsvSampleViaDialog writes a new CSV keeping every Nth data row (header kept),
@@ -570,20 +579,23 @@ func (s *FileService) CsvSampleViaDialog(fileID, delimiter string, hasHeader boo
 	if err != nil || strings.TrimSpace(dst) == "" {
 		return TransformResult{}, err
 	}
-	sum, err := csv.SampleRowsFile(context.Background(), f.Path, dst, csv.SampleOptions{
-		Delimiter: delimiterRune(delimiter),
-		HasHeader: hasHeader,
-		EveryN:    everyN,
+	return s.withJob("Sample CSV", func(ctx context.Context, progress func(int64, string)) (TransformResult, error) {
+		sum, err := csv.SampleRowsFile(ctx, f.Path, dst, csv.SampleOptions{
+			Delimiter: delimiterRune(delimiter),
+			HasHeader: hasHeader,
+			EveryN:    everyN,
+			Progress:  func(r int64) { progress(r, "rows read") },
+		})
+		if err != nil {
+			return TransformResult{}, err
+		}
+		return TransformResult{
+			OutputPath:     dst,
+			RecordsRead:    sum.RecordsRead,
+			RecordsWritten: sum.RecordsWritten,
+			Note:           fmt.Sprintf("kept every %dth row", everyN),
+		}, nil
 	})
-	if err != nil {
-		return TransformResult{}, err
-	}
-	return TransformResult{
-		OutputPath:     dst,
-		RecordsRead:    sum.RecordsRead,
-		RecordsWritten: sum.RecordsWritten,
-		Note:           fmt.Sprintf("kept every %dth row", everyN),
-	}, nil
 }
 
 // CsvExportJSONLViaDialog streams the CSV to newline-delimited JSON.
@@ -596,15 +608,18 @@ func (s *FileService) CsvExportJSONLViaDialog(fileID, delimiter string, hasHeade
 	if err != nil || strings.TrimSpace(dst) == "" {
 		return TransformResult{}, err
 	}
-	sum, err := csv.ExportJSONLFile(context.Background(), f.Path, dst, csv.JSONLOptions{
-		Delimiter:  delimiterRune(delimiter),
-		HasHeader:  hasHeader,
-		NumberKeys: numberKeys,
+	return s.withJob("Export JSONL", func(ctx context.Context, progress func(int64, string)) (TransformResult, error) {
+		sum, err := csv.ExportJSONLFile(ctx, f.Path, dst, csv.JSONLOptions{
+			Delimiter:  delimiterRune(delimiter),
+			HasHeader:  hasHeader,
+			NumberKeys: numberKeys,
+			Progress:   func(r int64) { progress(r, "rows read") },
+		})
+		if err != nil {
+			return TransformResult{}, err
+		}
+		return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: "JSON Lines"}, nil
 	})
-	if err != nil {
-		return TransformResult{}, err
-	}
-	return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: "JSON Lines"}, nil
 }
 
 // CsvExportSQLiteViaDialog streams the CSV into a new SQLite .db file.
@@ -617,16 +632,19 @@ func (s *FileService) CsvExportSQLiteViaDialog(fileID, delimiter string, hasHead
 	if err != nil || strings.TrimSpace(dst) == "" {
 		return TransformResult{}, err
 	}
-	sum, err := csv.ExportSQLiteFile(context.Background(), f.Path, dst, csv.SQLiteOptions{
-		Delimiter:  delimiterRune(delimiter),
-		HasHeader:  hasHeader,
-		TableName:  sqlTableName(tableName),
-		TypedCells: typedCells,
+	return s.withJob("Export SQLite", func(ctx context.Context, progress func(int64, string)) (TransformResult, error) {
+		sum, err := csv.ExportSQLiteFile(ctx, f.Path, dst, csv.SQLiteOptions{
+			Delimiter:  delimiterRune(delimiter),
+			HasHeader:  hasHeader,
+			TableName:  sqlTableName(tableName),
+			TypedCells: typedCells,
+			Progress:   func(r int64) { progress(r, "rows inserted") },
+		})
+		if err != nil {
+			return TransformResult{}, err
+		}
+		return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: fmt.Sprintf("table %q", sqlTableName(tableName))}, nil
 	})
-	if err != nil {
-		return TransformResult{}, err
-	}
-	return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: fmt.Sprintf("table %q", sqlTableName(tableName))}, nil
 }
 
 // CsvExportXLSXViaDialog streams the CSV into a new .xlsx workbook.
@@ -639,20 +657,23 @@ func (s *FileService) CsvExportXLSXViaDialog(fileID, delimiter string, hasHeader
 	if err != nil || strings.TrimSpace(dst) == "" {
 		return TransformResult{}, err
 	}
-	sum, err := csv.ExportXLSXFile(context.Background(), f.Path, dst, csv.XLSXOptions{
-		Delimiter:  delimiterRune(delimiter),
-		HasHeader:  hasHeader,
-		SheetName:  strings.TrimSpace(sheetName),
-		TypedCells: typedCells,
+	return s.withJob("Export Excel", func(ctx context.Context, progress func(int64, string)) (TransformResult, error) {
+		sum, err := csv.ExportXLSXFile(ctx, f.Path, dst, csv.XLSXOptions{
+			Delimiter:  delimiterRune(delimiter),
+			HasHeader:  hasHeader,
+			SheetName:  strings.TrimSpace(sheetName),
+			TypedCells: typedCells,
+			Progress:   func(r int64) { progress(r, "rows written") },
+		})
+		if err != nil {
+			return TransformResult{}, err
+		}
+		note := "Excel workbook"
+		if sum.Truncated {
+			note = fmt.Sprintf("Excel workbook (truncated at %d rows — sheet limit)", sum.RecordsWritten)
+		}
+		return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: note}, nil
 	})
-	if err != nil {
-		return TransformResult{}, err
-	}
-	note := "Excel workbook"
-	if sum.Truncated {
-		note = fmt.Sprintf("Excel workbook (truncated at %d rows — sheet limit)", sum.RecordsWritten)
-	}
-	return TransformResult{OutputPath: dst, RecordsRead: sum.RecordsRead, RecordsWritten: sum.RecordsWritten, Note: note}, nil
 }
 
 // CsvMarkdownPreview returns the current preview as a Markdown table (for copy).

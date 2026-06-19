@@ -800,6 +800,35 @@ body {
   border-bottom: 1px solid #1c3a40;
 }
 
+.q-job {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 12px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text);
+}
+.q-job-title {
+  font-weight: 600;
+}
+.q-job-count {
+  font-family: var(--mono);
+  color: var(--muted);
+}
+.q-job-spin {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: q-spin 0.7s linear infinite;
+}
+@keyframes q-spin {
+  to { transform: rotate(360deg); }
+}
+
 .q-edit-flag {
   color: var(--accent-hover);
   font-weight: 600;
