@@ -100,3 +100,10 @@ A tool is usually four small steps:
 - **SQL analysis caches** a `Summary` per file id on the `FileService`; tools
   that need offsets (extract, split, fixture, schema diff) require the dump to be
   analyzed first.
+- **Always build the GUI exe with `task build` / `wails3 build`**, not a bare
+  `go build`. The production task links with `-ldflags="-H windowsgui"`, which
+  sets the Windows GUI subsystem; a plain `go build` produces a *console*
+  subsystem binary that pops an extra terminal window next to the app. (`task
+  build` regenerates `wails_windows_amd64.syso` for the icon and deletes it
+  afterward; the committed copy is what lets a bare `go build` still embed the
+  icon — don't commit its deletion.)
