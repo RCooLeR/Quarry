@@ -270,6 +270,38 @@ func dirDialog(message string) (string, error) {
 	return d.PromptForSingleSelection()
 }
 
+// CsvProfileResult is a per-column data profile over a bounded sample.
+type CsvProfileResult struct {
+	Columns        []csv.ColumnProfile `json:"columns"`
+	RecordsScanned int                 `json:"recordsScanned"`
+	RaggedRows     int                 `json:"raggedRows"`
+	Truncated      bool                `json:"truncated"`
+}
+
+// CsvProfile profiles each column (null %, distinct, min/max, top values) and
+// counts ragged rows over a bounded sample.
+func (s *FileService) CsvProfile(fileID, delimiter string, hasHeader bool) (CsvProfileResult, error) {
+	r, _, err := s.csvSampleReader(fileID)
+	if err != nil {
+		return CsvProfileResult{}, err
+	}
+	rep, err := csv.ProfileColumns(context.Background(), r, csv.SchemaOptions{
+		Delimiter:  delimiterRune(delimiter),
+		HasHeader:  hasHeader,
+		MaxBytes:   csvSampleBytes,
+		NullValues: []string{"", "NULL", "null", "\\N"},
+	})
+	if err != nil {
+		return CsvProfileResult{}, err
+	}
+	return CsvProfileResult{
+		Columns:        rep.Columns,
+		RecordsScanned: rep.RecordsScanned,
+		RaggedRows:     rep.RaggedRows,
+		Truncated:      rep.TruncatedSample,
+	}, nil
+}
+
 // CsvProjectViaDialog writes a new CSV keeping only keepIndices (0-based) in the
 // given order — used for drop-column and reorder.
 func (s *FileService) CsvProjectViaDialog(fileID string, delimiter string, keepIndices []int) (TransformResult, error) {

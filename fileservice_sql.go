@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/quarry/quarry-wails3/internal/document"
@@ -108,6 +109,78 @@ func (s *FileService) SqlExtractTableViaDialog(fileID string, tableName string) 
 		RecordsWritten: 1,
 		Note:           fmt.Sprintf("%s — %s", tableName, fmtByteCount(sum.BytesWritten)),
 	}, nil
+}
+
+// SqlLintFinding is one issue found in a dump.
+type SqlLintFinding struct {
+	Severity string `json:"severity"` // info | warn
+	Title    string `json:"title"`
+	Detail   string `json:"detail"`
+}
+
+// SqlLintResult is the dump-linter output (derived from the cached analysis).
+type SqlLintResult struct {
+	Findings []SqlLintFinding `json:"findings"`
+}
+
+// SqlLint reports dump issues from the cached analysis: empty tables, DEFINER
+// usage, mixed charsets/collations, and the largest tables. No new file scan.
+func (s *FileService) SqlLint(fileID string) (SqlLintResult, error) {
+	f, summary, err := s.sqlSummaryFor(fileID)
+	if err != nil {
+		return SqlLintResult{}, err
+	}
+	var out []SqlLintFinding
+
+	empty := make([]string, 0)
+	for _, t := range summary.Tables {
+		if t.CreateOffset >= 0 && t.InsertOffset < 0 {
+			empty = append(empty, t.Name)
+		}
+	}
+	if len(empty) > 0 {
+		out = append(out, SqlLintFinding{Severity: "info", Title: fmt.Sprintf("%d empty tables", len(empty)), Detail: previewList(empty)})
+	}
+	if summary.DefinerCount > 0 {
+		out = append(out, SqlLintFinding{Severity: "warn", Title: fmt.Sprintf("%d DEFINER clauses", summary.DefinerCount), Detail: "Re-import may fail unless the definer user exists; consider the Remove DEFINER preset."})
+	}
+	if len(summary.Charsets) > 1 {
+		out = append(out, SqlLintFinding{Severity: "warn", Title: "mixed charsets", Detail: mapKeys(summary.Charsets)})
+	}
+	if len(summary.Collations) > 1 {
+		out = append(out, SqlLintFinding{Severity: "info", Title: "mixed collations", Detail: mapKeys(summary.Collations)})
+	}
+	if ranges, perr := sqlextract.PlanTableRanges(summary, f.Doc.Size(), sqlextract.PlanOptions{}); perr == nil {
+		largest := append([]sqlextract.TableRange(nil), ranges...)
+		sort.Slice(largest, func(i, j int) bool { return largest[i].Bytes > largest[j].Bytes })
+		parts := make([]string, 0, 3)
+		for i := 0; i < len(largest) && i < 3; i++ {
+			parts = append(parts, fmt.Sprintf("%s (%s)", largest[i].Name, fmtByteCount(largest[i].Bytes)))
+		}
+		if len(parts) > 0 {
+			out = append(out, SqlLintFinding{Severity: "info", Title: "largest tables", Detail: strings.Join(parts, ", ")})
+		}
+	}
+	if len(out) == 0 {
+		out = append(out, SqlLintFinding{Severity: "info", Title: "no issues found", Detail: ""})
+	}
+	return SqlLintResult{Findings: out}, nil
+}
+
+func previewList(names []string) string {
+	if len(names) > 8 {
+		return strings.Join(names[:8], ", ") + fmt.Sprintf(", … (+%d)", len(names)-8)
+	}
+	return strings.Join(names, ", ")
+}
+
+func mapKeys(m map[string]int) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return strings.Join(keys, ", ")
 }
 
 // SqlSplitByTableViaDialog writes one .sql file per table into a chosen folder.

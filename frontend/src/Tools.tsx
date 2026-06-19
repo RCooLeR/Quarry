@@ -9,6 +9,11 @@ interface CsvPreviewResult { header: string[]; rows: string[][]; warnings: strin
 interface SqlTable { name: string; createOffset: number; insertOffset: number; bytes: number; }
 interface SqlSummaryResult { tables: SqlTable[]; createTables: number; insertTables: number; definerCount: number; header: boolean; }
 interface TransformResult { outputPath: string; recordsRead: number; recordsWritten: number; note: string; }
+interface ValueCount { value: string; count: number; }
+interface ColumnProfile { name: string; sqlType: string; nonNull: number; null: number; distinct: number; distinctCapped: boolean; min: string; max: string; top: ValueCount[]; }
+interface CsvProfileResult { columns: ColumnProfile[]; recordsScanned: number; raggedRows: number; truncated: boolean; }
+interface SqlLintFinding { severity: string; title: string; detail: string; }
+interface SqlLintResult { findings: SqlLintFinding[]; }
 
 interface ColCfg { source: number; name: string; type: string; include: boolean; }
 
@@ -73,6 +78,8 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const [sqlPreviewText, setSqlPreviewText] = useState("");
   const [redactModes, setRedactModes] = useState<Record<number, string>>({});
   const [redactFixed, setRedactFixed] = useState("REDACTED");
+  const [profile, setProfile] = useState<CsvProfileResult | null>(null);
+  const [lint, setLint] = useState<SqlLintResult | null>(null);
 
   // SQL state (analysis is lifted to App; shared with palette + X-ray)
   const sqlSummary = analysis;
@@ -180,6 +187,9 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
       onError(String(e?.message ?? e));
     }
   };
+  const doProfile = async () => {
+    try { setProfile((await FileService.CsvProfile(fileId, delim, hasHeader)) as CsvProfileResult); } catch (e: any) { onError(String(e?.message ?? e)); }
+  };
 
   // SQL tools
   const doAnalyze = async () => {
@@ -199,6 +209,9 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
   const doData = (name: string) => run(async () => (await FileService.SqlExtractDataViaDialog(fileId, name)) as TransformResult);
   const doSplit = () => run(async () => (await FileService.SqlSplitByTableViaDialog(fileId)) as TransformResult);
   const doSample = () => run(async () => (await FileService.SqlSampleFixtureViaDialog(fileId, sampleRows)) as TransformResult);
+  const doLint = async () => {
+    try { setLint((await FileService.SqlLint(fileId)) as SqlLintResult); } catch (e: any) { onError(String(e?.message ?? e)); }
+  };
   const doReplace = () => run(async () => (await FileService.SqlReplaceViaDialog(fileId, find, repl, regex, ci, false)) as TransformResult);
   const doPreset = () => run(async () => (await FileService.SqlApplyPresetViaDialog(fileId, preset, pa[0], pa[1], pa[2], pa[3])) as TransformResult);
 
@@ -315,6 +328,25 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
               <input className="q-select" value={redactFixed} onChange={(e) => setRedactFixed(e.target.value)} />
               <button className="q-btn q-btn-primary" disabled={busy || redactCols.length === 0} onClick={doRedact}>Redact →</button>
             </div>
+
+            <div className="q-tsection">Profile (sampled)</div>
+            <button className="q-btn" disabled={busy} onClick={() => void doProfile()}>Profile columns</button>
+            {profile && (
+              <div className="q-profile">
+                <div className="q-thint">{profile.recordsScanned} rows scanned{profile.truncated ? " (sample)" : ""}{profile.raggedRows > 0 ? ` · ${profile.raggedRows} ragged rows` : ""}</div>
+                {profile.columns.map((c, i) => {
+                  const total = c.nonNull + c.null;
+                  const nullPct = total > 0 ? Math.round((c.null / total) * 100) : 0;
+                  return (
+                    <div className="q-prof" key={i}>
+                      <div className="q-prof-h"><span className="q-tcol-n">{c.name}</span><span className="q-tcol-t">{c.sqlType}</span></div>
+                      <div className="q-thint">null {nullPct}% · distinct {c.distinct}{c.distinctCapped ? "+" : ""} · min {c.min || "—"} · max {c.max || "—"}</div>
+                      {c.top.length > 0 && <div className="q-thint">top: {c.top.slice(0, 4).map((t) => `${t.value || "∅"}×${t.count}`).join(", ")}</div>}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </>
         ) : (
           <>
@@ -335,6 +367,19 @@ export default function Tools({ fileId, detected, analysis, onAnalyze, onNotice,
                   <label className="q-tlabel q-tlabel-inline">rows/table</label>
                   <input className="q-num" type="number" min={1} value={sampleRows} onChange={(e) => setSampleRows(Math.max(1, Number(e.target.value) || 1))} />
                 </div>
+                <div className="q-trow">
+                  <button className="q-btn" disabled={busy} onClick={() => void doLint()} title="Report dump issues (empty tables, DEFINER, mixed charsets, largest tables)">Lint dump</button>
+                </div>
+                {lint && (
+                  <div className="q-profile">
+                    {lint.findings.map((fdg, i) => (
+                      <div className={"q-lint q-lint-" + fdg.severity} key={i}>
+                        <span className="q-lint-t">{fdg.title}</span>
+                        {fdg.detail && <span className="q-thint">{fdg.detail}</span>}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 <label className="q-tlabel">Tables ({sqlSummary.tables.length}) — extract / schema / data</label>
                 <div className="q-ttables">
                   {sqlSummary.tables.map((t, i) => (
