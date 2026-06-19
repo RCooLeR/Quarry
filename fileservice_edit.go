@@ -99,7 +99,6 @@ type SaveResult struct {
 	Mode         string `json:"mode"` // "patch" | "copy"
 	BytesWritten int64  `json:"bytesWritten"`
 	OutputPath   string `json:"outputPath"`
-	ReversePatch string `json:"reversePatch"` // sidecar path (patch mode)
 }
 
 func sidecarPath(path string) string { return path + ".qrp" }
@@ -387,8 +386,10 @@ func (s *FileService) SavePatch(fileID string) (SaveResult, error) {
 		patches = append(patches, inplace.Patch{Offset: e.Start, Old: old, New: append([]byte(nil), e.Text...)})
 	}
 
-	sc := sidecarPath(f.Path)
-	if err := inplace.Apply(f.Path, patches, sc); err != nil {
+	// inplace.Apply commits then deletes the sidecar on success, so it is not a
+	// durable "undo" artifact and must not be reported as one — in-place rollback
+	// is a crash-recovery feature handled by inplace.Recover at open time.
+	if err := inplace.Apply(f.Path, patches, sidecarPath(f.Path)); err != nil {
 		return SaveResult{}, err
 	}
 	if _, err := s.reg.Reopen(fileID); err != nil {
@@ -399,7 +400,7 @@ func (s *FileService) SavePatch(fileID string) (SaveResult, error) {
 	for _, p := range patches {
 		written += int64(len(p.New))
 	}
-	return SaveResult{Mode: "patch", BytesWritten: written, OutputPath: f.Path, ReversePatch: sc}, nil
+	return SaveResult{Mode: "patch", BytesWritten: written, OutputPath: f.Path}, nil
 }
 
 func stagingState(f *session.File) StagingState {

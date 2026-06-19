@@ -358,6 +358,14 @@ func writeTableToFile(ctx context.Context, sourcePath string, outputPath string,
 	if err != nil {
 		return summary, err
 	}
+	// The piece table's offsets are relative to the source size captured when
+	// staging began. If the source changed size since then (e.g. a still-growing
+	// or re-exported dump), those offsets are stale — abort before writing rather
+	// than streaming a truncated/misaligned copy and reporting it as a success.
+	if st.Size() != table.OriginalSize() {
+		return summary, fmt.Errorf("source size changed from %d to %d since staging: %w",
+			table.OriginalSize(), st.Size(), ErrSourceModifiedDuringOperation)
+	}
 	sourceState := snapshotSource(st)
 
 	dst, err := openExclusive(summary.TempPath)

@@ -3,6 +3,7 @@ package manualedit
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/quarry/quarry-wails3/internal/document"
@@ -77,6 +78,13 @@ func (pt *PieceTable) SetMaxInsertedBytes(limit int64) {
 
 func (pt *PieceTable) Size() int64 {
 	return pt.size
+}
+
+// OriginalSize is the source size captured when the table was built. Comparing
+// it to the source's current size before a save detects a source that changed
+// (shrank/grew/was replaced) since staging began.
+func (pt *PieceTable) OriginalSize() int64 {
+	return pt.originalSize
 }
 
 func (pt *PieceTable) ModifiedRanges() []Range {
@@ -183,6 +191,7 @@ func (pt *PieceTable) WriteTo(ctx context.Context, src document.ReaderAtSize, ds
 		switch current.source {
 		case pieceOriginal:
 			reader := io.NewSectionReader(src, current.start, current.length)
+			var pieceWritten int64
 			for {
 				select {
 				case <-ctx.Done():
@@ -194,6 +203,7 @@ func (pt *PieceTable) WriteTo(ctx context.Context, src document.ReaderAtSize, ds
 				if n > 0 {
 					w, writeErr := dst.Write(buf[:n])
 					written += int64(w)
+					pieceWritten += int64(w)
 					if opts.Progress != nil {
 						opts.Progress(Progress{BytesWritten: written, BytesTotal: total})
 					}
@@ -210,6 +220,13 @@ func (pt *PieceTable) WriteTo(ctx context.Context, src document.ReaderAtSize, ds
 				if readErr != nil {
 					return written, readErr
 				}
+			}
+			// A short read means the source shrank/was replaced since staging, so
+			// the offsets we're copying no longer reference the bytes we expect.
+			// Fail loudly instead of silently writing a truncated/misaligned copy.
+			if pieceWritten != current.length {
+				return written, fmt.Errorf("source shrank during save (read %d of %d bytes at offset %d): %w",
+					pieceWritten, current.length, current.start, ErrSourceModifiedDuringOperation)
 			}
 		case pieceAdded:
 			start := current.start

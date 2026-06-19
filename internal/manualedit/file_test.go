@@ -268,6 +268,37 @@ func TestWriteSessionToFileWritesStagedEdits(t *testing.T) {
 	}
 }
 
+// If the source file changes size between staging and the copy-through save, the
+// piece-table offsets are stale; the save must fail (not silently write a
+// truncated copy and report success) and must not leave a finished output.
+func TestWriteSessionToFileFailsWhenSourceSizeChanged(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "source.txt")
+	outPath := filepath.Join(dir, "session.txt")
+	original := "alpha bravo charlie delta"
+	if err := os.WriteFile(srcPath, []byte(original), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	session := NewSession(int64(len(original)), DefaultMaxInsertedBytes)
+	if err := session.ApplyEdit(Edit{Start: 0, End: 0, Text: []byte(">> ")}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Source shrinks after staging (e.g. re-exported / truncated dump).
+	if err := os.WriteFile(srcPath, []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := WriteSessionToFile(context.Background(), srcPath, outPath, session, FileOptions{})
+	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
+		t.Fatalf("err = %v, want ErrSourceModifiedDuringOperation", err)
+	}
+	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
+		t.Fatalf("output file should not exist after a failed save, stat err = %v", statErr)
+	}
+}
+
 func TestWriteSessionToFileCancelDeletesPartialOutput(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")

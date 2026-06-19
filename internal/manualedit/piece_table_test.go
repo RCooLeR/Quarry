@@ -35,6 +35,40 @@ func (b *nopSyncBuffer) Sync() error {
 	return nil
 }
 
+// shrunkReaderAtSize reports a larger Size() than it actually serves, simulating
+// a source that was truncated/replaced after the piece table was built.
+type shrunkReaderAtSize struct {
+	data         []byte
+	reportedSize int64
+}
+
+func (r shrunkReaderAtSize) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(r.data)) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[off:])
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func (r shrunkReaderAtSize) Size() int64 { return r.reportedSize }
+
+// WriteTo must fail loudly (not silently truncate) when an original piece reads
+// short because the source shrank since staging.
+func TestPieceTableWriteToFailsOnShortSource(t *testing.T) {
+	full := []byte("alpha bravo charlie delta echo foxtrot")
+	pt := NewPieceTable(int64(len(full)))
+	// No edits: the whole file is one original piece of length len(full).
+	src := shrunkReaderAtSize{data: full[:10], reportedSize: int64(len(full))}
+	var out nopSyncBuffer
+	_, err := pt.WriteTo(context.Background(), src, &out, WriteOptions{})
+	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
+		t.Fatalf("err = %v, want ErrSourceModifiedDuringOperation", err)
+	}
+}
+
 func TestPieceTableReplaceWritesUpdatedBytes(t *testing.T) {
 	src := []byte("alpha bravo charlie")
 	pt := NewPieceTable(int64(len(src)))
