@@ -31,7 +31,10 @@ type WriteSummary struct {
 	ManifestPath      string
 	Outputs           []TableRange
 	BytesWritten      int64
-	ChecksumAlgorithm string `json:",omitempty"`
+	ChecksumAlgorithm string   `json:",omitempty"`
+	HeaderIncluded    bool     // false: slices omit the dump preamble (see Note)
+	DetectedCharsets  []string `json:",omitempty"`
+	Note              string   `json:",omitempty"`
 }
 
 func SplitByTable(ctx context.Context, doc document.ReaderAtSize, sourcePath string, summary analyze.Summary, opts WriteOptions) (WriteSummary, error) {
@@ -73,10 +76,13 @@ func writePreview(ctx context.Context, doc document.ReaderAtSize, sourcePath str
 
 	total := previewTotalBytes(preview)
 	summary := WriteSummary{
-		Operation:    preview.Operation,
-		SourcePath:   sourcePath,
-		SourceSize:   preview.SourceSize,
-		ManifestPath: manifestPath,
+		Operation:        preview.Operation,
+		SourcePath:       sourcePath,
+		SourceSize:       preview.SourceSize,
+		ManifestPath:     manifestPath,
+		HeaderIncluded:   preview.HeaderIncluded,
+		DetectedCharsets: preview.DetectedCharsets,
+		Note:             preview.Note,
 	}
 	if opts.ComputeSHA256 {
 		summary.ChecksumAlgorithm = "sha256"

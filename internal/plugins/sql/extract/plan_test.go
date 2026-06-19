@@ -7,6 +7,26 @@ import (
 	"github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
 )
 
+func TestSplitByTablePreviewAnnotatesHeaderlessSlices(t *testing.T) {
+	summary := analyze.Summary{
+		Tables:   []analyze.Table{{Name: "orders", CreateOffset: 0, InsertOffset: 40}},
+		Charsets: map[string]int{"utf8mb4": 2, "latin1": 1},
+	}
+	preview, err := SplitByTablePreview(summary, 100, PlanOptions{OutputDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.HeaderIncluded {
+		t.Fatal("slices begin at CREATE/INSERT, HeaderIncluded should be false")
+	}
+	if preview.Note == "" {
+		t.Fatal("expected a note explaining slices omit the dump preamble")
+	}
+	if len(preview.DetectedCharsets) != 2 || preview.DetectedCharsets[0] != "latin1" || preview.DetectedCharsets[1] != "utf8mb4" {
+		t.Fatalf("DetectedCharsets = %#v, want sorted [latin1 utf8mb4]", preview.DetectedCharsets)
+	}
+}
+
 func TestPlanTableRangesUsesNextTableBoundaryAndSafeOutputs(t *testing.T) {
 	summary := analyze.Summary{Tables: []analyze.Table{
 		{Name: "orders", CreateOffset: 80, InsertOffset: 140},

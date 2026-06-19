@@ -31,6 +31,26 @@ type ManifestPreview struct {
 	Operation  string
 	SourceSize int64
 	Tables     []TableRange
+	// HeaderIncluded is always false today: each slice begins at its CREATE/INSERT
+	// statement, so the dump preamble (SET NAMES / charset, SET FOREIGN_KEY_CHECKS)
+	// is not part of any slice. DetectedCharsets + Note tell the user what to
+	// prepend for a correct standalone re-import.
+	HeaderIncluded   bool
+	DetectedCharsets []string `json:",omitempty"`
+	Note             string   `json:",omitempty"`
+}
+
+const headerlessSliceNote = "Each slice begins at its CREATE/INSERT statement and omits the dump preamble (SET NAMES / charset, SET FOREIGN_KEY_CHECKS=0). For a correct standalone re-import, prepend an appropriate SET NAMES and SET FOREIGN_KEY_CHECKS=0; the last slice also includes the dump's trailing footer."
+
+// detectedCharsets returns the charsets the analyzer saw (sorted), so a caller
+// re-importing a slice knows which SET NAMES to prepend.
+func detectedCharsets(summary analyze.Summary) []string {
+	charsets := make([]string, 0, len(summary.Charsets))
+	for cs := range summary.Charsets {
+		charsets = append(charsets, cs)
+	}
+	sort.Strings(charsets)
+	return charsets
 }
 
 func SplitByTablePreview(summary analyze.Summary, sourceSize int64, opts PlanOptions) (ManifestPreview, error) {
@@ -38,7 +58,14 @@ func SplitByTablePreview(summary analyze.Summary, sourceSize int64, opts PlanOpt
 	if err != nil {
 		return ManifestPreview{}, err
 	}
-	return ManifestPreview{Operation: "sql-split-by-table", SourceSize: sourceSize, Tables: ranges}, nil
+	return ManifestPreview{
+		Operation:        "sql-split-by-table",
+		SourceSize:       sourceSize,
+		Tables:           ranges,
+		HeaderIncluded:   false,
+		DetectedCharsets: detectedCharsets(summary),
+		Note:             headerlessSliceNote,
+	}, nil
 }
 
 func ExtractTablePreview(summary analyze.Summary, sourceSize int64, tableName string, opts PlanOptions) (ManifestPreview, error) {
@@ -46,7 +73,14 @@ func ExtractTablePreview(summary analyze.Summary, sourceSize int64, tableName st
 	if err != nil {
 		return ManifestPreview{}, err
 	}
-	return ManifestPreview{Operation: "sql-extract-table", SourceSize: sourceSize, Tables: []TableRange{rangePlan}}, nil
+	return ManifestPreview{
+		Operation:        "sql-extract-table",
+		SourceSize:       sourceSize,
+		Tables:           []TableRange{rangePlan},
+		HeaderIncluded:   false,
+		DetectedCharsets: detectedCharsets(summary),
+		Note:             headerlessSliceNote,
+	}, nil
 }
 
 func PlanExtractTable(summary analyze.Summary, sourceSize int64, tableName string, opts PlanOptions) (TableRange, error) {
