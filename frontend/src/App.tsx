@@ -9,6 +9,8 @@ import DiffView from "./DiffView";
 import Sidebar from "./Sidebar";
 import MenuBar from "./MenuBar";
 import type { MenuDef, MenuItem } from "./MenuBar";
+import CommandPalette from "./CommandPalette";
+import type { Command } from "./CommandPalette";
 import "./quarry.css";
 
 interface Tab {
@@ -74,6 +76,7 @@ function App() {
   const [gridView, setGridView] = useState(false);
   const [hexView, setHexView] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   const activeIdRef = useRef<string | null>(null);
   const tabsRef = useRef<Tab[]>([]);
@@ -110,9 +113,13 @@ function App() {
           e.preventDefault();
           void closeTab(activeIdRef.current);
         }
+      } else if (mod && e.key.toLowerCase() === "p") {
+        e.preventDefault();
+        setPaletteOpen(true);
       } else if (e.key === "Escape") {
         setSearchOpen(false);
         setGotoOpen(false);
+        setPaletteOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -420,6 +427,22 @@ function App() {
     },
   ];
 
+  const commands: Command[] = [
+    { id: "open", group: "File", label: "Open file…", hint: "Ctrl+O", run: () => void openViaDialog() },
+    { id: "close", group: "File", label: "Close tab", hint: "Ctrl+W", run: () => activeId && void closeTab(activeId) },
+    { id: "patch", group: "File", label: "Patch in place", run: () => void saveInPlace() },
+    { id: "savecopy", group: "File", label: "Save copy…", run: () => void saveCopy() },
+    { id: "discard", group: "File", label: "Discard edits", run: () => void discardEdits() },
+    { id: "find", group: "Edit", label: "Find…", hint: "Ctrl+F", run: openSearch },
+    { id: "goto", group: "Edit", label: "Go to line / offset…", hint: "Ctrl+G", run: openGoto },
+    { id: "edit", group: "Edit", label: editMode ? "Turn editing off" : "Turn editing on", run: () => void toggleEdit() },
+    { id: "sidebar", group: "View", label: "Toggle sidebar", hint: "Ctrl+B", run: () => setSidebarCollapsed((v) => !v) },
+    { id: "text", group: "View", label: "Plain text view", run: showText },
+    { id: "hex", group: "View", label: "Toggle hex view", run: () => { setGridView(false); setHexView((v) => !v); } },
+    { id: "grid", group: "View", label: "Toggle grid view", run: () => { setHexView(false); setGridView((v) => !v); } },
+    { id: "tools", group: "Tools", label: (isCsv || isSql) ? "Toggle data tools panel" : "Data tools (CSV/SQL only)", run: () => (isCsv || isSql) && setToolsOpen((v) => !v) },
+  ];
+
   return (
     <div className="q-app">
       <header className="q-top">
@@ -622,6 +645,8 @@ function App() {
           <span className="q-muted">Ready</span>
         )}
       </footer>
+
+      {paletteOpen && <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />}
     </div>
   );
 }
