@@ -1,13 +1,13 @@
 [Desktop Entry]
 Version=1.0
-Name=My Product
-Comment=A Quarry application
+Name=Quarry
+Comment=Windows-first desktop editor and toolkit for very large text files.
 # The Exec line includes %u to pass the URL to the application
-Exec=/usr/local/bin/quarry.exe %u
+Exec=/usr/local/bin/quarry %u
 Terminal=false
 Type=Application
-Icon=quarry.exe
+Icon=quarry
 Categories=Utility;
-StartupWMClass=quarry.exe
+StartupWMClass=quarry
 
  

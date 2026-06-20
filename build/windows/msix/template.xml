@@ -10,24 +10,24 @@
     <Installer
         Path="quarry.exe"
         Arguments=""
-        InstallLocation="C:\Program Files\My Company\My Product">
+        InstallLocation="C:\Program Files\RCooLeR\Quarry">
     </Installer>
     <PackageInformation
-        PackageName="My Product"
-        PackageDisplayName="My Product"
-        PublisherName="CN=My Company"
-        PublisherDisplayName="My Company"
-        Version="0.1.0.0"
-        PackageDescription="A Quarry application">
+        PackageName="com.rcooler.quarry"
+        PackageDisplayName="Quarry"
+        PublisherName="CN=RCooLeR"
+        PublisherDisplayName="RCooLeR"
+        Version="0.0.1.0"
+        PackageDescription="Windows-first desktop editor and toolkit for very large text files.">
         <Capabilities>
             <Capability Name="runFullTrust" />
             
         </Capabilities>
         <Applications>
             <Application
-                Id="com.example.quarry"
-                Description="A Quarry application"
-                DisplayName="My Product"
+                Id="com.rcooler.quarry"
+                Description="Windows-first desktop editor and toolkit for very large text files."
+                DisplayName="Quarry"
                 ExecutableName="quarry.exe"
                 EntryPoint="Windows.FullTrustApplication">
                 
@@ -41,9 +41,9 @@
         </Dependencies>
         <Properties>
             <Framework>false</Framework>
-            <DisplayName>My Product</DisplayName>
-            <PublisherDisplayName>My Company</PublisherDisplayName>
-            <Description>A Quarry application</Description>
+            <DisplayName>Quarry</DisplayName>
+            <PublisherDisplayName>RCooLeR</PublisherDisplayName>
+            <Description>Windows-first desktop editor and toolkit for very large text files.</Description>
             <Logo>Assets\AppIcon.png</Logo>
         </Properties>
     </PackageInformation>

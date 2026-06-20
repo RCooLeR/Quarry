@@ -32,7 +32,8 @@
 ```
 
 Module: `github.com/quarry/quarry-wails3` (Go 1.26). Stack: Wails v3 (alpha2),
-React + TypeScript + Vite, CodeMirror 6.
+React + TypeScript + Vite, CodeMirror 6. The frontend package is
+`quarry-frontend`.
 
 ## Build & test
 
@@ -42,6 +43,19 @@ task build          # production build → bin/quarry.exe
 go test ./...       # engine + plugin + binding tests
 cd frontend && npm run build   # type-check + bundle the UI
 ```
+
+The root Taskfile also exposes server and Docker targets for non-GUI builds:
+
+```sh
+task build:server   # server-mode binary, no native GUI
+task run:server
+task setup:docker   # build the cross-compilation image
+task build:docker   # container image for server mode
+task run:docker
+```
+
+Set `PACKAGE_MANAGER` to use `npm`, `pnpm`, `yarn`, or `bun` for frontend tasks.
+Set `WAILS_VITE_PORT` when the default dev port (`9245`) is already occupied.
 
 `bin/`, `frontend/dist/`, `frontend/node_modules/`, and `frontend/bindings/` are
 gitignored. `wails_windows_amd64.syso` (the Windows icon resource) **is**
@@ -60,6 +74,18 @@ wails3 generate bindings
 Then import the regenerated client from the frontend (e.g.
 `FileService.SqlSchemaDiff(...)`). Because the directory is gitignored, anyone
 building from a clean checkout runs this once before the first frontend build.
+
+## Updating build metadata
+
+Product metadata lives in `build/config.yml`. After changing `info` or file
+association values, regenerate the committed platform assets:
+
+```sh
+wails3 task common:update:build-assets
+```
+
+Review the generated files under `build/` before committing so package names,
+bundle identifiers, installer text, and desktop entries stay consistent.
 
 ## How to add a new data tool
 

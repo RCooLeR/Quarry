@@ -8,15 +8,15 @@
   IgnorableNamespaces="uap3">
   
   <Identity 
-    Name="com.example.quarry"
-    Publisher="CN=My Company"
-    Version="0.1.0.0" 
+    Name="com.rcooler.quarry"
+    Publisher="CN=RCooLeR"
+    Version="0.0.1.0"
     ProcessorArchitecture="x64" />
   
   <Properties>
-    <DisplayName>My Product</DisplayName>
-    <PublisherDisplayName>My Company</PublisherDisplayName>
-    <Description>A Quarry application</Description>
+    <DisplayName>Quarry</DisplayName>
+    <PublisherDisplayName>RCooLeR</PublisherDisplayName>
+    <Description>Windows-first desktop editor and toolkit for very large text files.</Description>
     <Logo>Assets\StoreLogo.png</Logo>
   </Properties>
   
@@ -29,10 +29,10 @@
   </Resources>
   
   <Applications>
-    <Application Id="com.example.quarry" Executable="quarry.exe" EntryPoint="Windows.FullTrustApplication">
+    <Application Id="com.rcooler.quarry" Executable="quarry.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="My Product"
-        Description="A Quarry application"
+        DisplayName="Quarry"
+        Description="Windows-first desktop editor and toolkit for very large text files."
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"
         Square44x44Logo="Assets\Square44x44Logo.png">

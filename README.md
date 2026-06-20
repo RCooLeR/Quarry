@@ -49,7 +49,7 @@ npm, the [Wails v3 CLI](https://v3.wails.io/getting-started/installation/), and
 
 ```sh
 # run in development (hot reload for Go + frontend)
-task dev          # or: wails3 dev
+task dev          # or: wails3 dev -config ./build/config.yml
 
 # production build → bin/quarry.exe
 task build        # or: wails3 build

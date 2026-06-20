@@ -34,7 +34,17 @@ wails3 build
 Frontend-only build (type-check + bundle), useful in CI:
 
 ```sh
-cd frontend && npm install && npm run build
+cd frontend
+npm install
+npm run build
+```
+
+The Taskfiles default to `npm`, but can run the frontend through another
+supported package manager:
+
+```sh
+task build PACKAGE_MANAGER=pnpm
+task dev WAILS_VITE_PORT=9246
 ```
 
 ## Running the tests
