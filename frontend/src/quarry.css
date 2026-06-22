@@ -391,6 +391,108 @@ body {
   font-size: 13px;
 }
 
+/* ---- help modal ---- */
+.q-help {
+  width: 760px;
+  max-width: 92vw;
+  height: 70vh;
+  max-height: 640px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+.q-help-head {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.q-help-title {
+  font-weight: 600;
+  font-size: 14px;
+}
+.q-help-body {
+  display: flex;
+  min-height: 0;
+  flex: 1;
+}
+.q-help-nav {
+  width: 190px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  padding: 8px;
+  overflow-y: auto;
+  background: var(--panel-2);
+}
+.q-help-navitem {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 7px 10px;
+  margin-bottom: 2px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  font-family: var(--ui);
+  font-size: 13px;
+  cursor: pointer;
+}
+.q-help-navitem:hover { background: var(--bg); }
+.q-help-navitem-sel { background: var(--accent); color: #04181c; }
+.q-help-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 22px;
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text);
+}
+.q-help-content h2.q-help-h {
+  margin: 0 0 12px;
+  font-size: 17px;
+}
+.q-help-content p { margin: 0 0 10px; }
+.q-help-content code {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--panel-2);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+.q-help-note {
+  border-left: 3px solid var(--accent);
+  padding: 6px 12px;
+  background: var(--panel-2);
+  border-radius: 0 6px 6px 0;
+}
+.q-help-defs { margin: 0; }
+.q-help-def {
+  display: grid;
+  grid-template-columns: 170px 1fr;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--border);
+}
+.q-help-def dt { font-weight: 600; }
+.q-help-def dd { margin: 0; color: var(--text); }
+.q-help-kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+.q-help-tips { margin: 0; padding-left: 18px; }
+.q-help-tips li { margin-bottom: 9px; }
+
 /* ---- menu bar ---- */
 .q-menubar {
   display: flex;

@@ -49,6 +49,8 @@ never modified. The exception is *patch in place*, described under
 - **Bookmarks** — mark the current position and jump back; stored per file.
 - **Follow tail** — for a growing file (e.g. an active log), poll for growth,
   reload, and jump to the new end. Auto-stops if you start editing.
+- **In-app help** — press **F1** (or Help → *Help & shortcuts…*) for a built-in
+  guide to the shortcuts and every tool.
 
 ## SQL workbench
 

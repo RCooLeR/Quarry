@@ -34,7 +34,7 @@ Built with **Go + [Wails v3](https://v3.wails.io/) + React + TypeScript +
   X-ray minimap, bookmarks, and jump-to-table.
 - **Ops polish** — cancellable background jobs with a progress toast,
   follow-tail of growing files, recent files, session restore, drag-and-drop
-  open, and a light/dark theme.
+  open, a light/dark theme, and built-in **help** (F1).
 
 > **Safety invariant:** every transform and export writes to a **new** file
 > (temp file + atomic rename). The only in-place write is the explicit

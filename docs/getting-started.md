@@ -71,6 +71,9 @@ Opening is cheap: the file is stat'd and a sparse line index starts building in
 the background. You can scroll and navigate immediately; exact line numbers
 "sharpen" as the index completes.
 
+> **In-app help:** press **F1** (or Help → *Help & shortcuts…*) for a built-in
+> guide to the keyboard shortcuts and every tool.
+
 ## Views
 
 Switch views from the **View** menu or the command palette (Ctrl+P):

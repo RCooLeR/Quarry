@@ -12,6 +12,7 @@ import MenuBar from "./MenuBar";
 import type { MenuDef, MenuItem } from "./MenuBar";
 import CommandPalette from "./CommandPalette";
 import type { Command } from "./CommandPalette";
+import Help from "./Help";
 import XRay from "./XRay";
 import type { XRayRegion } from "./XRay";
 import "./quarry.css";
@@ -85,6 +86,7 @@ function App() {
   const [hexView, setHexView] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [helpOpen, setHelpOpen] = useState(false);
   const [analyses, setAnalyses] = useState<Record<string, SqlSummaryResult>>({});
   const [xrayOn, setXrayOn] = useState(true);
   const [theme, setTheme] = useState<string>(() => localStorage.getItem("quarry.theme") || "dark");
@@ -141,10 +143,14 @@ function App() {
       } else if (mod && e.key.toLowerCase() === "p") {
         e.preventDefault();
         setPaletteOpen(true);
+      } else if (e.key === "F1") {
+        e.preventDefault();
+        setHelpOpen(true);
       } else if (e.key === "Escape") {
         setSearchOpen(false);
         setGotoOpen(false);
         setPaletteOpen(false);
+        setHelpOpen(false);
       }
     };
     window.addEventListener("keydown", onKey);
@@ -657,6 +663,8 @@ function App() {
     {
       label: "Help",
       items: [
+        { label: "Help & shortcuts…", shortcut: "F1", onClick: () => setHelpOpen(true) },
+        { separator: true },
         { label: "About Quarry", onClick: () => setNotice("Quarry — a streaming editor and toolkit for very large SQL/CSV dumps. Files are never fully loaded; windows stream as you scroll.") },
       ],
     },
@@ -681,6 +689,7 @@ function App() {
     { id: "hex", group: "View", label: "Toggle hex view", run: () => { setGridView(false); setHexView((v) => !v); } },
     { id: "grid", group: "View", label: "Toggle grid view", run: () => { setHexView(false); setGridView((v) => !v); } },
     { id: "tools", group: "Tools", label: (isCsv || isSql) ? "Toggle data tools panel" : "Data tools (CSV/SQL only)", run: () => (isCsv || isSql) && setToolsOpen((v) => !v) },
+    { id: "help", group: "Help", label: "Help & shortcuts", hint: "F1", run: () => setHelpOpen(true) },
   ];
 
   // File X-ray regions + table-jump commands, from cached analysis of the active file.
@@ -985,6 +994,7 @@ function App() {
       </footer>
 
       {paletteOpen && <CommandPalette commands={commands} onClose={() => setPaletteOpen(false)} />}
+      {helpOpen && <Help onClose={() => setHelpOpen(false)} />}
     </div>
   );
 }
