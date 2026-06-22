@@ -8,7 +8,7 @@
 // visible across window swaps; edits are flushed into the Go staging session as
 // whole-window replacements on swap, on a debounce, and before save.
 
-import { Compartment, EditorState, StateEffect, StateField, Transaction } from "@codemirror/state";
+import { Compartment, EditorState, Extension, StateEffect, StateField, Transaction } from "@codemirror/state";
 import {
   Decoration,
   DecorationSet,
@@ -167,6 +167,8 @@ export class QuarryEditor {
   private editableC = new Compartment();
   private langC = new Compartment();
   private themeC = new Compartment();
+  private byteGutterC = new Compartment();
+  private byteGutter!: Extension;
 
   private fileId = "";
   private startByte = 0;
@@ -188,7 +190,7 @@ export class QuarryEditor {
   private editWinOrigLen = 0;
   private flushTimer: number | null = null;
 
-  constructor(parent: HTMLElement, cb: EditorCallbacks, theme: string = "dark") {
+  constructor(parent: HTMLElement, cb: EditorCallbacks, theme: string = "dark", showByteOffsets: boolean = true) {
     this.cb = cb;
     const ref = this.ref;
     const self = this;
@@ -210,6 +212,7 @@ export class QuarryEditor {
       },
       lineMarkerChange: () => true,
     });
+    this.byteGutter = byteGutter;
 
     const edgeWatcher = ViewPlugin.fromClass(
       class {
@@ -230,7 +233,7 @@ export class QuarryEditor {
       doc: "",
       extensions: [
         globalLineNumbers,
-        byteGutter,
+        this.byteGutterC.of(showByteOffsets ? byteGutter : []),
         matchField,
         highlightActiveLineGutter(),
         drawSelection(),
@@ -408,6 +411,11 @@ export class QuarryEditor {
   /** Swap the editor color theme ("dark" | "light"). */
   setTheme(theme: string): void {
     this.view.dispatch({ effects: this.themeC.reconfigure(editorThemeFor(theme)) });
+  }
+
+  /** Show or hide the byte-offset gutter beside the line numbers. */
+  setShowByteOffsets(on: boolean): void {
+    this.view.dispatch({ effects: this.byteGutterC.reconfigure(on ? this.byteGutter : []) });
   }
 
   destroy(): void {

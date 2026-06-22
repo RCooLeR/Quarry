@@ -9,7 +9,9 @@ never modified. The exception is *patch in place*, described under
 
 - **Streaming editor** — only bounded, line-aligned windows are held in memory;
   scrolling pulls in adjacent windows. The gutter shows real (or approximate,
-  until indexed) line numbers plus byte offsets.
+  until indexed) line numbers, with an **optional per-line byte-offset column**
+  (View → *Byte offsets in gutter*, off by default; persisted). The current
+  window's byte range is always shown in the status bar regardless.
 - **Syntax highlighting** — 20+ programming languages, plus JSON/YAML/TOML/INI
   and other configs, dedicated SQL highlighting, and **rainbow CSV** (per-column
   colors). Highlighting is chosen from the detected type and file extension.

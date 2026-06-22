@@ -88,6 +88,8 @@ function App() {
   const [analyses, setAnalyses] = useState<Record<string, SqlSummaryResult>>({});
   const [xrayOn, setXrayOn] = useState(true);
   const [theme, setTheme] = useState<string>(() => localStorage.getItem("quarry.theme") || "dark");
+  // Byte-offset gutter is opt-in: most users only need line numbers. "1" = shown.
+  const [showByteOffsets, setShowByteOffsets] = useState<boolean>(() => localStorage.getItem("quarry.byteOffsets") === "1");
   const [recent, setRecent] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem("quarry.recent") || "[]"); } catch { return []; }
   });
@@ -107,12 +109,13 @@ function App() {
   useEffect(() => {
     if (!hostRef.current) return;
     const initialTheme = localStorage.getItem("quarry.theme") || "dark";
+    const initialBytes = localStorage.getItem("quarry.byteOffsets") === "1";
     const ed = new QuarryEditor(hostRef.current, {
       onStatus: setStatus,
       onDirty: setDirty,
       onStaging: (s) => setStaging(s),
       onMode: (on) => setEditMode(on),
-    }, initialTheme);
+    }, initialTheme, initialBytes);
     editorRef.current = ed;
     const onKey = (e: KeyboardEvent) => {
       const mod = e.ctrlKey || e.metaKey;
@@ -161,6 +164,12 @@ function App() {
   }, [theme]);
 
   const toggleTheme = () => setTheme((t) => (t === "light" ? "dark" : "light"));
+
+  // Show/hide the per-line byte-offset gutter (persisted).
+  useEffect(() => {
+    localStorage.setItem("quarry.byteOffsets", showByteOffsets ? "1" : "0");
+    editorRef.current?.setShowByteOffsets(showByteOffsets);
+  }, [showByteOffsets]);
 
   // Tail/follow: poll the active file's size; when it grows, reload from disk
   // and jump to the new end. Stops automatically when editing (reload would
@@ -634,6 +643,7 @@ function App() {
         { label: "Add bookmark here", disabled: !activeTab, onClick: addBookmark },
         { label: "Follow tail (live)", disabled: !hasFiles || hasEdits, checked: following, onClick: () => setFollowing((v) => !v) },
         { label: "Command palette…", shortcut: "Ctrl+P", onClick: () => setPaletteOpen(true) },
+        { label: "Byte offsets in gutter", checked: showByteOffsets, onClick: () => setShowByteOffsets((v) => !v) },
         { label: "Light theme", checked: theme === "light", onClick: toggleTheme },
         { separator: true },
         { label: "Plain text", checked: !hexView && !gridView, disabled: !hasFiles, onClick: showText },
@@ -663,6 +673,7 @@ function App() {
     { id: "edit", group: "Edit", label: editMode ? "Turn editing off" : "Turn editing on", run: () => void toggleEdit() },
     { id: "sidebar", group: "View", label: "Toggle sidebar", hint: "Ctrl+B", run: () => setSidebarCollapsed((v) => !v) },
     { id: "theme", group: "View", label: theme === "light" ? "Switch to dark theme" : "Switch to light theme", run: toggleTheme },
+    { id: "byteoffsets", group: "View", label: showByteOffsets ? "Hide byte offsets in gutter" : "Show byte offsets in gutter", run: () => setShowByteOffsets((v) => !v) },
     { id: "bookmark", group: "View", label: "Add bookmark here", run: addBookmark },
     { id: "bookmarks", group: "View", label: "Toggle bookmarks panel", run: () => setBookmarksOpen((v) => !v) },
     { id: "follow", group: "View", label: following ? "Stop following tail" : "Follow tail (live)", run: () => setFollowing((v) => !v) },
