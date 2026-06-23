@@ -57,8 +57,29 @@ task run:docker
 Set `PACKAGE_MANAGER` to use `npm`, `pnpm`, `yarn`, or `bun` for frontend tasks.
 Set `WAILS_VITE_PORT` when the default dev port (`9245`) is already occupied.
 
+## CI & releases
+
+GitHub Actions runs the desktop build on Windows, macOS, and Linux. Linux uses
+Ubuntu 24.04 plus GTK/WebKit development packages so the native Wails build has
+the same libraries that the Linux package metadata declares.
+
+Releases are tag-driven:
+
+```sh
+git tag -a v0.0.1 -m "Quarry v0.0.1"
+git push origin v0.0.1
+```
+
+The release workflow builds native Wails artifacts on each OS runner, downloads
+them into `release-artifacts/`, writes `SHA256SUMS.txt`, and then uses
+GoReleaser to create the GitHub release and upload the artifacts. The
+GoReleaser config intentionally skips its own Go build step because Wails
+desktop artifacts need platform-native packaging rather than a plain
+cross-compiled binary.
+
 `bin/`, `frontend/dist/`, `frontend/node_modules/`, and `frontend/bindings/` are
-gitignored. `wails_windows_amd64.syso` (the Windows icon resource) **is**
+gitignored, as are GoReleaser's local `dist/` and `release-artifacts/` scratch
+directories. `wails_windows_amd64.syso` (the Windows icon resource) **is**
 committed so `go build` embeds the icon without a separate generate step.
 
 ## Regenerating bindings

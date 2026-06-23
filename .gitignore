@@ -1,5 +1,7 @@
 .task
 bin
+dist/
+release-artifacts/
 frontend/dist
 frontend/node_modules
 build/linux/appimage/build

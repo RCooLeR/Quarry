@@ -1,0 +1,29 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+version: 2
+
+project_name: quarry
+
+# Wails desktop artifacts are built by native GitHub Actions runners so each OS
+# uses the platform toolchain it expects. GoReleaser owns the release creation,
+# changelog, and artifact upload.
+builds:
+  - skip: true
+
+release:
+  github:
+    owner: RCooLeR
+    name: Quarry
+  name_template: "{{ .ProjectName }} {{ .Tag }}"
+  draft: false
+  prerelease: auto
+  make_latest: true
+  mode: append
+  extra_files:
+    - glob: ./release-artifacts/*
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
