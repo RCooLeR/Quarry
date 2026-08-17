@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -9,6 +10,8 @@ const (
 	hexWindowBytes  = 64 * 1024
 	hexBytesPerLine = 16
 )
+
+var ErrHexRequestTooLarge = errors.New("hex window request exceeds the hard byte limit")
 
 // HexLine is one 16-byte row: global offset, space-grouped hex, and ASCII.
 type HexLine struct {
@@ -30,24 +33,37 @@ type HexWindow struct {
 // aligned) startByte. Scrolling loads adjacent windows; the file is never fully
 // read. Works for any file, including binary.
 func (s *FileService) GetHexWindow(fileID string, startByte int64, maxBytes int) (HexWindow, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return HexWindow{}, fmt.Errorf("unknown file id %q", fileID)
+	if startByte < 0 {
+		return HexWindow{}, fmt.Errorf("%w: start byte must not be negative", ErrHexRequestTooLarge)
 	}
-	if maxBytes <= 0 {
+	if maxBytes < 0 {
+		return HexWindow{}, fmt.Errorf("%w: byte budget must not be negative", ErrHexRequestTooLarge)
+	}
+	lease, f, err := s.acquireReadFile(fileID)
+	if err != nil {
+		return HexWindow{}, err
+	}
+	defer lease.Release()
+	if maxBytes == 0 {
 		maxBytes = hexWindowBytes
 	}
-	size := f.Doc.Size()
-	if startByte < 0 {
-		startByte = 0
+	if maxBytes > hexWindowBytes {
+		return HexWindow{}, fmt.Errorf("%w: requested %d bytes, maximum %d", ErrHexRequestTooLarge, maxBytes, hexWindowBytes)
 	}
+	size := f.Doc.Size()
 	if startByte > size {
 		startByte = size
 	}
 	startByte -= startByte % hexBytesPerLine // align to a row boundary
 
-	end := startByte + int64(maxBytes)
-	if end > size {
+	// Subtract before adding so a valid file near MaxInt64 cannot overflow the
+	// requested end offset. maxBytes is already capped to a small positive
+	// value, but startByte itself may legitimately be very large.
+	end := size
+	if int64(maxBytes) <= size-startByte {
+		end = startByte + int64(maxBytes)
+	}
+	if end > size { // defensive: keep the range exact if invariants change
 		end = size
 	}
 	raw, err := f.Doc.ReadRange(startByte, end)

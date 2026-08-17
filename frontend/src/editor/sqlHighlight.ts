@@ -9,6 +9,7 @@
 
 import { RangeSetBuilder } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
+import { MAX_EDITOR_HIGHLIGHT_RANGES } from "./highlightLimits";
 
 // A pragmatic MySQL/ANSI keyword set — enough to make dumps readable.
 const KEYWORDS = new Set(
@@ -42,7 +43,8 @@ const DECOS = {
 
 function buildDecorations(view: EditorView): DecorationSet {
   const builder = new RangeSetBuilder<Decoration>();
-  for (const { from, to } of view.visibleRanges) {
+  let remaining = MAX_EDITOR_HIGHLIGHT_RANGES;
+  visible: for (const { from, to } of view.visibleRanges) {
     let pos = from;
     while (pos <= to) {
       const line = view.state.doc.lineAt(pos);
@@ -59,6 +61,8 @@ function buildDecorations(view: EditorView): DecorationSet {
         if (deco) {
           const start = line.from + m.index;
           builder.add(start, start + m[0].length, deco);
+          remaining--;
+          if (remaining === 0) break visible;
         }
         if (m[0].length === 0) TOKEN.lastIndex++; // guard against zero-width matches
       }
@@ -83,13 +87,5 @@ const sqlHighlightPlugin = ViewPlugin.fromClass(
   { decorations: (v) => v.decorations },
 );
 
-const sqlHighlightTheme = EditorView.theme({
-  ".q-sql-comment": { color: "#6a9955", fontStyle: "italic" },
-  ".q-sql-string": { color: "#ce9178" },
-  ".q-sql-ident": { color: "#4ec9b0" }, // backtick-quoted identifiers
-  ".q-sql-number": { color: "#b5cea8" },
-  ".q-sql-keyword": { color: "#569cd6" },
-});
-
 /** SQL highlighting extension (display-only, per visible line). */
-export const sqlHighlight = [sqlHighlightPlugin, sqlHighlightTheme];
+export const sqlHighlight = [sqlHighlightPlugin];

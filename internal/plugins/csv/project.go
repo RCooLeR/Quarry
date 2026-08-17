@@ -8,7 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 	"unicode/utf8"
 
@@ -20,6 +19,8 @@ type ProjectOptions struct {
 	Columns           []int
 	AllowShortRecords bool
 	MissingValue      string
+	MaxRecordBytes    int64
+	ExpectedSource    *SourceExpectation
 	Progress          func(ProjectProgress)
 }
 
@@ -44,6 +45,7 @@ type ProjectPreviewOptions struct {
 	MissingValue      string
 	MaxBytes          int64
 	MaxRows           int
+	MaxRecordBytes    int64
 }
 
 type ProjectPreviewReport struct {
@@ -76,12 +78,13 @@ func ProjectColumns(ctx context.Context, r io.Reader, w io.Writer, opts ProjectO
 		return ProjectSummary{}, err
 	}
 	counting := &countingReader{r: br}
-	reader := stdcsv.NewReader(counting)
-	reader.Comma = opts.Delimiter
-	reader.FieldsPerRecord = -1
-	reader.LazyQuotes = true
-	reader.TrimLeadingSpace = true
-	reader.ReuseRecord = false
+	reader, err := newBoundedCSVReader(ctx, counting, csvReaderConfig{
+		Delimiter: opts.Delimiter, MaxRecordBytes: opts.MaxRecordBytes,
+		FieldsPerRecord: -1, LazyQuotes: false,
+	})
+	if err != nil {
+		return ProjectSummary{}, err
+	}
 
 	writer := stdcsv.NewWriter(w)
 	writer.Comma = opts.Delimiter
@@ -135,51 +138,40 @@ func ProjectColumns(ctx context.Context, r io.Reader, w io.Writer, opts ProjectO
 	return summary, nil
 }
 
-func ProjectColumnsFile(ctx context.Context, inputPath, outputPath string, opts ProjectOptions) (ProjectSummary, error) {
+func ProjectColumnsFile(ctx context.Context, inputPath, outputPath string, opts ProjectOptions) (_ ProjectSummary, retErr error) {
 	if inputPath == "" {
 		return ProjectSummary{}, errors.New("input path is required")
 	}
 	if outputPath == "" {
 		return ProjectSummary{}, errors.New("output path is required")
 	}
-	same, err := sameFilePath(inputPath, outputPath)
+	if err := ValidateDelimiter(opts.Delimiter); err != nil {
+		return ProjectSummary{}, err
+	}
+	normalized, err := normalizeProjectOptions(opts)
 	if err != nil {
 		return ProjectSummary{}, err
 	}
-	if same {
-		return ProjectSummary{}, errors.New("output path must be different from input path")
-	}
-
-	input, err := os.Open(inputPath)
+	opts = normalized
+	input, err := openCSVSource(ctx, inputPath, opts.ExpectedSource)
 	if err != nil {
 		return ProjectSummary{}, err
 	}
-	defer input.Close()
+	defer func() { retErr = errors.Join(retErr, input.Close()) }()
 
-	output, err := os.OpenFile(outputPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	output, err := fileio.OpenAtomicOutput(outputPath, []string{inputPath}, 0o600)
 	if err != nil {
 		return ProjectSummary{}, err
 	}
-
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = output.Close()
-			_ = os.Remove(outputPath)
-		}
-	}()
+	defer func() { retErr = errors.Join(retErr, output.Cleanup()) }()
 
 	summary, err := ProjectColumns(ctx, input, output, opts)
 	if err != nil {
 		return summary, err
 	}
-	if err := output.Sync(); err != nil {
+	if err := output.CommitContextValidated(ctx, input.ValidateContext); err != nil {
 		return summary, err
 	}
-	if err := output.Close(); err != nil {
-		return summary, err
-	}
-	cleanup = false
 	return summary, nil
 }
 
@@ -196,41 +188,43 @@ func PreviewProjectedColumnsContext(ctx context.Context, r io.Reader, opts Proje
 		return ProjectPreviewReport{}, err
 	}
 
-	data, err := readBoundedSample(ctx, r, maxBytes)
+	sample, err := readBoundedSample(ctx, r, maxBytes)
 	if err != nil {
 		return ProjectPreviewReport{}, err
 	}
-	truncated := int64(len(data)) > maxBytes
-	if truncated {
-		data = data[:maxBytes]
-	}
-	bytesScanned := int64(len(data))
-	if truncated {
-		if trimmed, ok := trimTrailingPartialRecord(data); ok {
-			data = trimmed
+	data := sample.Data
+	partialOmitted := false
+	if sample.Truncated {
+		data, partialOmitted, err = CompleteRecordPrefix(ctx, data, projectOpts.Delimiter, projectOpts.MaxRecordBytes, true)
+		if err != nil {
+			return ProjectPreviewReport{}, err
 		}
 	}
 
 	report := ProjectPreviewReport{
-		BytesScanned:    bytesScanned,
+		BytesScanned:    sample.BytesScanned,
 		ColumnsWritten:  len(projectOpts.Columns),
 		Delimiter:       projectOpts.Delimiter,
-		TruncatedSample: truncated,
+		TruncatedSample: sample.Truncated,
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
 		report.Warnings = append(report.Warnings, "sample is empty")
 		return report, nil
 	}
-	if truncated {
+	if sample.Truncated {
 		report.Warnings = append(report.Warnings, fmt.Sprintf("sample limited to %d bytes", maxBytes))
+	}
+	if partialOmitted {
 		report.Warnings = append(report.Warnings, "trailing partial record omitted from preview")
 	}
 
-	reader := stdcsv.NewReader(bytes.NewReader(data))
-	reader.Comma = projectOpts.Delimiter
-	reader.FieldsPerRecord = -1
-	reader.LazyQuotes = true
-	reader.ReuseRecord = false
+	reader, err := newBoundedCSVReader(ctx, bytes.NewReader(data), csvReaderConfig{
+		Delimiter: projectOpts.Delimiter, MaxRecordBytes: projectOpts.MaxRecordBytes,
+		FieldsPerRecord: -1, LazyQuotes: false,
+	})
+	if err != nil {
+		return report, err
+	}
 
 	for len(report.Rows) < maxRows {
 		if err := contextErr(ctx); err != nil {
@@ -251,18 +245,6 @@ func PreviewProjectedColumnsContext(ctx context.Context, r io.Reader, opts Proje
 		report.Rows = append(report.Rows, projected)
 	}
 	return report, nil
-}
-
-func trimTrailingPartialRecord(data []byte) ([]byte, bool) {
-	for i := len(data) - 1; i >= 0; i-- {
-		if data[i] == '\n' {
-			return data[:i+1], true
-		}
-		if data[i] == '\r' {
-			return data[:i+1], true
-		}
-	}
-	return nil, false
 }
 
 func FormatProjectPreviewReport(report ProjectPreviewReport) string {
@@ -287,40 +269,48 @@ func FormatProjectPreviewReport(report ProjectPreviewReport) string {
 }
 
 func normalizeProjectOptions(opts ProjectOptions) (ProjectOptions, error) {
+	if err := validateTransformColumnMappingCount("CSV projection", len(opts.Columns), true); err != nil {
+		return opts, err
+	}
+	if err := validateDistinctNonNegativeIndexes("projection column", opts.Columns); err != nil {
+		return opts, err
+	}
+	configStringBytes := 0
+	if err := addTransformConfigString(&configStringBytes, "CSV projection", opts.MissingValue); err != nil {
+		return opts, err
+	}
 	if opts.Delimiter == 0 {
 		opts.Delimiter = ','
 	}
 	if !validProjectDelimiter(opts.Delimiter) {
 		return opts, fmt.Errorf("invalid delimiter %q", opts.Delimiter)
 	}
-	if len(opts.Columns) == 0 {
-		return opts, errors.New("at least one output column is required")
+	limit, err := normalizeLogicalRecordLimit(opts.MaxRecordBytes)
+	if err != nil {
+		return opts, err
 	}
-	for i, column := range opts.Columns {
-		if column < 0 {
-			return opts, fmt.Errorf("column %d is negative", i)
-		}
-	}
+	opts.MaxRecordBytes = limit
 	return opts, nil
 }
 
 func normalizeProjectPreviewOptions(opts ProjectPreviewOptions) (ProjectOptions, int64, int, error) {
+	maxBytes, err := normalizeSampleByteLimit("project preview sample", opts.MaxBytes, DefaultPreviewMaxBytes)
+	if err != nil {
+		return ProjectOptions{}, 0, 0, err
+	}
+	maxRows, err := normalizeSampleRowLimit("project preview sample", opts.MaxRows, DefaultPreviewMaxRows)
+	if err != nil {
+		return ProjectOptions{}, 0, 0, err
+	}
 	projectOpts, err := normalizeProjectOptions(ProjectOptions{
 		Delimiter:         opts.Delimiter,
 		Columns:           opts.Columns,
 		AllowShortRecords: opts.AllowShortRecords,
 		MissingValue:      opts.MissingValue,
+		MaxRecordBytes:    opts.MaxRecordBytes,
 	})
 	if err != nil {
 		return projectOpts, 0, 0, err
-	}
-	maxBytes := opts.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = DefaultPreviewMaxBytes
-	}
-	maxRows := opts.MaxRows
-	if maxRows <= 0 {
-		maxRows = DefaultPreviewMaxRows
 	}
 	return projectOpts, maxBytes, maxRows, nil
 }
@@ -341,11 +331,17 @@ func projectRecord(record []string, opts ProjectOptions) ([]string, error) {
 }
 
 func validProjectDelimiter(delimiter rune) bool {
-	return delimiter != '"' && delimiter != '\r' && delimiter != '\n' && utf8.ValidRune(delimiter) && delimiter != utf8.RuneError
+	return ValidateDelimiter(delimiter) == nil
 }
 
-func sameFilePath(a, b string) (bool, error) {
-	return fileio.SamePath(a, b)
+// ValidateDelimiter rejects delimiters that encoding/csv cannot represent.
+// A zero rune is invalid at artifact-producing boundaries; callers that want a
+// comma must request a comma explicitly instead of relying on coercion.
+func ValidateDelimiter(delimiter rune) error {
+	if delimiter == 0 || delimiter == '"' || delimiter == '\r' || delimiter == '\n' || !utf8.ValidRune(delimiter) || delimiter == utf8.RuneError {
+		return fmt.Errorf("invalid delimiter %q", delimiter)
+	}
+	return nil
 }
 
 func csvRecordLineWithDelimiter(fields []string, delimiter rune) string {

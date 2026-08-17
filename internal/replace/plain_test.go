@@ -3,13 +3,100 @@ package replace
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/quarry/quarry-wails3/internal/document"
 )
+
+func TestReplacePlainWholeWordUnicodeBoundaryChunkInvariant(t *testing.T) {
+	const supplementaryLetter = "𐐀"
+	for chunkSize := len("cat") + utf8.UTFMax; chunkSize <= 13; chunkSize++ {
+		for padding := 0; padding < chunkSize; padding++ {
+			name := fmt.Sprintf("chunk=%d/padding=%d", chunkSize, padding)
+			t.Run(name, func(t *testing.T) {
+				prefix := strings.Repeat(".", padding)
+				source := prefix + supplementaryLetter + "cat cat cat" + supplementaryLetter
+				want := prefix + supplementaryLetter + "cat dog cat" + supplementaryLetter
+
+				src, err := os.CreateTemp("", "q-word-src-*")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.Remove(src.Name())
+				defer src.Close()
+				dst, err := os.CreateTemp("", "q-word-dst-*")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer os.Remove(dst.Name())
+				defer dst.Close()
+				if _, err := src.WriteString(source); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := src.Seek(0, 0); err != nil {
+					t.Fatal(err)
+				}
+				matches, err := replacePlain(context.Background(), src, dst, []byte("cat"), []byte("dog"), PlainOptions{
+					ChunkSize: chunkSize,
+					WholeWord: true,
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if matches != 1 {
+					t.Fatalf("matches=%d, want 1", matches)
+				}
+				got, err := os.ReadFile(dst.Name())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != want {
+					t.Fatalf("output=%q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
+func TestReplacePlainWholeWordCombiningMarkIsNotBoundary(t *testing.T) {
+	src, err := os.CreateTemp("", "q-mark-src-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(src.Name())
+	defer src.Close()
+	dst, err := os.CreateTemp("", "q-mark-dst-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(dst.Name())
+	defer dst.Close()
+	if _, err := src.WriteString("e\u0301 e"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := src.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	matches, err := replacePlain(context.Background(), src, dst, []byte("e"), []byte("X"), PlainOptions{ChunkSize: 5, WholeWord: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if matches != 1 {
+		t.Fatalf("matches=%d, want 1", matches)
+	}
+	got, err := os.ReadFile(dst.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "e\u0301 X" {
+		t.Fatalf("output=%q", got)
+	}
+}
 
 func TestReplacePlainBoundary(t *testing.T) {
 	src, err := os.CreateTemp("", "q-src-*")
@@ -33,7 +120,7 @@ func TestReplacePlainBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	matches, err := ReplacePlain(context.Background(), src, dst, []byte("hello"), []byte("bye"), PlainOptions{ChunkSize: 7})
+	matches, err := replacePlain(context.Background(), src, dst, []byte("hello"), []byte("bye"), PlainOptions{ChunkSize: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,7 +163,7 @@ func TestReplacePlainCaseInsensitiveWholeWord(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	matches, err := ReplacePlain(context.Background(), src, dst, []byte("cat"), []byte("dog"), PlainOptions{
+	matches, err := replacePlain(context.Background(), src, dst, []byte("cat"), []byte("dog"), PlainOptions{
 		ChunkSize:       5,
 		CaseInsensitive: true,
 		WholeWord:       true,
@@ -120,7 +207,7 @@ func TestReplacePlainCaseInsensitiveUsesByteStableASCIIFold(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	matches, err := ReplacePlain(context.Background(), src, dst, []byte("kelvin"), []byte("FOUND"), PlainOptions{
+	matches, err := replacePlain(context.Background(), src, dst, []byte("kelvin"), []byte("FOUND"), PlainOptions{
 		ChunkSize:       8,
 		CaseInsensitive: true,
 	})
@@ -158,7 +245,7 @@ func TestReplacePlainBuffersDenseMatchWrites(t *testing.T) {
 	}
 
 	dst := &countingSyncWriter{}
-	matches, err := ReplacePlain(context.Background(), src, dst, []byte("old_database"), []byte("new_database"), PlainOptions{
+	matches, err := replacePlain(context.Background(), src, dst, []byte("old_database"), []byte("new_database"), PlainOptions{
 		ChunkSize: 64 * 1024,
 	})
 	if err != nil {
@@ -207,7 +294,7 @@ func TestReplacePlainFileUsesWholeSourceWhileEditableSliceIsDirty(t *testing.T) 
 		t.Fatalf("edited replacement still contains original marker: %q", string(encoded))
 	}
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("original"), []byte("replaced"), FileOptions{ChunkSize: 8})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("original"), []byte("replaced"), FileOptions{ChunkSize: 8})
 	if err != nil {
 		t.Fatal(err)
 	}

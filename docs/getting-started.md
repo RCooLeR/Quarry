@@ -2,10 +2,13 @@
 
 ## Prerequisites
 
-- **Go** 1.26 or newer
-- **Node.js** + **npm** (the frontend is built with Vite)
-- **Wails v3 CLI** — see the
-  [Wails installation guide](https://v3.wails.io/getting-started/installation/)
+- **Go** 1.26.6 or newer. CI and release-candidate validation use exactly
+  1.26.6 from `go.mod`.
+- **Node.js** `^20.19.0` or `>=22.12.0` with **npm** `11.17.0` (the frontend
+  install is locked to npm and `package-lock.json`). The canonical CI runtime
+  is Node 24.19.0, also recorded in `.node-version`.
+- **Wails v3 CLI** `v3.0.0-alpha2.106`, matching `go.mod`:
+  `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106`
 - **[Task](https://taskfile.dev/)** (optional) — the `Taskfile.yml` wraps the
   common Wails commands
 
@@ -13,15 +16,19 @@ Quarry targets Windows first (the build embeds a Windows icon and a dark title
 bar via the Windows API), but the Go engine and the React UI are
 platform-neutral.
 
+There is not yet a supported public binary release. See
+[Support, installation, and release status](support-and-release.md) before
+using or distributing a validation build.
+
 ## Build & run
 
 Using Task:
 
 ```sh
 task dev      # development mode, hot reload for Go + frontend
-task build    # production build → bin/quarry.exe
+task build    # optimized local build; not a release-qualified artifact
 task run      # build and run
-task package  # packaged production build
+task package  # local unsigned/unqualified package for validation only
 ```
 
 Equivalent Wails CLI commands:
@@ -34,38 +41,66 @@ wails3 build
 Frontend-only build (type-check + bundle), useful in CI:
 
 ```sh
-cd frontend
-npm install
-npm run build
+wails3 task frontend:check
 ```
 
-The Taskfiles default to `npm`, but can run the frontend through another
-supported package manager:
+That task generates TypeScript bindings before running `npm ci`, Vitest,
+TypeScript, and the production Vite build. For a manual equivalent, use
+`wails3 generate bindings -ts -i` before entering `frontend/`.
 
-```sh
-task build PACKAGE_MANAGER=pnpm
-task dev WAILS_VITE_PORT=9246
-```
+Quarry supports the committed npm lockfile as its sole frontend dependency
+graph. `task dev WAILS_VITE_PORT=9246` changes the development port without
+changing dependencies.
 
 ## Running the tests
 
-The engine is covered by Go unit tests:
+The engine/internal packages can be tested without a frontend bundle; the full
+module embeds `frontend/dist`, so generate the ignored bundle first in a fresh
+checkout:
 
 ```sh
-go test ./...
+go test ./internal/... ./build/releasemeta
+wails3 task frontend:check
+go test ./...  # complete module, after frontend:check
 ```
 
+The canonical local gate is:
+
+```sh
+task verify       # unit/production-tag/UI/static/dependency/workflow gates
+task verify:race  # race-enabled suite, run separately because it is slower
+```
+
+Both canonical tasks build/check the frontend before whole-module Go commands,
+so they work from a fresh checkout where `frontend/dist` is absent. `task verify`
+downloads exact scanner releases without adding them to
+`go.mod`. It requires network access for the Go vulnerability database and npm
+advisory service. CI runs the same checks from a fresh checkout and records the
+verified commit, tree, tool versions, and lockfile hashes.
+
 The streaming primitives, the CSV/SQL plugins, the search/replace engine, and
-the binding helpers all have tests. The frontend is validated with `tsc` and the
-Vite production build.
+the binding helpers all have tests. Standard Wails builds generate bindings,
+run the frontend test suite, type-check, and build the Vite production bundle.
 
 ## Opening a file
 
 - **Open file…** (Ctrl+O) — native file dialog; any file type is allowed.
 - **Paste a path** on the empty-state screen and press Enter.
 - **Drag and drop** a file onto the window.
-- **Recent files** — the File menu lists recently opened paths; the previous
-  session's open files are restored on launch.
+- **Recent files** — the File menu lists paths opened during the current run.
+  Path persistence is off on a fresh install. Turn on **File → Remember
+  workspace paths** only if local path history is appropriate for the machine.
+- **Session restore** — after path memory is enabled, separately enable **File
+  → Restore remembered tabs on launch**. Quarry stores and restores at most 16
+  validated paths. It never enables restore implicitly.
+
+The File menu can clear recent paths, the saved session, and all path-keyed
+bookmarks in one operation without closing current tabs. Turning workspace path
+memory off performs the same storage cleanup and prevents later path writes;
+bookmarks and recent entries created afterward remain available only until the
+app exits. When upgrading from a version that stored paths automatically,
+legacy recent/session/bookmark data is cleared unless the new versioned opt-in
+preference already exists.
 
 Opening is cheap: the file is stat'd and a sparse line index starts building in
 the background. You can scroll and navigate immediately; exact line numbers
@@ -98,11 +133,10 @@ Other surfaces:
 1. Toggle **Edit mode** (the file must be editable — text, a supported
    encoding).
 2. Make changes in the current window.
-3. Save with one of:
-   - **Patch in place** — only enabled when the staged edits preserve total
-     file length; overwrites just the changed bytes and keeps a backup.
-   - **Save copy…** — streams a full edited copy to a new file.
+3. Finish with one of:
+   - **Save copy…** — streams a full edited copy to a new file. In-place save
+     is disabled until Quarry can retain and verify a durable backup.
    - **Discard edits** — drop staged changes.
 
-See [Architecture → Editing & saving](architecture.md#editing--saving) for why
-length-preserving edits can be patched in place while others stream a copy.
+See [Architecture → Editing & saving](architecture.md#editing--saving) for the
+source-safety rationale.

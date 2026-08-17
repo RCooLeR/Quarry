@@ -1,6 +1,7 @@
 package document
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -591,6 +592,9 @@ func TestInMemoryBufferWriteCopyKeepsUTF16LEEncoding(t *testing.T) {
 	if !strings.EqualFold(buf.Encoding, "UTF-16LE") {
 		t.Fatalf("Encoding = %q", buf.Encoding)
 	}
+	if !buf.HasBOM {
+		t.Fatal("buffer did not retain the source BOM policy")
+	}
 
 	output := filepath.Join(dir, "utf16.edited.txt")
 	if _, err := buf.WriteCopy(output, "bye"); err != nil {
@@ -600,8 +604,122 @@ func TestInMemoryBufferWriteCopyKeepsUTF16LEEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(written) < 2 || written[0] != 'b' || written[1] != 0 {
-		t.Fatalf("output bytes do not look UTF-16LE encoded: % x", written)
+	if len(written) < 4 || written[0] != 0xFF || written[1] != 0xFE || written[2] != 'b' || written[3] != 0 {
+		t.Fatalf("output did not preserve UTF-16LE BOM and encoding: % x", written)
+	}
+}
+
+func TestInMemoryBufferWriteCopyPreservesUTF8BOM(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "utf8-bom.txt")
+	data := append([]byte{0xEF, 0xBB, 0xBF}, []byte("hello")...)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	buf, err := LoadInMemoryBuffer(doc, 1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !buf.HasBOM || buf.Text != "hello" {
+		t.Fatalf("buffer = %+v, want stripped text with retained BOM policy", buf)
+	}
+	output := filepath.Join(dir, "utf8-bom-copy.txt")
+	if _, err := buf.WriteCopy(output, "edited"); err != nil {
+		t.Fatal(err)
+	}
+	written, err := os.ReadFile(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := append([]byte{0xEF, 0xBB, 0xBF}, []byte("edited")...)
+	if !bytes.Equal(written, want) {
+		t.Fatalf("output = % x, want % x", written, want)
+	}
+}
+
+func TestInMemoryWindowStartingAtZeroPreservesBOMInReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "utf8-bom.txt")
+	data := append([]byte{0xEF, 0xBB, 0xBF}, []byte("hello world")...)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	buf, err := LoadInMemoryWindow(doc, 0, 8, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start, end, encoded, err := buf.EncodedReplacement("HELLO")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if start != 0 || end != 8 {
+		t.Fatalf("range = [%d,%d), want [0,8)", start, end)
+	}
+	want := append([]byte{0xEF, 0xBB, 0xBF}, []byte("HELLO")...)
+	if !bytes.Equal(encoded, want) {
+		t.Fatalf("replacement = % x, want % x", encoded, want)
+	}
+}
+
+func TestLoadInMemoryWindowRejectsEverySplitUTF8RuneBoundary(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "utf8-boundaries.txt")
+	data := []byte("A¢€😀Z")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	for offset := 0; offset <= len(data); offset++ {
+		_, err := LoadInMemoryWindow(doc, int64(offset), int64(offset), 64)
+		continuation := offset < len(data) && data[offset]&0xC0 == 0x80
+		if continuation && !errors.Is(err, ErrTextRangeUnaligned) {
+			t.Fatalf("offset %d error = %v, want ErrTextRangeUnaligned", offset, err)
+		}
+		if !continuation && err != nil {
+			t.Fatalf("valid UTF-8 boundary %d rejected: %v", offset, err)
+		}
+	}
+}
+
+func TestLoadInMemoryWindowRejectsUTF16CodeUnitAndSurrogateSeams(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "utf16-boundaries.txt")
+	data := utf16LEWithBOM("A😀B")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	for _, offset := range []int64{1, 3, 5, 7, 9} {
+		if _, err := LoadInMemoryWindow(doc, offset, offset, 64); !errors.Is(err, ErrTextRangeUnaligned) {
+			t.Fatalf("odd offset %d error = %v, want code-unit alignment error", offset, err)
+		}
+	}
+	// BOM [0,2), A [2,4), high surrogate [4,6), low surrogate [6,8), B [8,10).
+	if _, err := LoadInMemoryWindow(doc, 6, 6, 64); !errors.Is(err, ErrTextRangeUnaligned) {
+		t.Fatalf("surrogate seam error = %v, want ErrTextRangeUnaligned", err)
+	}
+	for _, offset := range []int64{0, 2, 4, 8, 10} {
+		if _, err := LoadInMemoryWindow(doc, offset, offset, 64); err != nil {
+			t.Fatalf("valid UTF-16 boundary %d rejected: %v", offset, err)
+		}
 	}
 }
 

@@ -41,7 +41,7 @@ func TestFindNextMatchesInUTF16File(t *testing.T) {
 		t.Fatalf("encoding = %q, want UTF-16LE", meta.Encoding)
 	}
 
-	hit, err := svc.FindNext(meta.FileID, "users", 0, false, true, false)
+	hit, err := svc.findNext(meta.FileID, "users", 0, false, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -69,7 +69,7 @@ func TestFindNextRegexUnsupportedOnUTF16(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.CloseFile(meta.FileID)
-	hit, err := svc.FindNext(meta.FileID, "w.rld", 0, true, true, false)
+	hit, err := svc.findNext(meta.FileID, "w.rld", 0, true, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +87,7 @@ func TestFindNextPlainUTF8StillWorks(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer svc.CloseFile(meta.FileID)
-	hit, err := svc.FindNext(meta.FileID, "orders", 0, false, true, false)
+	hit, err := svc.findNext(meta.FileID, "orders", 0, false, true, false)
 	if err != nil {
 		t.Fatal(err)
 	}

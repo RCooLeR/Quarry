@@ -1,8 +1,8 @@
 package document
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -14,6 +14,26 @@ import (
 	"github.com/quarry/quarry-wails3/internal/encodingx"
 	"github.com/quarry/quarry-wails3/internal/lineindex"
 )
+
+func TestOpenFileDetectsUTF8WhenSampleEndsInsideRune(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "split-rune.txt")
+	content := bytes.Repeat([]byte{'a'}, openSampleSize-1)
+	content = append(content, []byte("€ tail")...)
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	if got := doc.Metadata().Encoding; got != "UTF-8" {
+		t.Fatalf("encoding = %q, want UTF-8", got)
+	}
+	if doc.Metadata().Binary {
+		t.Fatal("valid UTF-8 prefix seam was classified as binary")
+	}
+}
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "quarry-document-test-home-*")
@@ -246,6 +266,157 @@ func TestExactLineToOffsetAfterIndexing(t *testing.T) {
 	}
 }
 
+func TestLookupLineStartPreservesOffsetZeroAndPendingIndex(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pending-line-index.txt")
+	if err := os.WriteFile(path, []byte("one\ntwo\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+
+	lineOne, err := doc.LookupLineStart(context.Background(), 1, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lineOne.Status != LineStartLookupExact || !lineOne.HasPosition || lineOne.Line != 1 || lineOne.Offset != 0 {
+		t.Fatalf("line one lookup = %#v, want exact position at offset zero", lineOne)
+	}
+
+	pending, err := doc.LookupLineStart(context.Background(), 2, exactScanChunkSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.Status != LineStartLookupPending || pending.HasPosition {
+		t.Fatalf("pending lookup = %#v, want unavailable incomplete index", pending)
+	}
+}
+
+func TestLookupLineStartHardCapReturnsHonestHugeLineFallback(t *testing.T) {
+	const budget = int64(exactScanChunkSize + 37)
+	content := bytes.Repeat([]byte{'x'}, int(budget+1))
+	content = append(content, '\n', 'z')
+	path := filepath.Join(t.TempDir(), "huge-first-line.txt")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	if err := doc.StartIndexing(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	var requestedBytes int64
+	var readCalls int
+	lookup, err := doc.lookupLineStart(context.Background(), 2, budget, func(p []byte, off int64) (int, error) {
+		readCalls++
+		requestedBytes += int64(len(p))
+		return doc.ReadAt(p, off)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lookup.Status != LineStartLookupLimited || !lookup.HasPosition || lookup.Line != 1 || lookup.Offset != 0 {
+		t.Fatalf("lookup = %#v, want limited fallback to exact line 1 offset 0", lookup)
+	}
+	if requestedBytes != budget {
+		t.Fatalf("requested source bytes = %d, want hard cap %d", requestedBytes, budget)
+	}
+	if readCalls != 2 {
+		t.Fatalf("read calls = %d, want one full chunk plus one capped remainder", readCalls)
+	}
+}
+
+func TestLookupLineStartCancellationReturnsFallbackWithoutAnotherRead(t *testing.T) {
+	content := bytes.Repeat([]byte{'x'}, 2*exactScanChunkSize)
+	content = append(content, '\n', 'z')
+	path := filepath.Join(t.TempDir(), "cancel-exact-line.txt")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	if err := doc.StartIndexing(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var requestedBytes int64
+	var readCalls int
+	lookup, err := doc.lookupLineStart(ctx, 2, int64(len(content)), func(p []byte, off int64) (int, error) {
+		readCalls++
+		requestedBytes += int64(len(p))
+		n, readErr := doc.ReadAt(p, off)
+		cancel()
+		return n, readErr
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if lookup.Status != LineStartLookupLimited || !lookup.HasPosition || lookup.Line != 1 || lookup.Offset != 0 {
+		t.Fatalf("lookup = %#v, want cancellation fallback to line 1 offset 0", lookup)
+	}
+	if readCalls != 1 || requestedBytes != exactScanChunkSize {
+		t.Fatalf("reads = %d calls, %d bytes; want one %d-byte read", readCalls, requestedBytes, exactScanChunkSize)
+	}
+}
+
+func TestLookupLineStartCapEdgeEOFAndProvenMissing(t *testing.T) {
+	content := []byte("abc\n")
+	path := filepath.Join(t.TempDir(), "line-at-eof.txt")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	if err := doc.StartIndexing(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	limited, err := doc.LookupLineStart(context.Background(), 2, int64(len(content)-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if limited.Status != LineStartLookupLimited || limited.Line != 1 || limited.Offset != 0 {
+		t.Fatalf("below-edge lookup = %#v, want limited line 1 fallback", limited)
+	}
+
+	exact, err := doc.LookupLineStart(context.Background(), 2, int64(len(content)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exact.Status != LineStartLookupExact || !exact.HasPosition || exact.Line != 2 || exact.Offset != int64(len(content)) {
+		t.Fatalf("at-edge lookup = %#v, want exact empty line 2 at EOF", exact)
+	}
+
+	readCalls := 0
+	missing, err := doc.lookupLineStart(context.Background(), 3, 0, func([]byte, int64) (int, error) {
+		readCalls++
+		return 0, errors.New("unexpected read")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if missing.Status != LineStartLookupAbsent || missing.HasPosition {
+		t.Fatalf("missing lookup = %#v, want line proven absent", missing)
+	}
+	if readCalls != 0 {
+		t.Fatalf("proven-missing lookup issued %d source reads", readCalls)
+	}
+}
+
 func TestStartIndexingMarksEmptyDocumentDone(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "empty.txt")
@@ -453,24 +624,17 @@ func TestOpenFileDefersHugeIndexCacheHydrationUntilExplicitIndexing(t *testing.T
 		t.Fatal(err)
 	}
 
-	idx := lineindex.New(4096)
-	idx.MarkDone(42, info.Size())
-	data, err := json.MarshalIndent(indexCacheFile{
-		Version:         indexCacheVersion,
-		Path:            path,
-		Size:            info.Size(),
-		ModTimeUnixNano: info.ModTime().UnixNano(),
-		SampleHash:      sampleHash,
-		Index:           idx.Snapshot(),
-	}, "", "  ")
-	if err != nil {
+	idx := lineindex.New(lineindex.EveryLinesForSize(info.Size()))
+	if err := idx.RestoreSnapshot(lineindex.Snapshot{
+		EveryLines: idx.EveryLines,
+		Entries:    []lineindex.Entry{{Line: 1, Offset: 0}},
+		Lines:      42,
+		Bytes:      info.Size(),
+		Done:       true,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	cachePath := indexCachePath(path)
-	if err := os.MkdirAll(filepath.Dir(cachePath), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(cachePath, append(data, '\n'), 0o600); err != nil {
+	if err := saveIndexCache(path, info.Size(), info.ModTime(), sampleHash, idx); err != nil {
 		t.Fatal(err)
 	}
 
@@ -516,48 +680,15 @@ func openProgressStagesContain(stages []OpenStage, want OpenStage) bool {
 	return false
 }
 
-func TestOpenFileFallsBackToLegacyIndexCache(t *testing.T) {
+func TestOpenFileIgnoresLegacySourceAdjacentIndexCache(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "legacy-index.txt")
 	body := []byte("one\ntwo\nthree\nfour\n")
 	if err := os.WriteFile(path, body, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sample := make([]byte, len(body))
-	n, err := file.ReadAt(sample, 0)
-	if err != nil && !errors.Is(err, io.EOF) {
-		_ = file.Close()
-		t.Fatal(err)
-	}
-	sample = sample[:n]
-	sampleHash := computeIndexSampleHash(file, info.Size(), sample)
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	idx := lineindex.New(4096)
-	if err := idx.Build(context.Background(), strings.NewReader(string(body))); err != nil {
-		t.Fatal(err)
-	}
-	data, err := json.MarshalIndent(indexCacheFile{
-		Version:         indexCacheVersion,
-		Path:            path,
-		Size:            info.Size(),
-		ModTimeUnixNano: info.ModTime().UnixNano(),
-		SampleHash:      sampleHash,
-		Index:           idx.Snapshot(),
-	}, "", "  ")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(legacyIndexCachePath(path), append(data, '\n'), 0o600); err != nil {
+	legacyPayload := []byte(`{"version":2,"path":"retired-source-adjacent-format"}`)
+	if err := os.WriteFile(legacyIndexCachePath(path), legacyPayload, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -566,8 +697,8 @@ func TestOpenFileFallsBackToLegacyIndexCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer doc.Close()
-	if progress := doc.IndexProgress(); !progress.Done {
-		t.Fatalf("progress = %#v, want legacy cached done index", progress)
+	if progress := doc.IndexProgress(); progress.Done {
+		t.Fatalf("progress = %#v, legacy source-adjacent cache must be ignored", progress)
 	}
 }
 
@@ -653,6 +784,47 @@ func TestInspectExternalModificationReturnsFalseWhenUnchanged(t *testing.T) {
 	}
 	if changed {
 		t.Fatal("expected unchanged file to stay unchanged")
+	}
+}
+
+func TestInspectExternalModificationDetectsSameMetadataPathReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "source.txt")
+	held := filepath.Join(dir, "source.held")
+	original := []byte("alpha\n")
+	replacement := []byte("bravo\n")
+	if err := os.WriteFile(path, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	opened, err := doc.OpenedFileInfo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, replacement, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, opened.ModTime(), opened.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+
+	change, changed, err := doc.InspectExternalModification()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("same-size, same-mtime pathname replacement was reported unchanged")
+	}
+	if change.Original.Size != change.Current.Size || !change.Original.ModTime.Equal(change.Current.ModTime) {
+		t.Fatalf("replacement metadata = %#v, want original metadata %#v", change.Current, change.Original)
 	}
 }
 
@@ -1319,6 +1491,54 @@ func TestExactOffsetToLineAfterIndex(t *testing.T) {
 	}
 }
 
+func TestExactOffsetToLineWithinRejectsBeforeReadAndCapsExactIO(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "exact-offset-bounded.log")
+	content := []byte(strings.Repeat("x", 128) + "\n")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+	doc.idx.EveryLines = 4096
+	if err := doc.StartIndexing(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	const offset int64 = 96
+	readCalls := 0
+	line, ok, err := doc.exactOffsetToLine(offset, 99, func([]byte, int64) (int, error) {
+		readCalls++
+		return 0, errors.New("bounded lookup issued unexpected source I/O")
+	})
+	if err != nil || ok || line != 0 {
+		t.Fatalf("over-budget lookup = line:%d ok:%v err:%v, want 0 false nil", line, ok, err)
+	}
+	if readCalls != 0 {
+		t.Fatalf("over-budget lookup issued %d reads, want zero", readCalls)
+	}
+
+	readBytes := 0
+	line, ok, err = doc.exactOffsetToLine(offset, 100, func(p []byte, off int64) (int, error) {
+		readBytes += len(p)
+		return doc.ReadAt(p, off)
+	})
+	if err != nil || !ok || line != 1 {
+		t.Fatalf("at-budget lookup = line:%d ok:%v err:%v, want 1 true nil", line, ok, err)
+	}
+	if readBytes != 100 {
+		t.Fatalf("at-budget lookup requested %d bytes, want the exact 100-byte scan plus lookahead budget", readBytes)
+	}
+
+	if _, _, err := doc.ExactOffsetToLineWithin(offset, -1); err == nil {
+		t.Fatal("negative exact offset scan budget accepted")
+	}
+}
+
 func TestExactOffsetToLineStoresForwardMemo(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "exact-offset-memo.log")
@@ -1552,6 +1772,80 @@ func TestCloseStopsAndWaitsForPriorityIndexWorker(t *testing.T) {
 
 	if _, err := doc.ReadRange(0, 1); !errors.Is(err, errDocumentClosed) {
 		t.Fatalf("ReadRange after Close error = %v, want errDocumentClosed", err)
+	}
+}
+
+func TestCloseWaitsForFirstPriorityRequestRegistration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "priority-first-request-close.log")
+	if err := os.WriteFile(path, []byte("one\ntwo\nthree\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	doc, err := OpenFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold the request immediately before its lazy worker registration. The
+	// request must retain lifecycleMu's read side here so Close cannot reach its
+	// zero-counter Wait until registration and enqueue are complete.
+	doc.priorityMu.Lock()
+	requestDone := make(chan struct{})
+	go func() {
+		doc.RequestPriorityIndex(0)
+		close(requestDone)
+	}()
+
+	barrierHeld := false
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if !doc.lifecycleMu.TryLock() {
+			barrierHeld = true
+			break
+		}
+		doc.lifecycleMu.Unlock()
+		time.Sleep(time.Millisecond)
+	}
+	if !barrierHeld {
+		doc.priorityMu.Unlock()
+		<-requestDone
+		_ = doc.Close()
+		t.Fatal("priority request did not retain the lifecycle barrier before worker registration")
+	}
+
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- doc.Close() }()
+	select {
+	case err := <-closeDone:
+		doc.priorityMu.Unlock()
+		<-requestDone
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Fatal("Close returned while the first priority request was not registered")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	doc.priorityMu.Unlock()
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		t.Fatal("priority request did not finish after its registration barrier was released")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close did not finish after the first priority request registered")
+	}
+
+	select {
+	case got := <-doc.priorityRequests:
+		t.Fatalf("closed document retained priority request at offset %d", got)
+	default:
 	}
 }
 

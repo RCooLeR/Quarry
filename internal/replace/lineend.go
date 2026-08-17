@@ -12,9 +12,12 @@ import (
 
 const lineEndingDetectSampleSize = 1024 * 1024
 
-// ConvertLineEndingsFile rewrites a text file with the requested line-ending style
+// convertLineEndingsFile rewrites a text file with the requested line-ending style
 // while preserving the detected encoding and the original-only safety model.
-func ConvertLineEndingsFile(ctx context.Context, sourcePath string, outputPath string, target string, opts FileOptions) (FileSummary, error) {
+func convertLineEndingsFile(ctx context.Context, sourcePath string, outputPath string, target string, opts FileOptions) (FileSummary, error) {
+	if opts.SwapOriginal {
+		return FileSummary{}, ErrSwapOriginalDisabled
+	}
 	same, err := samePath(sourcePath, outputPath)
 	if err != nil {
 		return FileSummary{}, err
@@ -82,12 +85,20 @@ func ConvertLineEndingsFile(ctx context.Context, sourcePath string, outputPath s
 		return summary, err
 	}
 	detected := encodingx.DetectSample(sample)
+	if int64(len(sample)) < st.Size() {
+		detected = encodingx.DetectPrefixSample(sample)
+	}
+	if detected.RequiresConfirmation {
+		return summary, encodingx.ErrEncodingConfirmationRequired
+	}
 	bomLen := int64(len(encodingx.BOMBytes(detected.Name)))
+	processedBOMBytes := int64(0)
 
 	if detected.HasBOM {
 		if _, err := src.Seek(bomLen, io.SeekStart); err != nil {
 			return summary, err
 		}
+		processedBOMBytes = bomLen
 	} else if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return summary, err
 	}
@@ -119,7 +130,7 @@ func ConvertLineEndingsFile(ctx context.Context, sourcePath string, outputPath s
 	progressReader := &progressReader{
 		reader:    src,
 		total:     st.Size(),
-		processed: bomLen,
+		processed: processedBOMBytes,
 		report: func(processed int64) {
 			manifest.BytesProcessed = processed
 			if opts.Progress != nil {
@@ -167,6 +178,17 @@ func ConvertLineEndingsFile(ctx context.Context, sourcePath string, outputPath s
 			})
 		}
 	})
+	if convertErr == nil {
+		manifest.BytesProcessed = st.Size()
+		manifest.Matches = conversions
+		if opts.Progress != nil {
+			opts.Progress(Progress{
+				BytesProcessed: st.Size(),
+				BytesTotal:     st.Size(),
+				Matches:        conversions,
+			})
+		}
+	}
 	closeErr, _ := closeWriter(encodedWriter)
 	dstCloseErr := error(nil)
 	if !writerIsDestination {
@@ -189,7 +211,7 @@ func ConvertLineEndingsFile(ctx context.Context, sourcePath string, outputPath s
 		return summary, err
 	}
 
-	if err := renamePath(summary.TempPath, outputPath); err != nil {
+	if err := publishLegacyOutput(&summary, outputPath); err != nil {
 		writeFailedManifest(summary.ManifestPath, &manifest, err)
 		return summary, err
 	}
@@ -254,8 +276,12 @@ func rewriteLineEndings(ctx context.Context, src io.Reader, dst io.Writer, targe
 		if len(out) == 0 {
 			return nil
 		}
-		if _, err := dst.Write(out); err != nil {
+		written, err := dst.Write(out)
+		if err != nil {
 			return err
+		}
+		if written != len(out) {
+			return io.ErrShortWrite
 		}
 		out = out[:0]
 		return nil
@@ -264,9 +290,6 @@ func rewriteLineEndings(ctx context.Context, src io.Reader, dst io.Writer, targe
 	emitTarget := func() {
 		out = append(out, target...)
 		conversions++
-		if onConvert != nil {
-			onConvert(conversions)
-		}
 	}
 
 	for {
@@ -302,11 +325,17 @@ func rewriteLineEndings(ctx context.Context, src io.Reader, dst io.Writer, targe
 					return conversions, err
 				}
 			}
+			if onConvert != nil {
+				onConvert(conversions)
+			}
 		}
 
 		if errors.Is(err, io.EOF) {
 			if pendingCR {
 				emitTarget()
+			}
+			if onConvert != nil {
+				onConvert(conversions)
 			}
 			if err := flushOut(); err != nil {
 				return conversions, err

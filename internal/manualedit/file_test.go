@@ -2,24 +2,26 @@ package manualedit
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
-	"time"
+
+	"github.com/quarry/quarry-wails3/internal/document"
+	"github.com/quarry/quarry-wails3/internal/fileio"
 )
 
-func TestApplyFileEditWritesNewOutput(t *testing.T) {
+func TestApplyFileEditPublishesExactCopyWithoutManifestOrNamedScratch(t *testing.T) {
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "edited.txt")
-	if err := os.WriteFile(srcPath, []byte("alpha bravo charlie"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	sourcePath := filepath.Join(dir, "source.txt")
+	// A leading space is intentional: selected output paths must be used exactly,
+	// not trimmed or reconstructed from a normalized display value.
+	outputPath := filepath.Join(dir, " edited copy.txt")
+	writeManualTestFile(t, sourcePath, []byte("alpha bravo charlie"))
 
-	summary, err := ApplyFileEdit(context.Background(), srcPath, outPath, Edit{
+	summary, err := ApplyFileEdit(context.Background(), sourcePath, outputPath, Edit{
 		Start: 6,
 		End:   11,
 		Text:  []byte("delta"),
@@ -27,436 +29,412 @@ func TestApplyFileEditWritesNewOutput(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.BytesWritten != int64(len("alpha delta charlie")) {
-		t.Fatalf("bytes written = %d", summary.BytesWritten)
+	if summary.OutputPath != outputPath {
+		t.Fatalf("OutputPath = %q, want exact %q", summary.OutputPath, outputPath)
 	}
+	if summary.TempPath != "" || summary.ManifestPath != "" {
+		t.Fatalf("copy-only save exposed temp/manifest paths: %+v", summary)
+	}
+	if summary.BackupPath != "" || summary.Swapped {
+		t.Fatalf("copy-only save reported source replacement: %+v", summary)
+	}
+	if !summary.Complete || !summary.Published {
+		t.Fatalf("successful summary is not complete/published: %+v", summary)
+	}
+	want := "alpha delta charlie"
+	if summary.BytesWritten != int64(len(want)) {
+		t.Fatalf("BytesWritten = %d, want %d", summary.BytesWritten, len(want))
+	}
+	assertManualFileContent(t, sourcePath, "alpha bravo charlie")
+	assertManualFileContent(t, outputPath, want)
+	assertManualDirEntries(t, dir, filepath.Base(sourcePath), filepath.Base(outputPath))
 
-	got, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "alpha delta charlie" {
-		t.Fatalf("output = %q", string(got))
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(outputPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("output mode = %o, want 0600", got)
+		}
 	}
 }
 
-func TestApplyFileEditSwapOriginalCreatesBackup(t *testing.T) {
+func TestWriteSessionToFilePublishesExactStagedEdits(t *testing.T) {
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "edited.txt")
-	backupPath := filepath.Join(dir, "source.txt.bak")
-	if err := os.WriteFile(srcPath, []byte("hello world"), 0o600); err != nil {
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "session.txt")
+	const source = "alpha bravo charlie"
+	writeManualTestFile(t, sourcePath, []byte(source))
+
+	session := newBoundManualTestSession(t, sourcePath, 1)
+	if err := session.ApplyVerifiedEdit(Edit{Start: 6, End: 11, Text: []byte("delta")}, []byte("bravo")); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.ApplyVerifiedEdit(Edit{Start: 0, End: 0, Text: []byte(">> ")}, nil); err != nil {
 		t.Fatal(err)
 	}
 
-	summary, err := ApplyFileEdit(context.Background(), srcPath, outPath, Edit{
-		Start: 5,
-		End:   5,
-		Text:  []byte(" brave"),
-	}, FileOptions{
+	summary, err := WriteSessionToFile(context.Background(), sourcePath, outputPath, session, FileOptions{SourceGeneration: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := ">> alpha delta charlie"
+	if summary.OutputPath != outputPath || summary.BytesWritten != int64(len(want)) || !summary.Complete || !summary.Published {
+		t.Fatalf("summary = %+v, want exact completed publication", summary)
+	}
+	assertManualFileContent(t, sourcePath, source)
+	assertManualFileContent(t, outputPath, want)
+}
+
+func TestSwapOriginalFailsBeforeAnyFilesystemAccess(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	backupPath := filepath.Join(dir, "backup.txt")
+	writeManualTestFile(t, sourcePath, []byte("source sentinel"))
+	writeManualTestFile(t, outputPath, []byte("output sentinel"))
+	writeManualTestFile(t, backupPath, []byte("backup sentinel"))
+
+	originalOpenSource := openSourceFile
+	originalOpenAtomic := openAtomicOutput
+	openSourceCalls := 0
+	openAtomicCalls := 0
+	openSourceFile = func(string) (*os.File, error) {
+		openSourceCalls++
+		return nil, errors.New("unexpected source open")
+	}
+	openAtomicOutput = func(string, []string, os.FileMode) (atomicOutput, error) {
+		openAtomicCalls++
+		return nil, errors.New("unexpected output open")
+	}
+	t.Cleanup(func() {
+		openSourceFile = originalOpenSource
+		openAtomicOutput = originalOpenAtomic
+	})
+
+	applySummary, err := ApplyFileEdit(context.Background(), sourcePath, outputPath, Edit{
+		Start: 0,
+		End:   1,
+		Text:  []byte("x"),
+	}, FileOptions{SwapOriginal: true, BackupPath: backupPath})
+	if !errors.Is(err, ErrSwapOriginalDisabled) {
+		t.Fatalf("ApplyFileEdit error = %v, want ErrSwapOriginalDisabled", err)
+	}
+	if applySummary.OutputPath != outputPath || applySummary.Published || applySummary.Complete {
+		t.Fatalf("ApplyFileEdit summary = %+v", applySummary)
+	}
+
+	session := NewSession(int64(len("source sentinel")), DefaultMaxInsertedBytes)
+	if err := session.ApplyEdit(Edit{Start: 0, End: 1, Text: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	sessionSummary, err := WriteSessionToFile(context.Background(), sourcePath, outputPath, session, FileOptions{
 		SwapOriginal: true,
 		BackupPath:   backupPath,
 	})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrSwapOriginalDisabled) {
+		t.Fatalf("WriteSessionToFile error = %v, want ErrSwapOriginalDisabled", err)
 	}
-	if !summary.Swapped {
-		t.Fatal("expected swapped summary")
+	if sessionSummary.OutputPath != outputPath || sessionSummary.Published || sessionSummary.Complete {
+		t.Fatalf("WriteSessionToFile summary = %+v", sessionSummary)
 	}
+	if openSourceCalls != 0 || openAtomicCalls != 0 {
+		t.Fatalf("disabled swap touched filesystem seams: source opens=%d output opens=%d", openSourceCalls, openAtomicCalls)
+	}
+	assertManualFileContent(t, sourcePath, "source sentinel")
+	assertManualFileContent(t, outputPath, "output sentinel")
+	assertManualFileContent(t, backupPath, "backup sentinel")
+}
 
-	current, err := os.ReadFile(srcPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(current) != "hello brave world" {
-		t.Fatalf("source = %q", string(current))
-	}
+func TestApplyFileEditCancellationNeverPublishesOrPreservesPartial(t *testing.T) {
+	for _, deletePartial := range []bool{false, true} {
+		t.Run("delete-partial-"+map[bool]string{false: "false", true: "true"}[deletePartial], func(t *testing.T) {
+			dir := t.TempDir()
+			sourcePath := filepath.Join(dir, "source.txt")
+			outputPath := filepath.Join(dir, "output.txt")
+			writeManualTestFile(t, sourcePath, []byte(strings.Repeat("abcdef", 4096)))
 
-	backup, err := os.ReadFile(backupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(backup) != "hello world" {
-		t.Fatalf("backup = %q", string(backup))
+			ctx, cancel := context.WithCancel(context.Background())
+			summary, err := ApplyFileEdit(ctx, sourcePath, outputPath, Edit{
+				Start: 0,
+				End:   0,
+				Text:  []byte("prefix\n"),
+			}, FileOptions{
+				DeletePartialOnCancel: deletePartial,
+				Progress: func(Progress) {
+					cancel()
+				},
+			})
+			if !errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, want context.Canceled", err)
+			}
+			if summary.Complete || summary.Published || summary.TempPath != "" || summary.ManifestPath != "" {
+				t.Fatalf("canceled summary = %+v", summary)
+			}
+			if _, err := os.Lstat(outputPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("final output exists after cancellation: %v", err)
+			}
+			assertManualDirEntries(t, dir, filepath.Base(sourcePath))
+		})
 	}
 }
 
-func TestApplyFileEditCancelDeletesPartialOutput(t *testing.T) {
+func TestApplyFileEditCancellationAfterExactStreamStillPreventsPublication(t *testing.T) {
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "edited.txt")
-	if err := os.WriteFile(srcPath, []byte(strings.Repeat("abcdef", 4096)), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	const source = "replace all of this"
+	writeManualTestFile(t, sourcePath, []byte(source))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	summary, err := ApplyFileEdit(ctx, srcPath, outPath, Edit{
+	summary, err := ApplyFileEdit(ctx, sourcePath, outputPath, Edit{
 		Start: 0,
-		End:   0,
-		Text:  []byte("prefix\n"),
-	}, FileOptions{
-		DeletePartialOnCancel: true,
-		Progress: func(Progress) {
-			cancel()
-		},
-	})
+		End:   int64(len(source)),
+		Text:  []byte("complete bytes, canceled before commit"),
+	}, FileOptions{Progress: func(Progress) { cancel() }})
 	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
+		t.Fatalf("error = %v, want context.Canceled", err)
 	}
-	if _, err := os.Stat(summary.TempPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temp output should be deleted, stat err = %v", err)
+	if summary.Complete || summary.Published {
+		t.Fatalf("canceled pre-publication summary = %+v", summary)
 	}
-	manifest := readManualEditManifest(t, summary.ManifestPath)
-	if manifest.Status != "canceled" || !strings.Contains(manifest.Error, context.Canceled.Error()) {
-		t.Fatalf("manifest status/error = %q/%q, want canceled", manifest.Status, manifest.Error)
+	if _, err := os.Lstat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("final output exists after cancellation: %v", err)
+	}
+	assertManualFileContent(t, sourcePath, source)
+	assertManualDirEntries(t, dir, filepath.Base(sourcePath))
+}
+
+func TestManualEditRefusesExistingDestinationWithoutChangingIt(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	writeManualTestFile(t, sourcePath, []byte("source sentinel"))
+	writeManualTestFile(t, outputPath, []byte("destination sentinel"))
+
+	summary, err := ApplyFileEdit(context.Background(), sourcePath, outputPath, Edit{
+		Start: 0,
+		End:   6,
+		Text:  []byte("edited"),
+	}, FileOptions{})
+	if !errors.Is(err, fileio.ErrExists) {
+		t.Fatalf("error = %v, want fileio.ErrExists", err)
+	}
+	if summary.Complete || summary.Published || summary.BytesWritten != 0 {
+		t.Fatalf("existing-destination summary = %+v", summary)
+	}
+	assertManualFileContent(t, sourcePath, "source sentinel")
+	assertManualFileContent(t, outputPath, "destination sentinel")
+	assertManualDirEntries(t, dir, filepath.Base(sourcePath), filepath.Base(outputPath))
+}
+
+func TestManualEditRefusesSourceAliases(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.txt")
+	writeManualTestFile(t, sourcePath, []byte("source sentinel"))
+
+	tests := []struct {
+		name   string
+		output func(t *testing.T) string
+	}{
+		{name: "same path", output: func(*testing.T) string { return sourcePath }},
+		{name: "hard link", output: func(t *testing.T) string {
+			path := filepath.Join(dir, "source-hard-link.txt")
+			if err := os.Link(sourcePath, path); err != nil {
+				t.Skipf("hard links unavailable: %v", err)
+			}
+			return path
+		}},
+		{name: "symbolic link", output: func(t *testing.T) string {
+			path := filepath.Join(dir, "source-symbolic-link.txt")
+			if err := os.Symlink(sourcePath, path); err != nil {
+				t.Skipf("symbolic links unavailable: %v", err)
+			}
+			return path
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputPath := tt.output(t)
+			summary, err := ApplyFileEdit(context.Background(), sourcePath, outputPath, Edit{
+				Start: 0,
+				End:   6,
+				Text:  []byte("edited"),
+			}, FileOptions{})
+			if !errors.Is(err, fileio.ErrSourceAlias) {
+				t.Fatalf("error = %v, want fileio.ErrSourceAlias", err)
+			}
+			if summary.Complete || summary.Published || summary.BytesWritten != 0 {
+				t.Fatalf("alias summary = %+v", summary)
+			}
+			assertManualFileContent(t, sourcePath, "source sentinel")
+		})
 	}
 }
 
-func TestApplyFileEditCancelKeepsPartialOutputWhenConfigured(t *testing.T) {
+func TestManualEditDestinationRaceCannotClobberCompetitor(t *testing.T) {
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "edited.txt")
-	if err := os.WriteFile(srcPath, []byte(strings.Repeat("abcdef", 4096)), 0o600); err != nil {
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	const source = "source sentinel"
+	const competitor = "competitor owns this pathname"
+	writeManualTestFile(t, sourcePath, []byte(source))
+
+	created := false
+	var createErr error
+	summary, err := ApplyFileEdit(context.Background(), sourcePath, outputPath, Edit{
+		Start: 0,
+		End:   int64(len(source)),
+		Text:  []byte("edited copy"),
+	}, FileOptions{Progress: func(Progress) {
+		if !created {
+			created = true
+			createErr = os.WriteFile(outputPath, []byte(competitor), 0o600)
+		}
+	}})
+	if createErr != nil {
+		t.Fatalf("create raced destination: %v", createErr)
+	}
+	if !errors.Is(err, fileio.ErrExists) {
+		t.Fatalf("error = %v, want raced fileio.ErrExists", err)
+	}
+	if summary.Complete || summary.Published {
+		t.Fatalf("raced-destination summary = %+v", summary)
+	}
+	assertManualFileContent(t, sourcePath, source)
+	assertManualFileContent(t, outputPath, competitor)
+	assertManualDirEntries(t, dir, filepath.Base(sourcePath), filepath.Base(outputPath))
+}
+
+func TestManualEditNeverDeletesLegacyOrUnownedScratchPaths(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	legacyTemp := outputPath + ".quarry.tmp"
+	legacyManifest := outputPath + ".quarry.manifest.json"
+	writeManualTestFile(t, sourcePath, []byte("alpha bravo"))
+	writeManualTestFile(t, legacyTemp, []byte("unowned temp sentinel"))
+	writeManualTestFile(t, legacyManifest, []byte("unowned manifest sentinel"))
+
+	if _, err := ApplyFileEdit(context.Background(), sourcePath, outputPath, Edit{
+		Start: 6,
+		End:   11,
+		Text:  []byte("delta"),
+	}, FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
+	assertManualFileContent(t, outputPath, "alpha delta")
+	assertManualFileContent(t, legacyTemp, "unowned temp sentinel")
+	assertManualFileContent(t, legacyManifest, "unowned manifest sentinel")
+}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	summary, err := ApplyFileEdit(ctx, srcPath, outPath, Edit{
-		Start: 0,
-		End:   0,
-		Text:  []byte("prefix\n"),
-	}, FileOptions{
-		DeletePartialOnCancel: false,
-		Progress: func(Progress) {
-			cancel()
-		},
-	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
+func TestWriteSessionToFileRejectsChangedSourceSizeBeforeOutputAllocation(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	const source = "alpha bravo charlie"
+	writeManualTestFile(t, sourcePath, []byte(source))
+
+	session := newBoundManualTestSession(t, sourcePath, 1)
+	if err := session.ApplyVerifiedEdit(Edit{Start: 0, End: 0, Text: []byte(">> ")}, nil); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(summary.TempPath); err != nil {
-		t.Fatalf("temp output should be preserved, stat err = %v", err)
+	writeManualTestFile(t, sourcePath, []byte("short"))
+
+	summary, err := WriteSessionToFile(context.Background(), sourcePath, outputPath, session, FileOptions{SourceGeneration: 1})
+	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
+		t.Fatalf("error = %v, want ErrSourceModifiedDuringOperation", err)
 	}
-	manifest := readManualEditManifest(t, summary.ManifestPath)
-	if manifest.Status != "canceled" || !strings.Contains(manifest.Error, context.Canceled.Error()) {
-		t.Fatalf("manifest status/error = %q/%q, want canceled", manifest.Status, manifest.Error)
+	if summary.BytesWritten != 0 || summary.Complete || summary.Published {
+		t.Fatalf("changed-source summary = %+v", summary)
+	}
+	if _, err := os.Lstat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("output exists after stale-session rejection: %v", err)
 	}
 }
 
-func TestApplyFileEditRejectsOversizedInsertedText(t *testing.T) {
+func TestApplyFileEditRejectsInvalidEditBeforeOutputAllocation(t *testing.T) {
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "edited.txt")
-	if err := os.WriteFile(srcPath, []byte("hello"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	writeManualTestFile(t, sourcePath, []byte("hello"))
 
-	_, err := ApplyFileEdit(context.Background(), srcPath, outPath, Edit{
+	summary, err := ApplyFileEdit(context.Background(), sourcePath, outputPath, Edit{
 		Start: 0,
 		End:   0,
 		Text:  []byte("toolong"),
-	}, FileOptions{
-		MaxInsertedBytes: 4,
-	})
+	}, FileOptions{MaxInsertedBytes: 4})
 	if !errors.Is(err, ErrInsertedTextTooLarge) {
-		t.Fatalf("err = %v, want ErrInsertedTextTooLarge", err)
+		t.Fatalf("error = %v, want ErrInsertedTextTooLarge", err)
+	}
+	if summary.BytesWritten != 0 || summary.Complete || summary.Published {
+		t.Fatalf("invalid-edit summary = %+v", summary)
+	}
+	if _, err := os.Lstat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("output exists after invalid edit: %v", err)
 	}
 }
 
-func TestApplyFileEditRenameFailureLeavesTempAndFailedManifest(t *testing.T) {
+func TestApplyFileEditValidatesEditBeforeFingerprintPass(t *testing.T) {
 	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "edited.txt")
-	if err := os.WriteFile(srcPath, []byte("alpha bravo charlie"), 0o600); err != nil {
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	writeManualTestFile(t, sourcePath, []byte("hello"))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	originalOpenSource := openSourceFile
+	openSourceFile = func(path string) (*os.File, error) {
+		file, err := originalOpenSource(path)
+		cancel()
+		return file, err
+	}
+	t.Cleanup(func() { openSourceFile = originalOpenSource })
+
+	_, err := ApplyFileEdit(ctx, sourcePath, outputPath, Edit{Text: []byte("toolong")}, FileOptions{MaxInsertedBytes: 4})
+	if !errors.Is(err, ErrInsertedTextTooLarge) {
+		t.Fatalf("error = %v, want edit validation before canceled fingerprint", err)
+	}
+	assertPathDoesNotExist(t, outputPath)
+}
+
+func TestApplyFileEditPreCanceledContextIsNotSourceDrift(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.txt")
+	outputPath := filepath.Join(dir, "output.txt")
+	writeManualTestFile(t, sourcePath, []byte("hello"))
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := ApplyFileEdit(ctx, sourcePath, outputPath, Edit{Start: 0, End: 1, Text: []byte("H")}, FileOptions{})
+	if !errors.Is(err, context.Canceled) || errors.Is(err, ErrSourceModifiedDuringOperation) {
+		t.Fatalf("error = %v, want only context cancellation", err)
+	}
+	assertPathDoesNotExist(t, outputPath)
+}
+
+func writeManualTestFile(t *testing.T, path string, data []byte) {
+	t.Helper()
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
-	}
-
-	renameErr := errors.New("forced rename failure")
-	oldRenamePath := renamePath
-	renamePath = func(old string, new string) error {
-		if old == outPath+".quarry.tmp" && new == outPath {
-			return renameErr
-		}
-		return oldRenamePath(old, new)
-	}
-	t.Cleanup(func() {
-		renamePath = oldRenamePath
-	})
-
-	summary, err := ApplyFileEdit(context.Background(), srcPath, outPath, Edit{
-		Start: 6,
-		End:   11,
-		Text:  []byte("delta"),
-	}, FileOptions{})
-	if !errors.Is(err, renameErr) {
-		t.Fatalf("err = %v, want forced rename failure", err)
-	}
-	assertFileContent(t, srcPath, "alpha bravo charlie")
-	if _, err := os.Stat(outPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("final output should not exist after rename failure, stat err = %v", err)
-	}
-	assertFileContent(t, summary.TempPath, "alpha delta charlie")
-
-	manifest := readManualEditManifest(t, summary.ManifestPath)
-	if manifest.Status != "failed" || !strings.Contains(manifest.Error, renameErr.Error()) {
-		t.Fatalf("manifest status/error = %q/%q, want failed rename", manifest.Status, manifest.Error)
 	}
 }
 
-func TestManualEditSaveRejectsBackupPathMatchingSource(t *testing.T) {
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	if err := os.WriteFile(srcPath, []byte("alpha bravo charlie"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := ApplyFileEdit(context.Background(), srcPath, filepath.Join(dir, "edited.txt"), Edit{
-		Start: 6,
-		End:   11,
-		Text:  []byte("delta"),
-	}, FileOptions{
-		SwapOriginal: true,
-		BackupPath:   srcPath,
-	})
-	if err == nil || !strings.Contains(err.Error(), "backup path must be different") {
-		t.Fatalf("ApplyFileEdit err = %v, want backup path rejection", err)
-	}
-
-	session := NewSession(int64(len("alpha bravo charlie")), DefaultMaxInsertedBytes)
-	if err := session.ApplyEdit(Edit{Start: 6, End: 11, Text: []byte("delta")}); err != nil {
-		t.Fatal(err)
-	}
-	_, err = WriteSessionToFile(context.Background(), srcPath, filepath.Join(dir, "session.txt"), session, FileOptions{
-		SwapOriginal: true,
-		BackupPath:   srcPath,
-	})
-	if err == nil || !strings.Contains(err.Error(), "backup path must be different") {
-		t.Fatalf("WriteSessionToFile err = %v, want backup path rejection", err)
-	}
-}
-
-func TestWriteSessionToFileWritesStagedEdits(t *testing.T) {
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "session.txt")
-	if err := os.WriteFile(srcPath, []byte("alpha bravo charlie"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	session := NewSession(int64(len("alpha bravo charlie")), DefaultMaxInsertedBytes)
-	if err := session.ApplyEdit(Edit{Start: 6, End: 11, Text: []byte("delta")}); err != nil {
-		t.Fatal(err)
-	}
-	if err := session.ApplyEdit(Edit{Start: 0, End: 0, Text: []byte(">> ")}); err != nil {
-		t.Fatal(err)
-	}
-
-	summary, err := WriteSessionToFile(context.Background(), srcPath, outPath, session, FileOptions{})
+func newBoundManualTestSession(t *testing.T, path string, generation uint64) *Session {
+	t.Helper()
+	doc, err := document.OpenFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.BytesWritten != int64(len(">> alpha delta charlie")) {
-		t.Fatalf("bytes written = %d", summary.BytesWritten)
-	}
-
-	got, err := os.ReadFile(outPath)
+	t.Cleanup(func() { _ = doc.Close() })
+	session, err := NewSourceBoundSession(doc, path, generation, DefaultLimits())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(got) != ">> alpha delta charlie" {
-		t.Fatalf("output = %q", string(got))
-	}
+	return session
 }
 
-// If the source file changes size between staging and the copy-through save, the
-// piece-table offsets are stale; the save must fail (not silently write a
-// truncated copy and report success) and must not leave a finished output.
-func TestWriteSessionToFileFailsWhenSourceSizeChanged(t *testing.T) {
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "session.txt")
-	original := "alpha bravo charlie delta"
-	if err := os.WriteFile(srcPath, []byte(original), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	session := NewSession(int64(len(original)), DefaultMaxInsertedBytes)
-	if err := session.ApplyEdit(Edit{Start: 0, End: 0, Text: []byte(">> ")}); err != nil {
-		t.Fatal(err)
-	}
-
-	// Source shrinks after staging (e.g. re-exported / truncated dump).
-	if err := os.WriteFile(srcPath, []byte("alpha"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := WriteSessionToFile(context.Background(), srcPath, outPath, session, FileOptions{})
-	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
-		t.Fatalf("err = %v, want ErrSourceModifiedDuringOperation", err)
-	}
-	if _, statErr := os.Stat(outPath); !os.IsNotExist(statErr) {
-		t.Fatalf("output file should not exist after a failed save, stat err = %v", statErr)
-	}
-}
-
-func TestWriteSessionToFileCancelDeletesPartialOutput(t *testing.T) {
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "session.txt")
-	if err := os.WriteFile(srcPath, []byte(strings.Repeat("abcdef", 4096)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	session := NewSession(int64(len(strings.Repeat("abcdef", 4096))), DefaultMaxInsertedBytes)
-	if err := session.ApplyEdit(Edit{Start: 0, End: 0, Text: []byte("prefix\n")}); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	summary, err := WriteSessionToFile(ctx, srcPath, outPath, session, FileOptions{
-		DeletePartialOnCancel: true,
-		Progress: func(Progress) {
-			cancel()
-		},
-	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
-	}
-	if _, err := os.Stat(summary.TempPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("temp output should be deleted, stat err = %v", err)
-	}
-	manifest := readManualEditManifest(t, summary.ManifestPath)
-	if manifest.Status != "canceled" || !strings.Contains(manifest.Error, context.Canceled.Error()) {
-		t.Fatalf("manifest status/error = %q/%q, want canceled", manifest.Status, manifest.Error)
-	}
-}
-
-func TestWriteSessionToFileCancelKeepsPartialOutputWhenConfigured(t *testing.T) {
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "session.txt")
-	content := strings.Repeat("abcdef", 4096)
-	if err := os.WriteFile(srcPath, []byte(content), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	session := NewSession(int64(len(content)), DefaultMaxInsertedBytes)
-	if err := session.ApplyEdit(Edit{Start: 0, End: 0, Text: []byte("prefix\n")}); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx, cancel := context.WithCancel(context.Background())
-	summary, err := WriteSessionToFile(ctx, srcPath, outPath, session, FileOptions{
-		DeletePartialOnCancel: false,
-		Progress: func(Progress) {
-			cancel()
-		},
-	})
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("err = %v, want context.Canceled", err)
-	}
-	if _, err := os.Stat(summary.TempPath); err != nil {
-		t.Fatalf("temp output should be preserved, stat err = %v", err)
-	}
-	manifest := readManualEditManifest(t, summary.ManifestPath)
-	if manifest.Status != "canceled" || !strings.Contains(manifest.Error, context.Canceled.Error()) {
-		t.Fatalf("manifest status/error = %q/%q, want canceled", manifest.Status, manifest.Error)
-	}
-}
-
-func TestWriteSessionToFileRenameFailureLeavesTempAndFailedManifest(t *testing.T) {
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "session.txt")
-	if err := os.WriteFile(srcPath, []byte("alpha bravo charlie"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	session := NewSession(int64(len("alpha bravo charlie")), DefaultMaxInsertedBytes)
-	if err := session.ApplyEdit(Edit{Start: 6, End: 11, Text: []byte("delta")}); err != nil {
-		t.Fatal(err)
-	}
-
-	renameErr := errors.New("forced rename failure")
-	oldRenamePath := renamePath
-	renamePath = func(old string, new string) error {
-		if old == outPath+".quarry.tmp" && new == outPath {
-			return renameErr
-		}
-		return oldRenamePath(old, new)
-	}
-	t.Cleanup(func() {
-		renamePath = oldRenamePath
-	})
-
-	summary, err := WriteSessionToFile(context.Background(), srcPath, outPath, session, FileOptions{})
-	if !errors.Is(err, renameErr) {
-		t.Fatalf("err = %v, want forced rename failure", err)
-	}
-	assertFileContent(t, srcPath, "alpha bravo charlie")
-	if _, err := os.Stat(outPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("final output should not exist after rename failure, stat err = %v", err)
-	}
-	assertFileContent(t, summary.TempPath, "alpha delta charlie")
-
-	manifest := readManualEditManifest(t, summary.ManifestPath)
-	if manifest.Status != "failed" || !strings.Contains(manifest.Error, renameErr.Error()) {
-		t.Fatalf("manifest status/error = %q/%q, want failed rename", manifest.Status, manifest.Error)
-	}
-}
-
-func TestWriteSessionToFileSwapSourceModifiedLeavesSourceAndOutput(t *testing.T) {
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "source.txt")
-	outPath := filepath.Join(dir, "session.txt")
-	backupPath := filepath.Join(dir, "source.txt.bak")
-	if err := os.WriteFile(srcPath, []byte("alpha bravo charlie"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	session := NewSession(int64(len("alpha bravo charlie")), DefaultMaxInsertedBytes)
-	if err := session.ApplyEdit(Edit{Start: 6, End: 11, Text: []byte("delta")}); err != nil {
-		t.Fatal(err)
-	}
-
-	oldStatPath := statPath
-	statPath = func(path string) (os.FileInfo, error) {
-		info, err := oldStatPath(path)
-		if err != nil {
-			return nil, err
-		}
-		if path == srcPath {
-			return fileInfoWithModTime{FileInfo: info, modTime: info.ModTime().Add(time.Hour)}, nil
-		}
-		return info, nil
-	}
-	t.Cleanup(func() {
-		statPath = oldStatPath
-	})
-
-	summary, err := WriteSessionToFile(context.Background(), srcPath, outPath, session, FileOptions{
-		SwapOriginal: true,
-		BackupPath:   backupPath,
-	})
-	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
-		t.Fatalf("err = %v, want ErrSourceModifiedDuringOperation", err)
-	}
-	if summary.Swapped {
-		t.Fatal("summary should not report swapped after source modification")
-	}
-	assertFileContent(t, srcPath, "alpha bravo charlie")
-	assertFileContent(t, outPath, "alpha delta charlie")
-	if _, err := os.Stat(backupPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup should not exist before a safe swap, stat err = %v", err)
-	}
-
-	manifest := readManualEditManifest(t, summary.ManifestPath)
-	if manifest.Status != "failed" || !strings.Contains(manifest.Error, ErrSourceModifiedDuringOperation.Error()) {
-		t.Fatalf("manifest status/error = %q/%q, want source-modified failure", manifest.Status, manifest.Error)
-	}
-}
-
-func assertFileContent(t *testing.T, path string, want string) {
+func assertManualFileContent(t *testing.T, path string, want string) {
 	t.Helper()
 	got, err := os.ReadFile(path)
 	if err != nil {
@@ -467,40 +445,30 @@ func assertFileContent(t *testing.T, path string, want string) {
 	}
 }
 
-func TestManifestProgressFlushPolicy(t *testing.T) {
-	started := time.Unix(100, 0)
-	if shouldFlushManifestProgress(0, 0, started, started.Add(10*manifestProgressFlushInterval)) {
-		t.Fatal("zero progress should not flush")
-	}
-	if !shouldFlushManifestProgress(manifestProgressFlushBytes, 0, started, started) {
-		t.Fatal("byte threshold should flush")
-	}
-	if !shouldFlushManifestProgress(1, 0, started, started.Add(manifestProgressFlushInterval)) {
-		t.Fatal("interval threshold should flush")
-	}
-	if shouldFlushManifestProgress(1, 0, started, started.Add(manifestProgressFlushInterval-time.Nanosecond)) {
-		t.Fatal("progress below byte and interval thresholds should not flush")
-	}
-}
-
-func readManualEditManifest(t *testing.T, path string) Manifest {
+func assertManualDirEntries(t *testing.T, dir string, want ...string) {
 	t.Helper()
-	data, err := os.ReadFile(path)
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var manifest Manifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		t.Fatal(err)
+	got := make(map[string]struct{}, len(entries))
+	for _, entry := range entries {
+		got[entry.Name()] = struct{}{}
 	}
-	return manifest
+	if len(got) != len(want) {
+		t.Fatalf("directory entries = %v, want %v", mapKeys(got), want)
+	}
+	for _, name := range want {
+		if _, ok := got[name]; !ok {
+			t.Fatalf("directory entries = %v, missing %q", mapKeys(got), name)
+		}
+	}
 }
 
-type fileInfoWithModTime struct {
-	os.FileInfo
-	modTime time.Time
-}
-
-func (f fileInfoWithModTime) ModTime() time.Time {
-	return f.modTime
+func mapKeys(values map[string]struct{}) []string {
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	return keys
 }

@@ -134,7 +134,7 @@ func TestReplaceBatchPlainPriorityAndConflicts(t *testing.T) {
 		{Name: "Rule 1", Find: []byte("abc"), Replace: []byte("X"), Priority: 0},
 		{Name: "Rule 2", Find: []byte("abcd"), Replace: []byte("Y"), Priority: 1},
 	}
-	matches, conflicts, err := ReplaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{ChunkSize: 4})
+	matches, conflicts, err := replaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{ChunkSize: 4})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,7 +179,7 @@ func TestReplaceBatchPlainBoundaryAndWholeWord(t *testing.T) {
 	rules := []BatchRule{
 		{Name: "Rule 1", Find: []byte("cat"), Replace: []byte("dog"), Priority: 0},
 	}
-	matches, conflicts, err := ReplaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
+	matches, conflicts, err := replaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
 		ChunkSize:       5,
 		CaseInsensitive: true,
 		WholeWord:       true,
@@ -229,7 +229,7 @@ func TestReplaceBatchPlainCaseInsensitiveUsesByteStableASCIIFold(t *testing.T) {
 	rules := []BatchRule{
 		{Name: "Kelvin", Find: []byte("kelvin"), Replace: []byte("FOUND"), Priority: 0},
 	}
-	matches, conflicts, err := ReplaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
+	matches, conflicts, err := replaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
 		ChunkSize:       8,
 		CaseInsensitive: true,
 	})
@@ -278,7 +278,7 @@ func TestReplaceBatchPlainWholeWordUsesUnicodeBoundaries(t *testing.T) {
 	rules := []BatchRule{
 		{Name: "Cyrillic", Find: []byte("кот"), Replace: []byte("dog"), Priority: 0},
 	}
-	matches, conflicts, err := ReplaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
+	matches, conflicts, err := replaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
 		ChunkSize: 8,
 		WholeWord: true,
 	})
@@ -375,7 +375,7 @@ func TestReplaceBatchPlainFileWritesOutputAndManifest(t *testing.T) {
 		{Name: "Rule 1", Find: []byte("abc"), Replace: []byte("X"), Priority: 0},
 		{Name: "Rule 2", Find: []byte("abcd"), Replace: []byte("Y"), Priority: 1},
 	}
-	summary, err := ReplaceBatchPlainFile(context.Background(), srcPath, outPath, rules, FileOptions{
+	summary, err := replaceBatchPlainFile(context.Background(), srcPath, outPath, rules, FileOptions{
 		ChunkSize: 4,
 	}, BatchOptions{
 		ChunkSize: 4,
@@ -438,7 +438,7 @@ func TestReplaceBatchPlainFileUsesWholeSourceWhileEditableSliceIsDirty(t *testin
 	rules := []BatchRule{
 		{Name: "Remove definer", Find: []byte("DEFINER=`root`@`localhost` "), Replace: nil, Priority: 0},
 	}
-	summary, err := ReplaceBatchPlainFile(context.Background(), srcPath, outPath, rules, FileOptions{
+	summary, err := replaceBatchPlainFile(context.Background(), srcPath, outPath, rules, FileOptions{
 		ChunkSize: 8,
 	}, BatchOptions{
 		ChunkSize: 8,
@@ -484,7 +484,7 @@ func TestReplaceBatchPlainFileCancelDeletesPartialWhenRequested(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplaceBatchPlainFile(ctx, srcPath, outPath, rules, FileOptions{
+	summary, err := replaceBatchPlainFile(ctx, srcPath, outPath, rules, FileOptions{
 		ChunkSize:             32,
 		DeletePartialOnCancel: true,
 	}, BatchOptions{
@@ -526,7 +526,7 @@ func TestReplaceBatchPlainFileCancelKeepsPartialWhenConfigured(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplaceBatchPlainFile(ctx, srcPath, outPath, rules, FileOptions{
+	summary, err := replaceBatchPlainFile(ctx, srcPath, outPath, rules, FileOptions{
 		ChunkSize:             32,
 		DeletePartialOnCancel: false,
 	}, BatchOptions{
@@ -560,7 +560,7 @@ func TestReplaceBatchPlainFileCancelKeepsPartialWhenConfigured(t *testing.T) {
 func TestPreviewBatchRegexp(t *testing.T) {
 	r := memReaderAt{data: []byte("alpha hello-42 world and abcde")}
 	rules := []BatchRule{
-		{Name: "Greeting", Find: []byte(`hello-(\d+)`), Replace: []byte(`bye-$1`), Priority: 0},
+		{Name: "Greeting", Find: []byte(`hello-(\d{2})`), Replace: []byte(`bye-$1`), Priority: 0},
 		{Name: "Prefix", Find: []byte(`abc`), Replace: []byte("X"), Priority: 0},
 		{Name: "Longer", Find: []byte(`abcde`), Replace: []byte("Y"), Priority: 1},
 	}
@@ -629,7 +629,7 @@ func TestReplaceBatchRegexpPriorityAndConflicts(t *testing.T) {
 		{Name: "Rule 1", Find: []byte(`abc`), Replace: []byte("X"), Priority: 0},
 		{Name: "Rule 2", Find: []byte(`abcd`), Replace: []byte("Y"), Priority: 1},
 	}
-	matches, conflicts, err := ReplaceBatchRegexp(context.Background(), src, dst, rules, RegexOptions{
+	matches, conflicts, err := replaceBatchRegexp(context.Background(), src, dst, rules, RegexOptions{
 		ChunkSize:      4,
 		MaxMatchWindow: 8,
 	})
@@ -677,7 +677,7 @@ func TestReplaceBatchRegexpRejectsEmptyMatchPattern(t *testing.T) {
 	rules := []BatchRule{
 		{Name: "Empty", Find: []byte(`a*`), Replace: []byte(""), Priority: 0},
 	}
-	if _, _, err := ReplaceBatchRegexp(context.Background(), src, dst, rules, RegexOptions{}); err == nil {
+	if _, _, err := replaceBatchRegexp(context.Background(), src, dst, rules, RegexOptions{}); err == nil {
 		t.Fatal("expected empty-match regex rejection")
 	}
 }
@@ -705,9 +705,9 @@ func TestReplaceBatchRegexpCaptureGroupsAcrossBoundary(t *testing.T) {
 	}
 
 	rules := []BatchRule{
-		{Name: "Rule 1", Find: []byte(`id=(\d+)`), Replace: []byte(`row-$1`), Priority: 0},
+		{Name: "Rule 1", Find: []byte(`id=(\d{2})`), Replace: []byte(`row-$1`), Priority: 0},
 	}
-	matches, conflicts, err := ReplaceBatchRegexp(context.Background(), src, dst, rules, RegexOptions{
+	matches, conflicts, err := replaceBatchRegexp(context.Background(), src, dst, rules, RegexOptions{
 		ChunkSize:      5,
 		MaxMatchWindow: 8,
 	})
@@ -739,9 +739,9 @@ func TestReplaceBatchRegexpFileWritesOutputAndManifest(t *testing.T) {
 	}
 
 	rules := []BatchRule{
-		{Name: "Rule 1", Find: []byte(`id=(\d+)`), Replace: []byte(`row-$1`), Priority: 0},
+		{Name: "Rule 1", Find: []byte(`id=(\d{2})`), Replace: []byte(`row-$1`), Priority: 0},
 	}
-	summary, err := ReplaceBatchRegexpFile(context.Background(), srcPath, outPath, rules, FileOptions{
+	summary, err := replaceBatchRegexpFile(context.Background(), srcPath, outPath, rules, FileOptions{
 		ChunkSize: 5,
 	}, RegexOptions{
 		ChunkSize:      5,
@@ -780,11 +780,11 @@ func TestReplaceBatchRegexpFileCancelDeletesPartialWhenRequested(t *testing.T) {
 	}
 
 	rules := []BatchRule{
-		{Name: "Rule 1", Find: []byte(`id=(\d+)`), Replace: []byte(`row-$1`), Priority: 0},
+		{Name: "Rule 1", Find: []byte(`id=(\d{2})`), Replace: []byte(`row-$1`), Priority: 0},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplaceBatchRegexpFile(ctx, srcPath, outPath, rules, FileOptions{
+	summary, err := replaceBatchRegexpFile(ctx, srcPath, outPath, rules, FileOptions{
 		ChunkSize:             8,
 		DeletePartialOnCancel: true,
 	}, RegexOptions{
@@ -822,11 +822,11 @@ func TestReplaceBatchRegexpFileCancelKeepsPartialWhenConfigured(t *testing.T) {
 	}
 
 	rules := []BatchRule{
-		{Name: "Rule 1", Find: []byte(`id=(\d+)`), Replace: []byte(`row-$1`), Priority: 0},
+		{Name: "Rule 1", Find: []byte(`id=(\d{2})`), Replace: []byte(`row-$1`), Priority: 0},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplaceBatchRegexpFile(ctx, srcPath, outPath, rules, FileOptions{
+	summary, err := replaceBatchRegexpFile(ctx, srcPath, outPath, rules, FileOptions{
 		ChunkSize:             8,
 		DeletePartialOnCancel: false,
 	}, RegexOptions{
@@ -879,7 +879,7 @@ func TestReplaceBatchPlainWholeWordChunkInvariantAtBoundary(t *testing.T) {
 			_ = src.Close()
 		}()
 		dst := &fuzzSyncBuffer{}
-		matches, conflicts, err := ReplaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
+		matches, conflicts, err := replaceBatchPlain(context.Background(), src, dst, rules, BatchOptions{
 			ChunkSize:       chunkSize,
 			CaseInsensitive: true,
 			WholeWord:       true,

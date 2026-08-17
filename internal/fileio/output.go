@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 )
 
 type ExclusiveOutput struct {
@@ -14,9 +13,11 @@ type ExclusiveOutput struct {
 }
 
 func OpenExclusiveOutput(path string, mode os.FileMode) (*ExclusiveOutput, error) {
-	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil, errors.New("output path is required")
+	}
+	if err := ValidateExactOutputPath(path); err != nil {
+		return nil, err
 	}
 	mode = mode.Perm()
 	if mode == 0 {

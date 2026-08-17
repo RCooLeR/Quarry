@@ -89,7 +89,7 @@ func runBatchPlainForFuzz(t *testing.T, src []byte, rules []BatchRule, opts Batc
 	}()
 
 	dst := &fuzzSyncBuffer{}
-	matches, conflicts, err := ReplaceBatchPlain(context.Background(), f, dst, rules, opts)
+	matches, conflicts, err := replaceBatchPlain(context.Background(), f, dst, rules, opts)
 	if err != nil {
 		return nil, 0, 0, err
 	}

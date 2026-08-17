@@ -72,13 +72,13 @@ func FuzzPreviewRegexpConsistentWithReplace(f *testing.F) {
 		if err != nil {
 			t.Fatalf("compile failed: %v", err)
 		}
-		collected, err := collectRegexpMatches(context.Background(), memReaderAt{data: src}, re, opts, 0)
+		collected, err := collectRegexpMatches(context.Background(), memReaderAt{data: src}, re, opts, MaxPreviewHits)
 		if err != nil {
 			t.Fatalf("collect failed: %v", err)
 		}
 		previews, err := PreviewRegexp(context.Background(), memReaderAt{data: src}, pattern, repl, RegexPreviewOptions{
 			ChunkSize:    chunkSize,
-			MaxHits:      0,
+			MaxHits:      MaxPreviewHits,
 			PreviewBytes: 16,
 		}, opts)
 		if err != nil {
@@ -135,7 +135,7 @@ func runReplaceRegexpForFuzz(t *testing.T, src []byte, pattern []byte, repl []by
 	}()
 
 	dst := &fuzzSyncBuffer{}
-	matches, err := ReplaceRegexp(context.Background(), f, dst, pattern, repl, opts)
+	matches, err := replaceRegexp(context.Background(), f, dst, pattern, repl, opts)
 	if err != nil {
 		return nil, 0, err
 	}

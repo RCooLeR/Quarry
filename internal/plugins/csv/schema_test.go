@@ -15,6 +15,8 @@ func TestClassifyLeadingZeroIntIsText(t *testing.T) {
 		"42":    schemaInt,
 		"3.14":  schemaFloat,
 		"true":  schemaBool,
+		" true": schemaText,
+		"\t42":  schemaText,
 		"hello": schemaText,
 	}
 	for value, want := range cases {

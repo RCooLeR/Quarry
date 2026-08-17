@@ -1,5 +1,3 @@
-// Package preset defines SQL tool presets.
-//
-// Presets let the UI offer sensible defaults for common SQL workflows without
-// hard-coding those defaults directly inside dialog code.
+// Package preset retains a fail-closed compatibility boundary for removed SQL
+// cleanup presets. It does not produce executable replacement configurations.
 package preset

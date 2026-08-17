@@ -1,61 +1,68 @@
 # Quarry
 
-Quarry is a Windows-first desktop editor and toolkit for **very large** text
-files — multi-gigabyte (400 GB+) SQL dumps, CSV/TSV exports, and logs that no
-ordinary editor can open.
+Quarry is a Windows-first desktop editor and toolkit designed for **very large**
+text files, including SQL dumps, CSV/TSV exports, and logs.
 
-It never reads the whole file into memory. The editor holds only bounded,
-line-aligned **windows** that stream in as you scroll and navigate by byte
-offset, so a 4 KB file and a 400 GB file cost roughly the same. On top of that
-streaming core sits a workbench of data tools: SQL dump analysis and extraction,
-flexible CSV↔SQL conversion, streaming search/replace/harvest, row transforms,
-and export bridges.
+The editor reads bounded, line-aligned **windows** as you scroll and navigate by
+byte offset instead of retaining the complete file in frontend state. This
+keeps the interactive working set bounded by configured window and cache limits,
+but scans, indexing, hashing, and some tool metadata still cost time or space in
+proportion to the input. A 400 GB file is a qualification target, not a
+currently validated size claim. The available workbench includes SQL dump
+analysis and extraction, configurable CSV→SQL conversion, streaming search and
+harvest, row transforms, and export bridges. Generic replacement is not exposed
+until its format-safety contract is complete.
 
 Built with **Go + [Wails v3](https://v3.wails.io/) + React + TypeScript +
 [CodeMirror 6](https://codemirror.net/)**.
 
 ## Highlights
 
-- **Open anything, instantly** — files are memory-mapped in spirit, not loaded;
-  first paint doesn't wait for indexing. Indexing and analysis are background,
-  cancellable, and optional.
-- **Editing without rewriting the file** — length-preserving edits can be
-  *patched in place* (with a backup); anything else streams a full edited copy.
-- **SQL dump workbench** — analyze tables/charsets/DEFINER, extract a table or
-  its schema/data, split a dump per table, sample a tiny dev fixture, lint for
-  re-import problems, reshape extended↔single-row INSERTs, and diff two dumps'
-  schemas.
+- **Bounded-window opening** — the initial editor window does not wait for a
+  whole-file read or full index. Indexing and analysis are background,
+  cancellable, and optional; their runtime still scales with the work selected.
+- **Editing with source preservation** — staged edits stream to a new full copy;
+  in-place save stays unavailable until its backup/recovery contract is durable.
+- **SQL dump workbench** — analyze tables and DEFINER usage, extract discovered
+  CREATE/INSERT/REPLACE regions, split those regions per table, sample a tiny dev fixture, lint
+  re-import problems (including mixed charset/collation use), explicitly
+  regroup extended↔single-row INSERT statements with semantic warnings, and
+  diff two dumps' schemas.
 - **CSV workbench** — delimiter detection, schema inference, a spreadsheet grid,
   a convertcsv-style CSV→SQL builder, column transforms, filter/dedupe/sample,
   redact/anonymize, and a column profiler.
-- **Export bridges** — CSV → JSONL, SQLite, or Excel (.xlsx); copy a preview as
-  a Markdown table.
+- **Export bridges** — CSV → JSONL, plus copying a bounded preview as a
+  Markdown table. SQLite and Excel export remain unavailable until they can use
+  the same no-clobber, fail-closed publication guarantees.
 - **Fast navigation** — command palette, go-to line/offset/percent, a file
   X-ray minimap, bookmarks, and jump-to-table.
 - **Ops polish** — cancellable background jobs with a progress toast,
-  follow-tail of growing files, recent files, session restore, drag-and-drop
-  open, a light/dark theme, and built-in **help** (F1).
+  follow-tail of growing files, drag-and-drop open, a light/dark theme, and
+  built-in **help** (F1). Local recent-path memory and bounded session restore
+  are separate, privacy-conservative opt-in preferences.
 
-> **Safety invariant:** every transform and export writes to a **new** file
-> (temp file + atomic rename). The only in-place write is the explicit
-> length-preserving *patch in place*, which keeps a backup. Quarry never
-> silently mutates your source.
+> **Current edited-save policy:** Save copy is the only enabled save path and
+> in-place save is disabled until Quarry can retain and verify a durable,
+> user-restorable backup. The broader output-transaction hardening tracked in
+> `col-review/` must be completed before treating this branch as release-ready.
 
 ## Quick start
 
-Prerequisites: [Go](https://go.dev/) 1.26+, [Node.js](https://nodejs.org/) +
-npm, the [Wails v3 CLI](https://v3.wails.io/getting-started/installation/), and
-[Task](https://taskfile.dev/) (optional but convenient).
+Canonical prerequisites: [Go](https://go.dev/) 1.26.6, Node.js 24.19.0 with npm
+11.17.0, Wails CLI `v3.0.0-alpha2.106`, and [Task](https://taskfile.dev/)
+(optional but convenient). Compatible developer Node ranges and exact install
+commands are listed in [Getting started](docs/getting-started.md).
 
 ```sh
 # run in development (hot reload for Go + frontend)
 task dev          # or: wails3 dev -config ./build/config.yml
 
-# production build → bin/quarry.exe
+# optimized local build (not release-qualified) → bin/quarry.exe
 task build        # or: wails3 build
 
 # run the tests
-go test ./...
+task verify
+task verify:race
 ```
 
 See **[docs/getting-started.md](docs/getting-started.md)** for details.
@@ -72,7 +79,7 @@ See **[docs/getting-started.md](docs/getting-started.md)** for details.
 │   ├── lineindex/       # sparse line index (approx → exact line numbers)
 │   ├── search/ replace/ # streaming, encoding-aware find / replace
 │   ├── exportx/         # byte-range export
-│   ├── manualedit/ inplace/ editwindow/   # staged edits & in-place patching
+│   ├── manualedit/ inplace/ editwindow/   # staged edits; guarded recovery primitives
 │   └── plugins/
 │       ├── csv/         # inspect, schema, convert, transform, export
 │       └── sql/         # analyze, extract, preset, reshape, schemadiff
@@ -89,7 +96,11 @@ See **[docs/getting-started.md](docs/getting-started.md)** for details.
 - [Features & tools](docs/features.md) — the full editor + workbench reference
 - [Architecture](docs/architecture.md) — how streaming, editing, and bindings work
 - [Development](docs/development.md) — build, test, bindings, adding a tool
+- [Support & release status](docs/support-and-release.md) — validation matrix,
+  installation limits, data locations, and publication blockers
 
 ## License
 
-See the repository for license details.
+No open-source or redistribution license has been selected yet. Until an
+approved `LICENSE` file is added, the repository must not be treated as granting
+permission to redistribute Quarry or publish release artifacts.

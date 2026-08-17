@@ -1,0 +1,304 @@
+name: Reusable verification
+
+on:
+  workflow_call:
+    inputs:
+      expected_commit:
+        description: Full Git commit to check out and verify
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+jobs:
+  source-identity:
+    name: Bind verification to source
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      commit: ${{ steps.identity.outputs.commit }}
+      tree: ${{ steps.identity.outputs.tree }}
+      commit_date: ${{ steps.identity.outputs.commit_date }}
+    steps:
+      - name: Checkout requested commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.expected_commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify exact clean source identity
+        id: identity
+        env:
+          EXPECTED_COMMIT: ${{ inputs.expected_commit }}
+        run: |
+          case "$EXPECTED_COMMIT" in
+            ""|*[!0-9a-fA-F]*) echo "expected_commit must be a full hexadecimal Git object ID" >&2; exit 1 ;;
+          esac
+          test "${#EXPECTED_COMMIT}" -eq 40
+          actual="$(git rev-parse --verify HEAD^{commit})"
+          test "$actual" = "$(printf '%s' "$EXPECTED_COMMIT" | tr 'A-F' 'a-f')"
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+          echo "commit=$actual" >> "$GITHUB_OUTPUT"
+          echo "tree=$(git rev-parse --verify HEAD^{tree})" >> "$GITHUB_OUTPUT"
+          echo "commit_date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+
+  platform:
+    name: ${{ matrix.name }} tests and build
+    needs: source-identity
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-2025
+            wails_task: windows:build
+          - name: Linux
+            os: ubuntu-24.04
+            wails_task: linux:build
+
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source-identity.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config gcc libc6-dev \
+            libgtk-4-dev libwebkitgtk-6.0-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify pinned toolchain
+        shell: bash
+        run: |
+          test "$(go env GOVERSION)" = "go1.26.6"
+          test "$(node --version)" = "v24.19.0"
+          test "$(npm --version)" = "11.17.0"
+
+      - name: Install pinned Wails CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106
+
+      - name: Verify Go dependency graph
+        run: |
+          go mod verify
+          wails3 task common:verify:go:modules
+
+      - name: Generate bindings and verify frontend
+        run: wails3 task frontend:check
+
+      - name: Run Go tests
+        run: go test -count=1 ./...
+
+      - name: Run production-tag tests
+        if: runner.os == 'Linux'
+        run: go test -tags production -count=1 ./...
+
+      - name: Run Go race tests
+        if: runner.os == 'Linux'
+        run: go test -race -count=1 ./...
+
+      - name: Build Wails app
+        run: wails3 task ${{ matrix.wails_task }}
+
+      - name: Verify build preserved source inputs
+        shell: bash
+        run: |
+          test "$(git rev-parse --verify HEAD^{commit})" = "${EXPECTED_COMMIT}"
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+        env:
+          EXPECTED_COMMIT: ${{ needs.source-identity.outputs.commit }}
+
+  analysis:
+    name: Static and dependency analysis
+    needs: source-identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source-identity.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Verify dependency manifests
+        run: |
+          go mod verify
+          go mod tidy -diff
+
+      - name: Run Go vet
+        run: |
+          go vet ./...
+          go vet -tags production ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go vet -tags production ./...
+
+      - name: Run pinned staticcheck
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          "$(go env GOPATH)/bin/staticcheck" ./...
+          "$(go env GOPATH)/bin/staticcheck" -tags production ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/staticcheck" ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/staticcheck" -tags production ./...
+
+      - name: Run pinned Go vulnerability scanner
+        env:
+          GOTOOLCHAIN: local
+          GOVULNDB: https://vuln.go.dev
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          "$(go env GOPATH)/bin/govulncheck" ./...
+          "$(go env GOPATH)/bin/govulncheck" -tags production ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/govulncheck" ./...
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/govulncheck" -tags production ./...
+
+      - name: Audit locked frontend dependencies
+        working-directory: frontend
+        env:
+          NODE_USE_SYSTEM_CA: "1"
+        run: |
+          test "$(npm --version)" = "11.17.0"
+          npm audit --audit-level=high
+
+      - name: Lint GitHub Actions workflows with pinned actionlint
+        env:
+          GOTOOLCHAIN: local
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+          "$(go env GOPATH)/bin/actionlint" -no-color
+
+      - name: Check GoReleaser containment config
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
+        with:
+          version: v2.17.1
+          args: check
+
+      - name: Verify analysis preserved source inputs
+        run: |
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+
+  verification-record:
+    name: Record verified source and tools
+    needs:
+      - source-identity
+      - platform
+      - analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.source-identity.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.19.0
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Write verification record
+        env:
+          VERIFIED_COMMIT: ${{ needs.source-identity.outputs.commit }}
+          VERIFIED_TREE: ${{ needs.source-identity.outputs.tree }}
+          COMMIT_DATE: ${{ needs.source-identity.outputs.commit_date }}
+          WORKFLOW_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_RUN_ATTEMPT: ${{ github.run_attempt }}
+          RECORD_PATH: ${{ runner.temp }}/quarry-verification.json
+        run: |
+          jq -n \
+            --arg commit "$VERIFIED_COMMIT" \
+            --arg tree "$VERIFIED_TREE" \
+            --arg commitDate "$COMMIT_DATE" \
+            --arg runId "$WORKFLOW_RUN_ID" \
+            --arg runAttempt "$WORKFLOW_RUN_ATTEMPT" \
+            --arg goVersion "$(go env GOVERSION)" \
+            --arg nodeVersion "$(node --version)" \
+            --arg npmVersion "$(npm --version)" \
+            --arg goModSha256 "$(sha256sum go.mod | cut -d' ' -f1)" \
+            --arg goSumSha256 "$(sha256sum go.sum | cut -d' ' -f1)" \
+            --arg packageSha256 "$(sha256sum frontend/package.json | cut -d' ' -f1)" \
+            --arg lockSha256 "$(sha256sum frontend/package-lock.json | cut -d' ' -f1)" \
+            '{schemaVersion:1, commit:$commit, tree:$tree, commitDate:$commitDate,
+              workflow:{runId:$runId, attempt:$runAttempt},
+              toolchain:{go:$goVersion, node:$nodeVersion, npm:$npmVersion,
+                goToolchainPolicy:"local",
+                wails:"v3.0.0-alpha2.106", staticcheck:"v0.7.0",
+                govulncheck:"v1.7.0", actionlint:"v1.7.12", goreleaser:"v2.17.1"},
+              inputs:{goModSha256:$goModSha256, goSumSha256:$goSumSha256,
+                frontendPackageSha256:$packageSha256, frontendLockSha256:$lockSha256},
+              gates:["windows-tests-build", "linux-tests-build", "linux-production-tests",
+                "linux-race-tests", "frontend-tests-build-windows", "frontend-tests-build-linux",
+                "go-vet-host-and-windows", "staticcheck-host-and-windows",
+                "govulncheck-host-and-windows", "npm-audit-high", "actionlint",
+                "goreleaser-containment-check"]}' > "$RECORD_PATH"
+          jq -e --arg commit "$VERIFIED_COMMIT" '.schemaVersion == 1 and .commit == $commit' "$RECORD_PATH" >/dev/null
+
+      - name: Upload retained non-release CI verification evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: non-release-ci-verification-evidence-${{ needs.source-identity.outputs.commit }}
+          path: ${{ runner.temp }}/quarry-verification.json
+          if-no-files-found: error
+          retention-days: 30

@@ -6,10 +6,28 @@ import (
 	"errors"
 	"io"
 	"testing"
+
+	"github.com/quarry/quarry-wails3/internal/sourceio"
 )
 
 type memReaderAtSize struct {
 	data []byte
+}
+
+type changedShortReaderAtSize struct{ size int64 }
+
+func (r changedShortReaderAtSize) ReadAt([]byte, int64) (int, error) {
+	return 0, sourceio.ErrSourceChanged
+}
+
+func (r changedShortReaderAtSize) Size() int64 { return r.size }
+
+func TestPieceTableRangeEqualsPreservesShortReadCause(t *testing.T) {
+	table := NewPieceTable(4)
+	matches, err := table.rangeEquals(changedShortReaderAtSize{size: 4}, 0, 4, []byte("test"))
+	if matches || !errors.Is(err, ErrSourceModifiedDuringOperation) || !errors.Is(err, sourceio.ErrSourceChanged) {
+		t.Fatalf("range comparison = %t, %v; want both source-change causes", matches, err)
+	}
 }
 
 func (r memReaderAtSize) ReadAt(p []byte, off int64) (int, error) {
@@ -66,6 +84,60 @@ func TestPieceTableWriteToFailsOnShortSource(t *testing.T) {
 	_, err := pt.WriteTo(context.Background(), src, &out, WriteOptions{})
 	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
 		t.Fatalf("err = %v, want ErrSourceModifiedDuringOperation", err)
+	}
+}
+
+func TestPieceTableReadRangeFailsOnShortOriginalPieceWithoutInventingBytes(t *testing.T) {
+	full := []byte("alpha bravo charlie delta")
+	tests := []struct {
+		name      string
+		start     int64
+		end       int64
+		available int
+	}{
+		{name: "short at range start", start: 18, end: int64(len(full)), available: 10},
+		{name: "short in range middle", start: 6, end: 20, available: 11},
+		{name: "short at range end", start: 0, end: int64(len(full)), available: len(full) - 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pt := NewPieceTable(int64(len(full)))
+			src := shrunkReaderAtSize{data: full[:tt.available], reportedSize: int64(len(full))}
+			got, err := pt.ReadRange(src, tt.start, tt.end)
+			if !errors.Is(err, ErrSourceModifiedDuringOperation) {
+				t.Fatalf("err = %v, want ErrSourceModifiedDuringOperation", err)
+			}
+			if got != nil {
+				t.Fatalf("returned bytes on source drift = %q; want nil and no synthesized NULs", got)
+			}
+		})
+	}
+}
+
+type nilErrorShortReader struct {
+	data         []byte
+	reportedSize int64
+}
+
+func (r nilErrorShortReader) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(r.data)) {
+		return 0, nil
+	}
+	return copy(p, r.data[off:]), nil
+}
+
+func (r nilErrorShortReader) Size() int64 { return r.reportedSize }
+
+func TestPieceTableReadRangeRejectsShortReaderWithNilError(t *testing.T) {
+	full := []byte("0123456789")
+	pt := NewPieceTable(int64(len(full)))
+	got, err := pt.ReadRange(nilErrorShortReader{data: full[:4], reportedSize: int64(len(full))}, 0, int64(len(full)))
+	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
+		t.Fatalf("err = %v, want ErrSourceModifiedDuringOperation", err)
+	}
+	if got != nil {
+		t.Fatalf("returned bytes on invalid partial ReaderAt = %q, want nil", got)
 	}
 }
 

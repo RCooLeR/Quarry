@@ -10,24 +10,70 @@ import (
 	"time"
 
 	"github.com/quarry/quarry-wails3/internal/fileio"
+	"github.com/quarry/quarry-wails3/internal/regularfile"
+	"github.com/quarry/quarry-wails3/internal/sourceio"
 )
 
 var (
-	openSourceFile = os.Open
+	openSourceFile = regularfile.Open
 	openExclusive  = func(path string) (syncWriteCloser, error) {
 		return fileio.OpenExclusiveOutput(path, 0o600)
 	}
-	renamePath      = fileio.Rename
+	renamePath      = fileio.PublishExistingNoClobber
 	removePath      = fileio.Remove
 	statPath        = fileio.Stat
 	openManifestOut = func(path string, exclusive bool) (io.WriteCloser, error) {
-		flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
 		if exclusive {
-			flag |= os.O_EXCL
+			return fileio.OpenExclusiveOutput(path, 0o600)
 		}
-		return os.OpenFile(path, flag, 0o600)
+		return &atomicManifestWriter{path: path}, nil
 	}
 )
+
+const manifestAtomicTempSuffix = ".quarry.manifest.tmp"
+
+// atomicManifestWriter keeps each small, bounded manifest revision in memory
+// until Close, then replaces the previous revision through the shared synced
+// atomic writer. It never opens the live manifest with O_TRUNC. Initial
+// creation remains O_EXCL above so a pre-existing recovery record is never
+// overwritten when an operation starts.
+type atomicManifestWriter struct {
+	path   string
+	data   []byte
+	closed bool
+	failed error
+}
+
+func (w *atomicManifestWriter) Write(p []byte) (int, error) {
+	if w == nil || w.closed {
+		return 0, errors.New("manifest writer is closed")
+	}
+	if w.failed != nil {
+		return 0, w.failed
+	}
+	if len(p) > maxRecoveryManifestBytes-len(w.data) {
+		w.failed = fmt.Errorf("manifest exceeds the %d-byte limit", maxRecoveryManifestBytes)
+		return 0, w.failed
+	}
+	w.data = append(w.data, p...)
+	return len(p), nil
+}
+
+func (w *atomicManifestWriter) Close() error {
+	if w == nil || w.closed {
+		return nil
+	}
+	w.closed = true
+	if w.failed != nil {
+		return w.failed
+	}
+	_, err := fileio.WriteFileAtomic(w.path, w.data, fileio.AtomicWriteOptions{
+		Mode:       0o600,
+		Overwrite:  true,
+		TempSuffix: manifestAtomicTempSuffix,
+	})
+	return err
+}
 
 var ErrSourceModifiedDuringOperation = errors.New("source file modified during operation")
 
@@ -44,6 +90,7 @@ type FileOptions struct {
 	DeletePartialOnCancel bool
 	SwapOriginal          bool
 	BackupPath            string
+	ExpectedSource        *sourceio.Expectation
 	Progress              func(Progress)
 }
 
@@ -71,17 +118,27 @@ type Manifest struct {
 
 // FileSummary describes the result of a file transform.
 type FileSummary struct {
-	OutputPath   string
-	TempPath     string
-	ManifestPath string
-	BackupPath   string
-	Swapped      bool
-	Matches      int64
-	Conflicts    int64
+	OutputPath           string
+	TempPath             string
+	ManifestPath         string
+	BackupPath           string
+	Swapped              bool
+	Matches              int64
+	Conflicts            int64
+	BytesWritten         int64
+	Complete             bool
+	Published            bool
+	PublicationUncertain bool
 }
 
-// ReplacePlainFile streams sourcePath into outputPath through an exclusive temp file.
-func ReplacePlainFile(ctx context.Context, sourcePath string, outputPath string, pattern []byte, repl []byte, opts FileOptions) (FileSummary, error) {
+// replacePlainFile streams sourcePath into outputPath through an exclusive temp file.
+func replacePlainFile(ctx context.Context, sourcePath string, outputPath string, pattern []byte, repl []byte, opts FileOptions) (FileSummary, error) {
+	if opts.SwapOriginal {
+		return FileSummary{}, ErrSwapOriginalDisabled
+	}
+	if err := validatePlainTransformInputs(pattern, repl, opts.ChunkSize); err != nil {
+		return FileSummary{OutputPath: outputPath}, err
+	}
 	same, err := samePath(sourcePath, outputPath)
 	if err != nil {
 		return FileSummary{}, err
@@ -138,6 +195,9 @@ func ReplacePlainFile(ctx context.Context, sourcePath string, outputPath string,
 		return summary, err
 	}
 	sourceState := snapshotSource(st)
+	if err := rejectPossiblePHPSerialization(ctx, src); err != nil {
+		return summary, err
+	}
 
 	dst, err := openExclusive(summary.TempPath)
 	if err != nil {
@@ -175,7 +235,8 @@ func ReplacePlainFile(ctx context.Context, sourcePath string, outputPath string,
 			}
 		},
 	}
-	matches, replaceErr := ReplacePlain(ctx, src, dst, pattern, repl, plainOpts)
+	guardedSource := &phpSerializationGuardSource{source: src}
+	matches, replaceErr := replacePlain(ctx, guardedSource, dst, pattern, repl, plainOpts)
 	manifest.Matches = matches
 	closeErr := dst.Close()
 
@@ -191,7 +252,7 @@ func ReplacePlainFile(ctx context.Context, sourcePath string, outputPath string,
 		return summary, err
 	}
 
-	if err := renamePath(summary.TempPath, outputPath); err != nil {
+	if err := publishLegacyOutput(&summary, outputPath); err != nil {
 		writeFailedManifest(summary.ManifestPath, &manifest, err)
 		return summary, err
 	}
@@ -246,6 +307,28 @@ func failFileTransformWrite(summary FileSummary, manifest *Manifest, opts FileOp
 	}
 }
 
+// publishLegacyOutput records the irreversible visibility state reported by
+// the shared no-clobber publisher. Legacy transforms retain TempPath as an
+// audit/recovery name even after a successful move; callers can distinguish a
+// completed temporary stream from a visible final output through these flags.
+func publishLegacyOutput(summary *FileSummary, outputPath string) error {
+	if summary == nil {
+		return errors.New("file summary is required")
+	}
+	summary.Complete = true
+	err := renamePath(summary.TempPath, outputPath)
+	if err == nil {
+		summary.Published = true
+		return nil
+	}
+	var publication *fileio.PublicationError
+	if errors.As(err, &publication) {
+		summary.Published = true
+		summary.PublicationUncertain = publication.LocationUncertain
+	}
+	return err
+}
+
 func writeReadyToFinalizeManifest(path string, manifest *Manifest) error {
 	if manifest == nil {
 		return errors.New("manifest is required")
@@ -288,17 +371,35 @@ func writeManifest(path string, manifest Manifest, exclusive bool) error {
 		return err
 	}
 	data = append(data, '\n')
+	if len(data) > maxRecoveryManifestBytes {
+		return fmt.Errorf("manifest exceeds the %d-byte limit", maxRecoveryManifestBytes)
+	}
 
 	f, err := openManifestOut(path, exclusive)
 	if err != nil {
 		return err
 	}
-	_, writeErr := f.Write(data)
-	closeErr := f.Close()
-	if writeErr != nil {
-		return writeErr
+	n, writeErr := f.Write(data)
+	if writeErr == nil && n != len(data) {
+		writeErr = io.ErrShortWrite
 	}
-	return closeErr
+	var syncErr error
+	if writeErr == nil {
+		if syncer, ok := f.(interface{ Sync() error }); ok {
+			syncErr = syncer.Sync()
+		}
+	}
+	closeErr := f.Close()
+	resultErr := errors.Join(writeErr, syncErr, closeErr)
+	if resultErr != nil && exclusive {
+		// A failed initial revision is not useful recovery evidence. Remove only
+		// the object owned by this exclusive writer so a short write or sync
+		// failure cannot leave a corrupt manifest that blocks a safe retry.
+		if cleaner, ok := f.(interface{ Cleanup() error }); ok {
+			resultErr = errors.Join(resultErr, cleaner.Cleanup())
+		}
+	}
+	return resultErr
 }
 
 func snapshotSource(info os.FileInfo) sourceSnapshot {
@@ -347,12 +448,4 @@ func swapOutputIntoSource(sourcePath string, outputPath string, backupPath strin
 		return err
 	}
 	return nil
-}
-
-func applyBackupModeToOutput(outputPath string, backupPath string) error {
-	backupInfo, err := statPath(backupPath)
-	if err != nil {
-		return err
-	}
-	return fileio.ApplyMode(outputPath, backupInfo.Mode())
 }

@@ -1,4 +1,4 @@
-name: Release
+name: Release candidate validation
 
 on:
   push:
@@ -6,98 +6,194 @@ on:
       - "v*"
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+concurrency:
+  group: release-candidate-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  windows:
-    name: Build Windows
-    runs-on: windows-latest
+  provenance:
+    name: Verify annotated tag provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.metadata.outputs.app_version }}
+      platform_version: ${{ steps.metadata.outputs.platform_version }}
+      build_number: ${{ steps.metadata.outputs.build_number }}
+      commit: ${{ steps.metadata.outputs.build_commit }}
+      tree: ${{ steps.metadata.outputs.build_tree }}
+      build_date: ${{ steps.metadata.outputs.build_date }}
+      source_date_epoch: ${{ steps.metadata.outputs.source_date_epoch }}
+      tag_object: ${{ steps.metadata.outputs.tag_object }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout pushed tag with history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.ref }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Bind canonical version to annotated tag and checked-out commit
+        id: metadata
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_BUILD_NUMBER: ${{ github.run_number }}
+          PROVENANCE_PATH: ${{ runner.temp }}/quarry-release-provenance.json
+        run: |
+          go run ./build/releasemeta \
+            -release-tag "$RELEASE_TAG" \
+            -repository . \
+            -build-number "$RELEASE_BUILD_NUMBER" \
+            -github-output "$GITHUB_OUTPUT" \
+            -provenance-out "$PROVENANCE_PATH"
+
+      - name: Upload tag provenance record
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: non-release-ci-tag-provenance-evidence-${{ steps.metadata.outputs.build_commit }}
+          path: ${{ runner.temp }}/quarry-release-provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
+  verify:
+    name: Verify tagged commit
+    needs: provenance
+    permissions:
+      contents: read
+    uses: ./.github/workflows/verify.yml
+    with:
+      expected_commit: ${{ needs.provenance.outputs.commit }}
+
+  windows:
+    name: Build Windows unqualified non-release candidate
+    needs:
+      - provenance
+      - verify
+    runs-on: windows-2025
+    timeout-minutes: 45
+    env:
+      APP_VERSION: ${{ needs.provenance.outputs.version }}
+      PLATFORM_VERSION: ${{ needs.provenance.outputs.platform_version }}
+      BUILD_NUMBER: ${{ needs.provenance.outputs.build_number }}
+      BUILD_COMMIT: ${{ needs.provenance.outputs.commit }}
+      BUILD_DATE: ${{ needs.provenance.outputs.build_date }}
+      SOURCE_DATE_EPOCH: ${{ needs.provenance.outputs.source_date_epoch }}
+      TZ: UTC
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.provenance.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.19.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.103
+      - name: Verify pinned toolchain and dependency graph
+        shell: bash
+        run: |
+          test "$(go env GOVERSION)" = "go1.26.6"
+          test "$(node --version)" = "v24.19.0"
+          test "$(npm --version)" = "11.17.0"
+          go mod verify
+          go mod tidy -diff
 
-      - name: Build
-        run: wails3 task windows:build
+      - name: Install pinned Wails CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106
 
-      - name: Package
+      - name: Install and verify pinned NSIS compiler
+        shell: pwsh
+        run: |
+          choco install nsis --version=3.11 --allow-downgrade -y --no-progress
+          $actual = (& makensis /VERSION | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne "v3.11") { throw "makensis version '$actual' does not match pinned 'v3.11'" }
+
+      - name: Build unsigned Windows 10/11 x64 NSIS validation candidate
+        run: wails3 task windows:package:candidate
+
+      - name: Verify installer, payload, runtime bootstrapper, and clean source inputs
+        shell: pwsh
+        run: |
+          ./build/windows/verify-unqualified-nsis-candidate.ps1 `
+            -InstallerPath bin/quarry-amd64-installer.exe `
+            -BinaryPath bin/quarry.exe `
+            -BootstrapperPath build/windows/nsis/MicrosoftEdgeWebview2Setup.exe `
+            -ProductVersion $env:APP_VERSION `
+            -PlatformVersion $env:PLATFORM_VERSION `
+            -BuildNumber $env:BUILD_NUMBER `
+            -BuildCommit $env:BUILD_COMMIT `
+            -BuildDate $env:BUILD_DATE `
+            -ExpectedNsisVersion v3.11 `
+            -EvidencePath release-artifacts/windows-nsis-candidate-evidence.json
+          if ((git rev-parse --verify 'HEAD^{commit}').Trim() -ne $env:BUILD_COMMIT) { throw 'checked-out commit changed during build' }
+          $dirty = @(git status --porcelain --untracked-files=all)
+          if ($LASTEXITCODE -ne 0) { throw "git status failed" }
+          if ($dirty.Count -ne 0) { $dirty | Write-Error; throw "build rewrote tracked inputs or created unignored outputs" }
+
+      - name: Package unqualified non-release candidate and checksum
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release-artifacts | Out-Null
-          Compress-Archive -Path bin/quarry.exe -DestinationPath release-artifacts/quarry_windows_amd64.zip -Force
+          $epoch = [DateTimeOffset]::FromUnixTimeSeconds([int64]$env:SOURCE_DATE_EPOCH).UtcDateTime
+          $artifact = "release-artifacts/quarry_${env:APP_VERSION}_windows_amd64_nsis.exe"
+          Copy-Item -LiteralPath bin/quarry-amd64-installer.exe -Destination $artifact
+          (Get-Item -LiteralPath $artifact).LastWriteTimeUtc = $epoch
+          $name = Split-Path -Leaf $artifact
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $artifact).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath "$artifact.sha256" -Value "$hash  $name" -Encoding utf8NoBOM -NoNewline
+          Set-Content -LiteralPath release-artifacts/UNQUALIFIED-NON-RELEASE-CI-EVIDENCE.txt -Value "Not a Quarry release. Unsigned, unqualified Windows installer evidence; do not redistribute." -Encoding utf8NoBOM
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload unqualified non-release CI evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-windows
+          name: unqualified-non-release-ci-windows-${{ needs.provenance.outputs.commit }}
           path: release-artifacts/*
           if-no-files-found: error
-
-  macos:
-    name: Build macOS
-    runs-on: macos-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: frontend/package-lock.json
-
-      - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.103
-
-      - name: Build universal app
-        run: wails3 task darwin:package:universal
-
-      - name: Package
-        run: |
-          mkdir -p release-artifacts
-          ditto -c -k --sequesterRsrc --keepParent bin/quarry.app release-artifacts/quarry_darwin_universal.zip
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-macos
-          path: release-artifacts/*
-          if-no-files-found: error
+          retention-days: 7
 
   linux:
-    name: Build Linux
+    name: Build Linux unqualified non-release candidate
+    needs:
+      - provenance
+      - verify
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      APP_VERSION: ${{ needs.provenance.outputs.version }}
+      PLATFORM_VERSION: ${{ needs.provenance.outputs.platform_version }}
+      BUILD_NUMBER: ${{ needs.provenance.outputs.build_number }}
+      BUILD_COMMIT: ${{ needs.provenance.outputs.commit }}
+      BUILD_DATE: ${{ needs.provenance.outputs.build_date }}
+      SOURCE_DATE_EPOCH: ${{ needs.provenance.outputs.source_date_epoch }}
+      TZ: UTC
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Checkout verified commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
+          ref: ${{ needs.provenance.outputs.commit }}
+          fetch-depth: 1
+          persist-credentials: false
 
       - name: Install desktop dependencies
         run: |
@@ -108,68 +204,77 @@ jobs:
             libgtk-3-dev libwebkit2gtk-4.1-dev
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: true
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: 24.19.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
-      - name: Install Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.103
+      - name: Verify pinned toolchain and dependency graph
+        run: |
+          test "$(go env GOVERSION)" = "go1.26.6"
+          test "$(node --version)" = "v24.19.0"
+          test "$(npm --version)" = "11.17.0"
+          go mod verify
+          go mod tidy -diff
+
+      - name: Install pinned Wails CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106
 
       - name: Build
         run: wails3 task linux:build
 
-      - name: Package
+      - name: Verify embedded provenance and clean source inputs
+        run: |
+          strings bin/quarry | grep -F -- "$APP_VERSION" >/dev/null
+          strings bin/quarry | grep -F -- "$BUILD_COMMIT" >/dev/null
+          strings bin/quarry | grep -F -- "$BUILD_DATE" >/dev/null
+          test "$(git rev-parse --verify HEAD^{commit})" = "$BUILD_COMMIT"
+          dirty="$(git status --porcelain --untracked-files=all)"
+          if [ -n "$dirty" ]; then
+            printf '%s\n' "$dirty" >&2
+            exit 1
+          fi
+
+      - name: Package normalized unqualified non-release candidate and checksum
         run: |
           mkdir -p release-artifacts/quarry-linux-amd64
-          cp bin/quarry release-artifacts/quarry-linux-amd64/
-          cp build/linux/quarry.desktop release-artifacts/quarry-linux-amd64/
-          cp build/appicon.png release-artifacts/quarry-linux-amd64/
-          tar -czf release-artifacts/quarry_linux_amd64.tar.gz -C release-artifacts quarry-linux-amd64
+          install -m 0755 bin/quarry release-artifacts/quarry-linux-amd64/quarry
+          install -m 0644 build/linux/quarry.desktop release-artifacts/quarry-linux-amd64/quarry.desktop
+          install -m 0644 build/appicon.png release-artifacts/quarry-linux-amd64/appicon.png
+          archive="release-artifacts/quarry_${APP_VERSION}_linux_amd64.tar.gz"
+          tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
+            -C release-artifacts -cf - quarry-linux-amd64 | gzip -n > "$archive"
           rm -rf release-artifacts/quarry-linux-amd64
+          sha256sum "$archive" | sed 's#  release-artifacts/#  #' > "$archive.sha256"
+          printf '%s\n' 'Not a Quarry release. Unsigned, unqualified CI evidence; do not redistribute.' > release-artifacts/UNQUALIFIED-NON-RELEASE-CI-EVIDENCE.txt
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload unqualified non-release CI evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-linux
+          name: unqualified-non-release-ci-linux-${{ needs.provenance.outputs.commit }}
           path: release-artifacts/*
           if-no-files-found: error
+          retention-days: 7
 
-  publish:
-    name: Publish GitHub release
+  publication-contained:
+    name: Confirm public publication is disabled
     needs:
+      - provenance
+      - verify
       - windows
-      - macos
       - linux
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: release-artifacts
-          merge-multiple: true
-
-      - name: Create checksums
+      - name: Record containment policy
         run: |
-          cd release-artifacts
-          sha256sum * > SHA256SUMS.txt
-
-      - name: Publish with GoReleaser
-        uses: goreleaser/goreleaser-action@v7
-        with:
-          version: "~> v2"
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          echo "Validated artifacts remain unqualified non-release CI evidence."
+          echo "Public release publication stays disabled until the project has an approved LICENSE,"
+          echo "candidate signing and platform verification, authenticated checksums or attestations, and packaged-app safety tests."

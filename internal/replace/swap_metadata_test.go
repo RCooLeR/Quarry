@@ -2,13 +2,14 @@ package replace
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
-func TestReplacePlainFileSwapOriginalPreservesBackupTimeAndSourceReadOnlyMode(t *testing.T) {
+func TestReplacePlainFileSwapOriginalPreservesReadOnlySourceByRefusingMutation(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	outPath := filepath.Join(dir, "output.txt")
@@ -28,16 +29,16 @@ func TestReplacePlainFileSwapOriginalPreservesBackupTimeAndSourceReadOnlyMode(t 
 		_ = os.Chmod(backupPath, 0o666)
 	})
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
 		ChunkSize:    5,
 		SwapOriginal: true,
 		BackupPath:   backupPath,
 	})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrSwapOriginalDisabled) {
+		t.Fatalf("error = %v, want ErrSwapOriginalDisabled", err)
 	}
-	if !summary.Swapped {
-		t.Fatal("expected swapped summary")
+	if summary != (FileSummary{}) {
+		t.Fatalf("summary = %+v, want zero summary", summary)
 	}
 
 	sourceInfo, err := os.Stat(srcPath)
@@ -48,22 +49,23 @@ func TestReplacePlainFileSwapOriginalPreservesBackupTimeAndSourceReadOnlyMode(t 
 		t.Fatalf("swapped source mode = %v, want read-only permission bits preserved", sourceInfo.Mode().Perm())
 	}
 
-	backupInfo, err := os.Stat(backupPath)
-	if err != nil {
-		t.Fatal(err)
+	assertModTimeClose(t, srcPath, sourceInfo.ModTime(), originalTime)
+	if got, readErr := os.ReadFile(srcPath); readErr != nil || string(got) != "hello world hello" {
+		t.Fatalf("source = %q, %v; want unchanged", got, readErr)
 	}
-	if !isReadOnlyMode(backupInfo.Mode()) {
-		t.Fatalf("backup mode = %v, want original read-only permission bits", backupInfo.Mode().Perm())
+	for _, path := range []string{outPath, backupPath} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("disabled swap created %q: %v", path, statErr)
+		}
 	}
-	assertModTimeClose(t, backupPath, backupInfo.ModTime(), originalTime)
 }
 
-func TestResumeRecoverySourceMissingUsesBackupModeForRestoredSource(t *testing.T) {
+func TestResumeRecoverySourceMissingPreservesBackupAndOutput(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.sql")
 	outputPath := filepath.Join(dir, "output.sql")
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	manifestPath := outputPath + ".quarry.manifest.json"
+	backupPath := sourcePath + ".quarry.bak"
+	manifestPath := outputPath + recoveryManifestSuffix
 	originalTime := time.Unix(1_700_000_100, 456_000_000)
 	if err := os.WriteFile(backupPath, []byte("old source"), 0o600); err != nil {
 		t.Fatal(err)
@@ -102,20 +104,25 @@ func TestResumeRecoverySourceMissingUsesBackupModeForRestoredSource(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	resumed, err := ResumeRecovery(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !resumed.Manifest.Swapped || resumed.Manifest.Status != "complete" {
-		t.Fatalf("manifest swapped/status = %v/%q", resumed.Manifest.Swapped, resumed.Manifest.Status)
+	if _, err := ResumeRecovery(state); !errors.Is(err, ErrRecoveryMutationDisabled) {
+		t.Fatalf("ResumeRecovery error = %v, want ErrRecoveryMutationDisabled", err)
 	}
 
-	sourceInfo, err := os.Stat(sourcePath)
+	if _, err := os.Lstat(sourcePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("source should remain absent: %v", err)
+	}
+	backupInfo, err := os.Stat(backupPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !isReadOnlyMode(sourceInfo.Mode()) {
-		t.Fatalf("restored source mode = %v, want backup read-only permission bits", sourceInfo.Mode().Perm())
+	if !isReadOnlyMode(backupInfo.Mode()) {
+		t.Fatalf("backup mode = %v, want read-only permission bits preserved", backupInfo.Mode().Perm())
+	}
+	if got, err := os.ReadFile(outputPath); err != nil || string(got) != "new source" {
+		t.Fatalf("output = %q, %v", got, err)
+	}
+	if got, err := os.ReadFile(backupPath); err != nil || string(got) != "old source" {
+		t.Fatalf("backup = %q, %v", got, err)
 	}
 }
 

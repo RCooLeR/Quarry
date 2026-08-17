@@ -2,6 +2,7 @@ package csv
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -150,6 +151,35 @@ func TestTransformRejectsSamePath(t *testing.T) {
 	_, err := FilterRowsFile(context.Background(), src, src, FilterOptions{Op: "nonempty", Column: 0})
 	if err == nil {
 		t.Fatal("expected error for same input/output path")
+	}
+}
+
+func TestFilterRowsRejectsInvalidOptionsBeforeArtifacts(t *testing.T) {
+	tests := []struct {
+		name string
+		opts FilterOptions
+	}{
+		{name: "empty operation", opts: FilterOptions{Delimiter: ',', Column: 0}},
+		{name: "unknown operation", opts: FilterOptions{Delimiter: ',', Column: 0, Op: FilterOp("equals")}},
+		{name: "mixed case operation", opts: FilterOptions{Delimiter: ',', Column: 0, Op: FilterOp("EQ")}},
+		{name: "whitespace operation", opts: FilterOptions{Delimiter: ',', Column: 0, Op: FilterOp(" eq")}},
+		{name: "negative column", opts: FilterOptions{Delimiter: ',', Column: -1, Op: FilterEqual}},
+		{name: "NUL delimiter", opts: FilterOptions{Delimiter: 0, Column: 0, Op: FilterEqual}},
+		{name: "quote delimiter", opts: FilterOptions{Delimiter: '"', Column: 0, Op: FilterEqual}},
+		{name: "newline delimiter", opts: FilterOptions{Delimiter: '\n', Column: 0, Op: FilterEqual}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			output := filepath.Join(dir, "output.csv")
+			_, err := FilterRowsFile(context.Background(), filepath.Join(dir, "missing.csv"), output, test.opts)
+			if err == nil {
+				t.Fatal("expected validation error")
+			}
+			if _, statErr := os.Lstat(output); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("invalid options created output: %v", statErr)
+			}
+		})
 	}
 }
 

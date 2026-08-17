@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"unicode/utf16"
 
 	"github.com/quarry/quarry-wails3/internal/encodingx"
 	"github.com/quarry/quarry-wails3/internal/fileio"
@@ -14,6 +15,7 @@ import (
 var (
 	ErrInMemoryBufferTooLarge = errors.New("file exceeds in-memory editor budget")
 	ErrInMemoryBufferBinary   = errors.New("binary-looking file cannot use in-memory editor")
+	ErrTextRangeUnaligned     = errors.New("text range is not aligned to the source encoding")
 )
 
 // InMemoryBuffer is a full decoded text buffer for files that fit the
@@ -26,6 +28,7 @@ type InMemoryBuffer struct {
 	WindowEnd     int64
 	EditableLimit int64
 	Encoding      string
+	HasBOM        bool
 	LineEnding    string
 	FileType      string
 	Text          string
@@ -105,6 +108,61 @@ func LoadInMemoryBufferContextWithOptions(ctx context.Context, doc *FileDocument
 	return newInMemoryBufferContext(ctx, doc, 0, doc.Size(), editableLimit, data, opts)
 }
 
+func validateTextRangeAlignment(doc *FileDocument, start int64, end int64, encoding string) error {
+	if err := validateTextBoundary(doc, start, encoding); err != nil {
+		return err
+	}
+	if end != start {
+		return validateTextBoundary(doc, end, encoding)
+	}
+	return nil
+}
+
+func validateTextBoundary(doc *FileDocument, offset int64, encoding string) error {
+	if offset <= 0 || offset >= doc.Size() {
+		return nil
+	}
+	switch strings.ToUpper(strings.TrimSpace(encoding)) {
+	case "UTF-8":
+		byteAtBoundary, err := doc.ReadRangeWithLimit(offset, offset+1, 1)
+		if err != nil {
+			return err
+		}
+		if len(byteAtBoundary) != 1 {
+			return errors.Join(ErrTextRangeUnaligned, errors.New("could not read UTF-8 boundary byte"))
+		}
+		if byteAtBoundary[0]&0xC0 == 0x80 {
+			return fmt.Errorf("%w: byte offset %d splits a UTF-8 rune", ErrTextRangeUnaligned, offset)
+		}
+	case "UTF-16LE", "UTF-16BE":
+		if offset%2 != 0 {
+			return fmt.Errorf("%w: byte offset %d splits a UTF-16 code unit", ErrTextRangeUnaligned, offset)
+		}
+		if offset < 2 || offset+2 > doc.Size() {
+			return nil
+		}
+		around, err := doc.ReadRangeWithLimit(offset-2, offset+2, 4)
+		if err != nil {
+			return err
+		}
+		if len(around) != 4 {
+			return errors.Join(ErrTextRangeUnaligned, errors.New("could not read UTF-16 boundary units"))
+		}
+		before, after := decodeUTF16Unit(around[:2], encoding), decodeUTF16Unit(around[2:], encoding)
+		if utf16.IsSurrogate(rune(before)) && before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF {
+			return fmt.Errorf("%w: byte offset %d splits a UTF-16 surrogate pair", ErrTextRangeUnaligned, offset)
+		}
+	}
+	return nil
+}
+
+func decodeUTF16Unit(data []byte, encoding string) uint16 {
+	if strings.EqualFold(encoding, "UTF-16BE") {
+		return uint16(data[0])<<8 | uint16(data[1])
+	}
+	return uint16(data[1])<<8 | uint16(data[0])
+}
+
 // LoadInMemoryWindow decodes a bounded byte range for normal-editor behavior.
 // Unlike LoadInMemoryBuffer, this may be used for huge files because it proves
 // only the requested window, not the whole file, fits the caller-provided budget.
@@ -148,6 +206,9 @@ func LoadInMemoryWindowContextWithOptions(ctx context.Context, doc *FileDocument
 	if meta.Binary {
 		return nil, fmt.Errorf("%w: confidence %.2f", ErrInMemoryBufferBinary, meta.BinaryConfidence)
 	}
+	if err := validateTextRangeAlignment(doc, start, end, meta.Encoding); err != nil {
+		return nil, err
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -163,10 +224,6 @@ func LoadInMemoryWindowContextWithOptions(ctx context.Context, doc *FileDocument
 		return nil, err
 	}
 	return newInMemoryBufferContext(ctx, doc, start, end, editableLimit, data, opts)
-}
-
-func newInMemoryBuffer(doc *FileDocument, start, end, editableLimit int64, data []byte) (*InMemoryBuffer, error) {
-	return newInMemoryBufferContext(context.Background(), doc, start, end, editableLimit, data, InMemoryLoadOptions{})
 }
 
 func newInMemoryBufferContext(ctx context.Context, doc *FileDocument, start, end, editableLimit int64, data []byte, opts InMemoryLoadOptions) (*InMemoryBuffer, error) {
@@ -198,6 +255,7 @@ func newInMemoryBufferContext(ctx context.Context, doc *FileDocument, start, end
 		WindowEnd:     end,
 		EditableLimit: editableLimit,
 		Encoding:      meta.Encoding,
+		HasBOM:        meta.HasBOM,
 		LineEnding:    meta.LineEnding,
 		FileType:      meta.FileType,
 		Text:          text,
@@ -220,7 +278,20 @@ func (b *InMemoryBuffer) EncodedBytes(text string) ([]byte, error) {
 	if b == nil {
 		return nil, errors.New("nil in-memory buffer")
 	}
-	return encodingx.EncodeString(b.Encoding, text)
+	encoded, err := encodingx.EncodeString(b.Encoding, text)
+	if err != nil {
+		return nil, err
+	}
+	if b.HasBOM && b.WindowStart == 0 {
+		bom := encodingx.BOMBytes(b.Encoding)
+		if len(bom) > 0 {
+			withBOM := make([]byte, 0, len(bom)+len(encoded))
+			withBOM = append(withBOM, bom...)
+			withBOM = append(withBOM, encoded...)
+			encoded = withBOM
+		}
+	}
+	return encoded, nil
 }
 
 // EncodedReplacement returns the source byte range and encoded replacement
@@ -277,7 +348,6 @@ func (b *InMemoryBuffer) WriteCopyContextWithOptions(ctx context.Context, output
 	if !b.CoversWholeFile() {
 		return 0, errors.New("window buffers cannot be saved as whole-file copies; stage the bounded replacement instead")
 	}
-	outputPath = strings.TrimSpace(outputPath)
 	if outputPath == "" {
 		return 0, errors.New("output path is required")
 	}
@@ -299,7 +369,10 @@ func (b *InMemoryBuffer) WriteCopyContextWithOptions(ctx context.Context, output
 		return 0, err
 	}
 
-	mode := os.FileMode(0o644)
+	// Fail private when the source pathname can no longer be inspected. A
+	// successful stat may preserve an existing source mode, but an external
+	// rename/removal must not make a buffered copy more widely readable.
+	mode := os.FileMode(0o600)
 	if info, err := os.Stat(b.Path); err == nil {
 		mode = info.Mode().Perm()
 	}

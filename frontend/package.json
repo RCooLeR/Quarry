@@ -3,28 +3,38 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "packageManager": "npm@11.17.0",
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0",
+    "npm": "11.17.0"
+  },
   "scripts": {
-    "dev": "vite",
-    "build:dev": "tsc && vite build --minify false --mode development",
-    "build": "tsc && vite build --mode production",
-    "preview": "vite preview"
+    "dev": "node scripts/check-privileged-webview.mjs && vite",
+    "check:security": "node scripts/check-privileged-webview.mjs",
+    "build:dev": "node scripts/check-privileged-webview.mjs && tsc && vite build --minify false --mode development",
+    "build": "node scripts/check-privileged-webview.mjs && tsc && vite build --mode production && node scripts/check-bundle-budget.mjs",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:a11y": "vitest run tests/AxeAccessibility.test.ts"
   },
   "dependencies": {
-    "@codemirror/commands": "^6.10.3",
-    "@codemirror/language": "^6.12.3",
-    "@codemirror/merge": "^6.12.2",
-    "@codemirror/search": "^6.7.1",
-    "@codemirror/state": "^6.6.0",
-    "@codemirror/view": "^6.43.1",
-    "@wailsio/runtime": "latest",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0"
+    "@codemirror/commands": "6.11.0",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/merge": "6.12.2",
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.9",
+    "@wailsio/runtime": "3.0.0-alpha.94",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
   },
   "devDependencies": {
-    "@types/react": "^18.2.43",
-    "@types/react-dom": "^18.2.17",
-    "@vitejs/plugin-react": "^6.0.0",
-    "typescript": "^5.2.2",
-    "vite": "^8.0.5"
+    "@types/react": "18.3.31",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "6.0.5",
+    "axe-core": "4.13.0",
+    "jsdom": "29.1.1",
+    "typescript": "5.9.3",
+    "vite": "8.2.1",
+    "vitest": "4.1.10"
   }
 }

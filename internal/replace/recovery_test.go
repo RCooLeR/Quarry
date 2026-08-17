@@ -1,7 +1,9 @@
 package replace
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,18 +16,13 @@ import (
 func TestFindRecoveryStatesFiltersBySourceAndSortsNewestFirst(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.sql")
-	if err := os.WriteFile(sourcePath, []byte("select 1;\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	writeRecoveryFile(t, sourcePath, "select 1;\n")
 
 	outputPath := filepath.Join(dir, "output.sql")
 	tempPath := outputPath + ".quarry.tmp"
-	if err := os.WriteFile(tempPath, []byte("partial"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	fileManifestPath := outputPath + ".quarry.manifest.json"
-	if err := writeManifest(fileManifestPath, Manifest{
+	writeRecoveryFile(t, tempPath, "partial")
+	fileManifestPath := outputPath + recoveryManifestSuffix
+	writeRecoveryManifest(t, fileManifestPath, Manifest{
 		Operation:      "plain-replace",
 		Source:         sourcePath,
 		Output:         outputPath,
@@ -35,12 +32,10 @@ func TestFindRecoveryStatesFiltersBySourceAndSortsNewestFirst(t *testing.T) {
 		BytesProcessed: 5,
 		Matches:        1,
 		Status:         "canceled",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
+	})
 
 	inPlaceManifestPath := sourcePath + ".quarry.inplace.20260528T120000.000000000Z.manifest.json"
-	if err := writeManifest(inPlaceManifestPath, Manifest{
+	writeRecoveryManifest(t, inPlaceManifestPath, Manifest{
 		Operation:      "plain-replace-in-place",
 		Source:         sourcePath,
 		Output:         sourcePath,
@@ -50,21 +45,7 @@ func TestFindRecoveryStatesFiltersBySourceAndSortsNewestFirst(t *testing.T) {
 		Matches:        1,
 		Status:         "failed",
 		Error:          "canceled mid-run",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	otherManifestPath := filepath.Join(dir, "other.sql.quarry.manifest.json")
-	if err := writeManifest(otherManifestPath, Manifest{
-		Operation:  "plain-replace",
-		Source:     filepath.Join(dir, "other.sql"),
-		Output:     filepath.Join(dir, "other.out.sql"),
-		StartedAt:  time.Unix(1716800000, 0).UTC(),
-		SourceSize: 10,
-		Status:     "running",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
+	})
 
 	states, err := FindRecoveryStates(sourcePath)
 	if err != nil {
@@ -73,60 +54,33 @@ func TestFindRecoveryStatesFiltersBySourceAndSortsNewestFirst(t *testing.T) {
 	if len(states) != 2 {
 		t.Fatalf("states = %#v, want 2 entries", states)
 	}
-	if states[0].ManifestPath != inPlaceManifestPath {
-		t.Fatalf("first manifest = %q, want %q", states[0].ManifestPath, inPlaceManifestPath)
+	if states[0].ManifestPath != inPlaceManifestPath || !states[0].InPlace || !states[0].SourceExists {
+		t.Fatalf("unexpected first state: %#v", states[0])
 	}
-	if !states[0].InPlace {
-		t.Fatal("expected in-place recovery state")
-	}
-	if !states[0].SourceExists {
-		t.Fatal("expected sourceExists for in-place manifest")
-	}
-	if states[0].TempExists {
-		t.Fatal("did not expect tempExists for in-place manifest")
-	}
-	if states[1].ManifestPath != fileManifestPath {
-		t.Fatalf("second manifest = %q, want %q", states[1].ManifestPath, fileManifestPath)
-	}
-	if states[1].InPlace {
-		t.Fatal("did not expect file replace recovery state to be marked in-place")
-	}
-	if !states[1].TempExists {
-		t.Fatal("expected tempExists for canceled file replace")
+	if states[1].ManifestPath != fileManifestPath || states[1].InPlace || !states[1].TempExists {
+		t.Fatalf("unexpected second state: %#v", states[1])
 	}
 }
 
 func TestFindRecoveryStatesKeepsLegacyInPlaceManifest(t *testing.T) {
 	dir := t.TempDir()
 	sourcePath := filepath.Join(dir, "source.sql")
-	if err := os.WriteFile(sourcePath, []byte("select 1;\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	legacyManifestPath := sourcePath + ".quarry.inplace.manifest.json"
-	if err := writeManifest(legacyManifestPath, Manifest{
-		Operation:  "plain-replace-in-place",
-		Source:     sourcePath,
-		Output:     sourcePath,
-		StartedAt:  time.Unix(1716790000, 0).UTC(),
-		SourceSize: 10,
-		Status:     "failed",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
+	writeRecoveryFile(t, sourcePath, "select 1;\n")
+	manifestPath := sourcePath + ".quarry.inplace.manifest.json"
+	writeRecoveryManifest(t, manifestPath, Manifest{
+		Operation: "plain-replace-in-place",
+		Source:    sourcePath,
+		Output:    sourcePath,
+		StartedAt: time.Unix(1716790000, 0).UTC(),
+		Status:    "failed",
+	})
 
 	states, err := FindRecoveryStates(sourcePath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(states) != 1 {
-		t.Fatalf("states = %#v, want 1 entry", states)
-	}
-	if states[0].ManifestPath != legacyManifestPath {
-		t.Fatalf("manifest path = %q, want %q", states[0].ManifestPath, legacyManifestPath)
-	}
-	if !states[0].InPlace {
-		t.Fatal("expected legacy in-place recovery state")
+	if len(states) != 1 || states[0].ManifestPath != manifestPath || !states[0].InPlace {
+		t.Fatalf("states = %#v, want legacy in-place manifest", states)
 	}
 }
 
@@ -134,26 +88,18 @@ func TestFindRecoveryStatesLogsMalformedManifestAndContinues(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv(settings.ConfigDirEnv, filepath.Join(dir, "quarry-home"))
 	sourcePath := filepath.Join(dir, "source.sql")
-	if err := os.WriteFile(sourcePath, []byte("select 1;\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
+	writeRecoveryFile(t, sourcePath, "select 1;\n")
 	outputPath := filepath.Join(dir, "output.sql")
-	validManifestPath := outputPath + ".quarry.manifest.json"
-	if err := writeManifest(validManifestPath, Manifest{
-		Operation:  "plain-replace",
-		Source:     sourcePath,
-		Output:     outputPath,
-		StartedAt:  time.Unix(1716780000, 0).UTC(),
-		SourceSize: 10,
-		Status:     "failed",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-	badManifestPath := filepath.Join(dir, "bad.sql.quarry.manifest.json")
-	if err := os.WriteFile(badManifestPath, []byte("{not-json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+	validManifestPath := outputPath + recoveryManifestSuffix
+	writeRecoveryManifest(t, validManifestPath, Manifest{
+		Operation: "plain-replace",
+		Source:    sourcePath,
+		Output:    outputPath,
+		StartedAt: time.Unix(1716780000, 0).UTC(),
+		Status:    "failed",
+	})
+	badManifestPath := filepath.Join(dir, "bad.sql") + recoveryManifestSuffix
+	writeRecoveryFile(t, badManifestPath, "{not-json")
 
 	states, err := FindRecoveryStates(sourcePath)
 	if err != nil {
@@ -162,56 +108,279 @@ func TestFindRecoveryStatesLogsMalformedManifestAndContinues(t *testing.T) {
 	if len(states) != 1 || states[0].ManifestPath != validManifestPath {
 		t.Fatalf("states = %#v, want only valid manifest", states)
 	}
-
-	logPath := filepath.Join(dir, "quarry-home", "quarry.log")
-	data, err := os.ReadFile(logPath)
+	logData, err := os.ReadFile(filepath.Join(dir, "quarry-home", "quarry.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	logText := string(data)
-	if !strings.Contains(logText, "skipping recovery manifest") || !strings.Contains(logText, filepath.Base(badManifestPath)) {
+	if logText := string(logData); !strings.Contains(logText, "skipping recovery manifest") || !strings.Contains(logText, filepath.Base(badManifestPath)) {
 		t.Fatalf("log = %q, want malformed manifest warning", logText)
 	}
 }
 
-func TestDeleteRecoveryTempRemovesPartialOutput(t *testing.T) {
-	dir := t.TempDir()
-	tempPath := filepath.Join(dir, "output.sql.quarry.tmp")
-	if err := os.WriteFile(tempPath, []byte("partial"), 0o600); err != nil {
-		t.Fatal(err)
-	}
+func TestLoadManifestRejectsOversizedUnknownAndTrailingJSON(t *testing.T) {
+	t.Run("oversized", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "output.sql") + recoveryManifestSuffix
+		writeRecoveryFile(t, path, strings.Repeat(" ", maxRecoveryManifestBytes+1))
+		if _, err := LoadManifest(path); !errors.Is(err, ErrInvalidRecoveryManifest) {
+			t.Fatalf("LoadManifest error = %v, want ErrInvalidRecoveryManifest", err)
+		}
+	})
 
-	state := RecoveryState{
-		Manifest: Manifest{
-			TempOutput: tempPath,
-		},
-	}
-	if err := DeleteRecoveryTemp(state); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
-		t.Fatalf("temp path should be removed, stat err = %v", err)
+	for _, tc := range []struct {
+		name   string
+		mutate func([]byte) []byte
+	}{
+		{name: "unknown field", mutate: func(data []byte) []byte {
+			return append(data[:len(data)-1], []byte(`,"forged":true}`)...)
+		}},
+		{name: "duplicate field", mutate: func(data []byte) []byte {
+			return append(data[:len(data)-1], []byte(`,"operation":"regex-replace"}`)...)
+		}},
+		{name: "trailing object", mutate: func(data []byte) []byte {
+			return append(data, []byte(` {}`)...)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			sourcePath := filepath.Join(dir, "source.sql")
+			outputPath := filepath.Join(dir, "output.sql")
+			manifestPath := outputPath + recoveryManifestSuffix
+			data, err := json.Marshal(Manifest{
+				Operation: "plain-replace", Source: sourcePath, Output: outputPath,
+				StartedAt: time.Now().UTC(), Status: "failed",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(manifestPath, tc.mutate(data), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := LoadManifest(manifestPath); !errors.Is(err, ErrInvalidRecoveryManifest) {
+				t.Fatalf("LoadManifest error = %v, want ErrInvalidRecoveryManifest", err)
+			}
+		})
 	}
 }
 
-func TestCleanupCompletedRecoveryManifestsRemovesOnlyOldCompleteFiles(t *testing.T) {
+func TestFindRecoveryStatesRejectsCandidateFlood(t *testing.T) {
 	dir := t.TempDir()
-	now := time.Unix(2000, 0).UTC()
+	sourcePath := filepath.Join(dir, "source.sql")
+	writeRecoveryFile(t, sourcePath, "source")
+	for i := 0; i <= maxRecoveryManifestCandidates; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("candidate-%04d.sql%s", i, recoveryManifestSuffix))
+		writeRecoveryFile(t, path, "{}")
+	}
+	if _, err := FindRecoveryStates(sourcePath); !errors.Is(err, ErrRecoveryScanLimit) {
+		t.Fatalf("FindRecoveryStates error = %v, want ErrRecoveryScanLimit", err)
+	}
+}
+
+func TestLoadManifestRejectsSymlinkWithoutFollowingTarget(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.sql")
+	outputPath := filepath.Join(dir, "output.sql")
+	targetPath := filepath.Join(dir, "target.json")
+	manifestPath := outputPath + recoveryManifestSuffix
+	writeRecoveryManifest(t, targetPath, Manifest{
+		Operation: "plain-replace", Source: sourcePath, Output: outputPath,
+		StartedAt: time.Now().UTC(), Status: "failed",
+	})
+	before := readRecoveryFile(t, targetPath)
+	if err := os.Symlink(targetPath, manifestPath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := LoadManifest(manifestPath); !errors.Is(err, ErrInvalidRecoveryManifest) {
+		t.Fatalf("LoadManifest error = %v, want ErrInvalidRecoveryManifest", err)
+	}
+	if after := readRecoveryFile(t, targetPath); after != before {
+		t.Fatal("symlink target changed")
+	}
+}
+
+func TestInspectRecoveryManifestRejectsForgedPathInstructions(t *testing.T) {
+	for _, field := range []string{"source", "output", "temp", "backup", "planned backup"} {
+		t.Run(field, func(t *testing.T) {
+			dir := t.TempDir()
+			foreignDir := t.TempDir()
+			sourcePath := filepath.Join(dir, "source.sql")
+			outputPath := filepath.Join(dir, "output.sql")
+			tempPath := outputPath + ".quarry.tmp"
+			backupPath := sourcePath + ".quarry.bak"
+			foreignPath := filepath.Join(foreignDir, field+".sentinel")
+			for path, body := range map[string]string{
+				sourcePath: "source", outputPath: "destination", tempPath: "temp",
+				backupPath: "backup", foreignPath: "foreign",
+			} {
+				writeRecoveryFile(t, path, body)
+			}
+			manifest := Manifest{
+				Operation: "plain-replace", Source: sourcePath, Output: outputPath,
+				TempOutput: tempPath, StartedAt: time.Now().UTC(), Status: "failed",
+				Phase: "ready_to_finalize",
+			}
+			switch field {
+			case "source":
+				manifest.Source = foreignPath
+			case "output":
+				manifest.Output = foreignPath
+			case "temp":
+				manifest.TempOutput = foreignPath
+			case "backup":
+				manifest.SwapRequested, manifest.Backup = true, foreignPath
+			case "planned backup":
+				manifest.SwapRequested, manifest.BackupPlanned = true, foreignPath
+			}
+			manifestPath := outputPath + recoveryManifestSuffix
+			writeRecoveryManifest(t, manifestPath, manifest)
+			if _, err := InspectRecoveryManifest(manifestPath); !errors.Is(err, ErrInvalidRecoveryManifest) {
+				t.Fatalf("InspectRecoveryManifest error = %v, want ErrInvalidRecoveryManifest", err)
+			}
+			assertRecoveryFile(t, sourcePath, "source")
+			assertRecoveryFile(t, outputPath, "destination")
+			assertRecoveryFile(t, tempPath, "temp")
+			assertRecoveryFile(t, backupPath, "backup")
+			assertRecoveryFile(t, foreignPath, "foreign")
+		})
+	}
+}
+
+func TestInspectRecoveryManifestRejectsSymlinkArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	sourceTarget := filepath.Join(dir, "source-target.sql")
+	sourcePath := filepath.Join(dir, "source.sql")
+	outputPath := filepath.Join(dir, "output.sql")
+	writeRecoveryFile(t, sourceTarget, "source target")
+	if err := os.Symlink(sourceTarget, sourcePath); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	manifestPath := outputPath + recoveryManifestSuffix
+	writeRecoveryManifest(t, manifestPath, Manifest{
+		Operation: "plain-replace", Source: sourcePath, Output: outputPath,
+		StartedAt: time.Now().UTC(), Status: "failed",
+	})
+	if _, err := InspectRecoveryManifest(manifestPath); !errors.Is(err, ErrInvalidRecoveryManifest) {
+		t.Fatalf("InspectRecoveryManifest error = %v, want ErrInvalidRecoveryManifest", err)
+	}
+	assertRecoveryFile(t, sourceTarget, "source target")
+}
+
+func TestRecoveryMutationAPIsFailClosedAndPreserveArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.sql")
+	outputPath := filepath.Join(dir, "output.sql")
+	tempPath := outputPath + ".quarry.tmp"
+	manifestPath := outputPath + recoveryManifestSuffix
+	writeRecoveryFile(t, sourcePath, "source")
+	writeRecoveryFile(t, tempPath, "temp output")
+	writeRecoveryManifest(t, manifestPath, Manifest{
+		Operation: "plain-replace", Source: sourcePath, Output: outputPath,
+		TempOutput: tempPath, Phase: "ready_to_finalize",
+		StartedAt: time.Now().UTC(), SourceSize: int64(len("source")), Status: "failed",
+	})
+	state, err := InspectRecoveryManifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifestBefore := readRecoveryFile(t, manifestPath)
+	if can, reason := CanResumeRecovery(state); can || reason != ErrRecoveryMutationDisabled.Error() {
+		t.Fatalf("CanResumeRecovery = %v, %q", can, reason)
+	}
+	if _, err := ResumeRecovery(state); !errors.Is(err, ErrRecoveryMutationDisabled) {
+		t.Fatalf("ResumeRecovery error = %v, want ErrRecoveryMutationDisabled", err)
+	}
+	if err := DeleteRecoveryTemp(state); !errors.Is(err, ErrRecoveryMutationDisabled) {
+		t.Fatalf("DeleteRecoveryTemp error = %v, want ErrRecoveryMutationDisabled", err)
+	}
+	assertRecoveryFile(t, sourcePath, "source")
+	assertRecoveryFile(t, tempPath, "temp output")
+	if _, err := os.Lstat(outputPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("output should remain absent: %v", err)
+	}
+	if manifestAfter := readRecoveryFile(t, manifestPath); manifestAfter != manifestBefore {
+		t.Fatal("manifest changed after refused recovery")
+	}
+}
+
+func TestRecoveryMutationAPIsIgnoreFabricatedStatePaths(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.sql")
+	outputPath := filepath.Join(dir, "destination.sql")
+	tempPath := filepath.Join(dir, "temp.sql")
+	backupPath := filepath.Join(dir, "backup.sql")
+	for path, body := range map[string]string{
+		sourcePath: "source", outputPath: "destination", tempPath: "temp", backupPath: "backup",
+	} {
+		writeRecoveryFile(t, path, body)
+	}
+	state := RecoveryState{ManifestPath: filepath.Join(dir, "forged.json"), Manifest: Manifest{
+		Source: sourcePath, Output: outputPath, TempOutput: tempPath, Backup: backupPath,
+	}}
+	if _, err := ResumeRecovery(state); !errors.Is(err, ErrRecoveryMutationDisabled) {
+		t.Fatalf("ResumeRecovery error = %v", err)
+	}
+	if err := DeleteRecoveryTemp(state); !errors.Is(err, ErrRecoveryMutationDisabled) {
+		t.Fatalf("DeleteRecoveryTemp error = %v", err)
+	}
+	if _, _, ok := RecoveryOpenPath(state); ok {
+		t.Fatal("fabricated state produced an open path")
+	}
+	assertRecoveryFile(t, sourcePath, "source")
+	assertRecoveryFile(t, outputPath, "destination")
+	assertRecoveryFile(t, tempPath, "temp")
+	assertRecoveryFile(t, backupPath, "backup")
+}
+
+func TestInspectRecoveryManifestAndOpenPathUseValidatedArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.sql")
+	outputPath := filepath.Join(dir, "output.sql")
+	tempPath := outputPath + ".quarry.tmp"
+	writeRecoveryFile(t, sourcePath, "source")
+	writeRecoveryFile(t, tempPath, "partial")
+	manifestPath := outputPath + recoveryManifestSuffix
+	writeRecoveryManifest(t, manifestPath, Manifest{
+		Operation: "plain-replace", Source: sourcePath, Output: outputPath,
+		TempOutput: tempPath, StartedAt: time.Now().UTC(), Status: "canceled",
+	})
+	state, err := InspectRecoveryManifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, label, ok := RecoveryOpenPath(state)
+	if !ok || path != tempPath || label != "partial temp output" {
+		t.Fatalf("RecoveryOpenPath = %q, %q, %v", path, label, ok)
+	}
+}
+
+func TestCleanupCompletedRecoveryManifestsRequiresValidatedState(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Unix(2_000_000, 0).UTC()
 	oldCompletedAt := now.Add(-72 * time.Hour)
 	recentCompletedAt := now.Add(-time.Hour)
-	oldPath := filepath.Join(dir, "old.quarry.manifest.json")
-	recentPath := filepath.Join(dir, "recent.quarry.manifest.json")
-	runningPath := filepath.Join(dir, "running.quarry.manifest.json")
-	for _, path := range []string{oldPath, recentPath, runningPath} {
-		if err := os.WriteFile(path, []byte("{}"), 0o600); err != nil {
+	sourcePath := filepath.Join(dir, "source.sql")
+	writeRecoveryFile(t, sourcePath, "source")
+
+	makeState := func(name, status string, completedAt *time.Time) RecoveryState {
+		outputPath := filepath.Join(dir, name)
+		manifestPath := outputPath + recoveryManifestSuffix
+		writeRecoveryManifest(t, manifestPath, Manifest{
+			Operation: "plain-replace", Source: sourcePath, Output: outputPath,
+			StartedAt: now.Add(-96 * time.Hour), CompletedAt: completedAt, Status: status,
+		})
+		state, err := InspectRecoveryManifest(manifestPath)
+		if err != nil {
 			t.Fatal(err)
 		}
+		return state
 	}
+	old := makeState("old.sql", "complete", &oldCompletedAt)
+	recent := makeState("recent.sql", "complete", &recentCompletedAt)
+	running := makeState("running.sql", "running", nil)
 
 	removed, err := CleanupCompletedRecoveryManifests([]RecoveryState{
-		{ManifestPath: oldPath, Manifest: Manifest{Status: "complete", CompletedAt: &oldCompletedAt}},
-		{ManifestPath: recentPath, Manifest: Manifest{Status: "complete", CompletedAt: &recentCompletedAt}},
-		{ManifestPath: runningPath, Manifest: Manifest{Status: "running"}},
+		old, recent, running,
+		{ManifestPath: old.ManifestPath, Manifest: old.Manifest}, // fabricated copy has no validation authority
 	}, 48*time.Hour, now)
 	if err != nil {
 		t.Fatal(err)
@@ -219,699 +388,42 @@ func TestCleanupCompletedRecoveryManifestsRemovesOnlyOldCompleteFiles(t *testing
 	if removed != 1 {
 		t.Fatalf("removed = %d, want 1", removed)
 	}
-	if _, err := os.Stat(oldPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("old manifest stat err = %v, want removed", err)
+	if _, err := os.Lstat(old.ManifestPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("old manifest should be removed: %v", err)
 	}
-	for _, path := range []string{recentPath, runningPath} {
-		if _, err := os.Stat(path); err != nil {
+	for _, path := range []string{recent.ManifestPath, running.ManifestPath} {
+		if _, err := os.Lstat(path); err != nil {
 			t.Fatalf("%s should remain: %v", path, err)
 		}
 	}
 }
 
-func TestInspectRecoveryManifestDetectsBackupAndOpenTargets(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	if err := os.WriteFile(sourcePath, []byte("source"), 0o600); err != nil {
+func writeRecoveryManifest(t *testing.T, path string, manifest Manifest) {
+	t.Helper()
+	if err := writeManifest(path, manifest, true); err != nil {
 		t.Fatal(err)
-	}
-	if err := os.WriteFile(outputPath, []byte("output"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(backupPath, []byte("backup"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:  "plain-replace",
-		Source:     sourcePath,
-		Output:     outputPath,
-		Backup:     backupPath,
-		StartedAt:  time.Unix(1716781000, 0).UTC(),
-		SourceSize: 6,
-		Status:     "complete",
-		Swapped:    true,
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !state.OutputExists {
-		t.Fatal("expected outputExists")
-	}
-	if !state.BackupExists {
-		t.Fatal("expected backupExists")
-	}
-	path, label, ok := RecoveryOpenPath(state)
-	if !ok {
-		t.Fatal("expected recovery open path")
-	}
-	if path != outputPath {
-		t.Fatalf("path = %q, want %q", path, outputPath)
-	}
-	if label != "output file" {
-		t.Fatalf("label = %q, want output file", label)
 	}
 }
 
-func TestRecoveryOpenPathPrefersTempOutput(t *testing.T) {
-	state := RecoveryState{
-		Manifest: Manifest{
-			TempOutput: "temp.sql",
-			Output:     "output.sql",
-			Backup:     "backup.sql",
-		},
-		TempExists:   true,
-		OutputExists: true,
-		BackupExists: true,
-	}
-	path, label, ok := RecoveryOpenPath(state)
-	if !ok {
-		t.Fatal("expected open path")
-	}
-	if path != "temp.sql" || label != "partial temp output" {
-		t.Fatalf("got %q / %q", path, label)
+func writeRecoveryFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
-func TestCanResumeRecoveryRequiresReadyPhase(t *testing.T) {
-	state := RecoveryState{
-		Manifest: Manifest{
-			Operation:  "plain-replace",
-			Source:     "source.sql",
-			Output:     "output.sql",
-			TempOutput: "output.sql.quarry.tmp",
-			Phase:      "processing",
-			Status:     "failed",
-		},
-		SourceExists: true,
-		TempExists:   true,
+func readRecoveryFile(t *testing.T, path string) string {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
 	}
-
-	canResume, reason := CanResumeRecovery(state)
-	if canResume {
-		t.Fatal("expected recovery state to be non-resumable")
-	}
-	if reason != "manifest phase is processing" {
-		t.Fatalf("reason = %q", reason)
-	}
+	return string(data)
 }
 
-func TestResumeRecoveryFinalizesOutput(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	tempPath := outputPath + ".quarry.tmp"
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("source body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tempPath, []byte("new output"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		TempOutput:     tempPath,
-		Phase:          "ready_to_finalize",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     int64(len("source body")),
-		BytesProcessed: int64(len("source body")),
-		Status:         "failed",
-		Error:          "interrupted before finalize",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resumed, err := ResumeRecovery(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resumed.Manifest.Status != "complete" {
-		t.Fatalf("manifest status = %q", resumed.Manifest.Status)
-	}
-	if resumed.Manifest.Phase != "complete" {
-		t.Fatalf("manifest phase = %q", resumed.Manifest.Phase)
-	}
-	if !resumed.OutputExists {
-		t.Fatal("expected output to exist after resume")
-	}
-	if resumed.TempExists {
-		t.Fatal("did not expect temp output after resume")
-	}
-	gotOutput, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotOutput) != "new output" {
-		t.Fatalf("output = %q", string(gotOutput))
-	}
-	gotSource, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotSource) != "source body" {
-		t.Fatalf("source = %q", string(gotSource))
-	}
-}
-
-func TestResumeRecoveryWithSwapOriginal(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	tempPath := outputPath + ".quarry.tmp"
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("old source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tempPath, []byte("new source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	srcInfo, err := os.Stat(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		TempOutput:     tempPath,
-		Phase:          "ready_to_finalize",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     srcInfo.Size(),
-		SourceModTime:  srcInfo.ModTime().UnixNano(),
-		BytesProcessed: srcInfo.Size(),
-		BackupPlanned:  backupPath,
-		SwapRequested:  true,
-		Status:         "failed",
-		Error:          "interrupted before swap",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resumed, err := ResumeRecovery(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resumed.Manifest.Status != "complete" {
-		t.Fatalf("manifest status = %q", resumed.Manifest.Status)
-	}
-	if resumed.Manifest.Phase != "complete" {
-		t.Fatalf("manifest phase = %q", resumed.Manifest.Phase)
-	}
-	if !resumed.Manifest.Swapped {
-		t.Fatal("expected swapped=true")
-	}
-	if resumed.Manifest.Backup != backupPath {
-		t.Fatalf("backup = %q, want %q", resumed.Manifest.Backup, backupPath)
-	}
-
-	gotSource, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotSource) != "new source" {
-		t.Fatalf("source = %q", string(gotSource))
-	}
-	gotBackup, err := os.ReadFile(backupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotBackup) != "old source" {
-		t.Fatalf("backup = %q", string(gotBackup))
-	}
-	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("expected intermediate output to be moved into source, stat err = %v", err)
-	}
-}
-
-func TestCanResumeRecoveryRejectsWhenOutputAlreadyExists(t *testing.T) {
-	state := RecoveryState{
-		Manifest: Manifest{
-			Operation:  "plain-replace",
-			Source:     "source.sql",
-			Output:     "output.sql",
-			TempOutput: "output.sql.quarry.tmp",
-			Phase:      "ready_to_finalize",
-			Status:     "failed",
-		},
-		TempExists:   true,
-		OutputExists: true,
-	}
-
-	canResume, reason := CanResumeRecovery(state)
-	if canResume {
-		t.Fatal("expected non-resumable state")
-	}
-	if reason != "output file already exists" {
-		t.Fatalf("reason = %q", reason)
-	}
-}
-
-func TestCanResumeRecoveryAllowsOutputWrittenWithoutSwap(t *testing.T) {
-	state := RecoveryState{
-		Manifest: Manifest{
-			Operation: "plain-replace",
-			Source:    "source.sql",
-			Output:    "output.sql",
-			Phase:     "output_written",
-			Status:    "failed",
-		},
-		OutputExists: true,
-	}
-
-	canResume, reason := CanResumeRecovery(state)
-	if !canResume {
-		t.Fatalf("expected resumable state, reason = %q", reason)
-	}
-}
-
-func TestCanResumeRecoveryAllowsOutputWrittenSwapWithMissingSourceAndBackup(t *testing.T) {
-	state := RecoveryState{
-		Manifest: Manifest{
-			Operation:     "plain-replace",
-			Source:        "source.sql",
-			Output:        "output.sql",
-			Phase:         "output_written",
-			Status:        "failed",
-			SwapRequested: true,
-		},
-		OutputExists: true,
-		BackupExists: true,
-	}
-
-	canResume, reason := CanResumeRecovery(state)
-	if !canResume {
-		t.Fatalf("expected resumable state, reason = %q", reason)
-	}
-}
-
-func TestResumeRecoverySwapPrecheckSourceModifiedKeepsOutput(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	tempPath := outputPath + ".quarry.tmp"
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("old source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	srcInfo, err := os.Stat(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tempPath, []byte("new source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		TempOutput:     tempPath,
-		Phase:          "ready_to_finalize",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     srcInfo.Size(),
-		SourceModTime:  srcInfo.ModTime().UnixNano(),
-		BytesProcessed: srcInfo.Size(),
-		BackupPlanned:  backupPath,
-		SwapRequested:  true,
-		Status:         "failed",
-		Error:          "interrupted before swap",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	time.Sleep(10 * time.Millisecond)
-	if err := os.WriteFile(sourcePath, []byte("source changed externally"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = ResumeRecovery(state)
-	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
-		t.Fatalf("err = %v, want %v", err, ErrSourceModifiedDuringOperation)
-	}
-	if _, err := os.Stat(tempPath); !os.IsNotExist(err) {
-		t.Fatalf("temp should be promoted before swap checks, stat err = %v", err)
-	}
-	if _, err := os.Stat(outputPath); err != nil {
-		t.Fatalf("output should remain for retry/audit, stat err = %v", err)
-	}
-	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
-		t.Fatalf("backup should not exist, stat err = %v", err)
-	}
-
-	manifest := readManifest(t, manifestPath)
-	if manifest.Status != "failed" {
-		t.Fatalf("manifest status = %q", manifest.Status)
-	}
-	if manifest.Error != ErrSourceModifiedDuringOperation.Error() {
-		t.Fatalf("manifest error = %q", manifest.Error)
-	}
-}
-
-func TestResumeRecoveryOutputWrittenNoSwapCompletes(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("source body"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(outputPath, []byte("new output"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		Phase:          "output_written",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     int64(len("source body")),
-		BytesProcessed: int64(len("source body")),
-		Status:         "failed",
-		Error:          "interrupted before completion",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resumed, err := ResumeRecovery(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resumed.Manifest.Status != "complete" {
-		t.Fatalf("manifest status = %q", resumed.Manifest.Status)
-	}
-	if resumed.Manifest.Phase != "complete" {
-		t.Fatalf("manifest phase = %q", resumed.Manifest.Phase)
-	}
-
-	gotOutput, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotOutput) != "new output" {
-		t.Fatalf("output = %q", gotOutput)
-	}
-}
-
-func TestResumeRecoveryOutputWrittenSwapSourceMissingUsesBackup(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("old source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(outputPath, []byte("new source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Rename(sourcePath, backupPath); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		Phase:          "output_written",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     int64(len("old source")),
-		BytesProcessed: int64(len("old source")),
-		SwapRequested:  true,
-		BackupPlanned:  backupPath,
-		Status:         "failed",
-		Error:          "interrupted mid-swap",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resumed, err := ResumeRecovery(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resumed.Manifest.Status != "complete" {
-		t.Fatalf("manifest status = %q", resumed.Manifest.Status)
-	}
-	if !resumed.Manifest.Swapped {
-		t.Fatal("expected swapped=true")
-	}
-	if resumed.Manifest.Backup != backupPath {
-		t.Fatalf("backup = %q, want %q", resumed.Manifest.Backup, backupPath)
-	}
-
-	gotSource, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotSource) != "new source" {
-		t.Fatalf("source = %q", gotSource)
-	}
-	gotBackup, err := os.ReadFile(backupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotBackup) != "old source" {
-		t.Fatalf("backup = %q", gotBackup)
-	}
-	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("expected output to be moved into source, stat err = %v", err)
-	}
-}
-
-func TestResumeRecoverySwappedPhaseCompletesManifest(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("new source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(backupPath, []byte("old source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		Phase:          "swapped",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     int64(len("old source")),
-		BytesProcessed: int64(len("old source")),
-		SwapRequested:  true,
-		Swapped:        true,
-		Backup:         backupPath,
-		Status:         "failed",
-		Error:          "interrupted before manifest close-out",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resumed, err := ResumeRecovery(state)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resumed.Manifest.Status != "complete" {
-		t.Fatalf("manifest status = %q", resumed.Manifest.Status)
-	}
-	if resumed.Manifest.Phase != "complete" {
-		t.Fatalf("manifest phase = %q", resumed.Manifest.Phase)
-	}
-}
-
-func TestResumeRecoverySwapFailureRollsBackSource(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	tempPath := outputPath + ".quarry.tmp"
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("old source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tempPath, []byte("new source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	srcInfo, err := os.Stat(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		TempOutput:     tempPath,
-		Phase:          "ready_to_finalize",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     srcInfo.Size(),
-		SourceModTime:  srcInfo.ModTime().UnixNano(),
-		BytesProcessed: srcInfo.Size(),
-		BackupPlanned:  backupPath,
-		SwapRequested:  true,
-		Status:         "failed",
-		Error:          "interrupted before swap",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	lockedErr := errors.New("destination is locked")
-	restoreRename := renamePath
-	renamePath = func(oldPath string, newPath string) error {
-		if filepath.Clean(oldPath) == filepath.Clean(outputPath) && filepath.Clean(newPath) == filepath.Clean(sourcePath) {
-			return lockedErr
-		}
-		return os.Rename(oldPath, newPath)
-	}
-	t.Cleanup(func() {
-		renamePath = restoreRename
-	})
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = ResumeRecovery(state)
-	if !errors.Is(err, lockedErr) {
-		t.Fatalf("err = %v, want %v", err, lockedErr)
-	}
-
-	gotSource, err := os.ReadFile(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotSource) != "old source" {
-		t.Fatalf("source = %q", gotSource)
-	}
-	if _, err := os.Stat(backupPath); !os.IsNotExist(err) {
-		t.Fatalf("backup should be rolled back, stat err = %v", err)
-	}
-	gotOutput, err := os.ReadFile(outputPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(gotOutput) != "new source" {
-		t.Fatalf("output = %q", gotOutput)
-	}
-
-	manifest := readManifest(t, manifestPath)
-	if manifest.Status != "failed" {
-		t.Fatalf("manifest status = %q", manifest.Status)
-	}
-	if manifest.Error != lockedErr.Error() {
-		t.Fatalf("manifest error = %q", manifest.Error)
-	}
-}
-
-func TestResumeRecoverySwapRollbackFailureIncludesRollbackError(t *testing.T) {
-	dir := t.TempDir()
-	sourcePath := filepath.Join(dir, "source.sql")
-	outputPath := filepath.Join(dir, "output.sql")
-	tempPath := outputPath + ".quarry.tmp"
-	backupPath := filepath.Join(dir, "source.sql.quarry.bak")
-	manifestPath := outputPath + ".quarry.manifest.json"
-	if err := os.WriteFile(sourcePath, []byte("old source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(tempPath, []byte("new source"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	srcInfo, err := os.Stat(sourcePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if err := writeManifest(manifestPath, Manifest{
-		Operation:      "plain-replace",
-		Source:         sourcePath,
-		Output:         outputPath,
-		TempOutput:     tempPath,
-		Phase:          "ready_to_finalize",
-		StartedAt:      time.Now().Add(-2 * time.Minute).UTC(),
-		SourceSize:     srcInfo.Size(),
-		SourceModTime:  srcInfo.ModTime().UnixNano(),
-		BytesProcessed: srcInfo.Size(),
-		BackupPlanned:  backupPath,
-		SwapRequested:  true,
-		Status:         "failed",
-		Error:          "interrupted before swap",
-	}, true); err != nil {
-		t.Fatal(err)
-	}
-
-	swapErr := errors.New("destination is locked")
-	rollbackErr := errors.New("rollback failed")
-	restoreRename := renamePath
-	renamePath = func(oldPath string, newPath string) error {
-		cleanOld := filepath.Clean(oldPath)
-		cleanNew := filepath.Clean(newPath)
-		if cleanOld == filepath.Clean(outputPath) && cleanNew == filepath.Clean(sourcePath) {
-			return swapErr
-		}
-		if cleanOld == filepath.Clean(backupPath) && cleanNew == filepath.Clean(sourcePath) {
-			return rollbackErr
-		}
-		return os.Rename(oldPath, newPath)
-	}
-	t.Cleanup(func() {
-		renamePath = restoreRename
-	})
-
-	state, err := InspectRecoveryManifest(manifestPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = ResumeRecovery(state)
-	if err == nil {
-		t.Fatal("expected resume failure")
-	}
-	if !strings.Contains(err.Error(), swapErr.Error()) || !strings.Contains(err.Error(), rollbackErr.Error()) {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	manifest := readManifest(t, manifestPath)
-	if manifest.Status != "failed" {
-		t.Fatalf("manifest status = %q", manifest.Status)
-	}
-	if !strings.Contains(manifest.Error, swapErr.Error()) || !strings.Contains(manifest.Error, rollbackErr.Error()) {
-		t.Fatalf("manifest error = %q", manifest.Error)
+func assertRecoveryFile(t *testing.T, path, want string) {
+	t.Helper()
+	if got := readRecoveryFile(t, path); got != want {
+		t.Fatalf("%s = %q, want %q", path, got, want)
 	}
 }

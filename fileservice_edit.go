@@ -1,14 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
+	"unicode/utf8"
 
-	"github.com/wailsapp/wails/v3/pkg/application"
-
-	"github.com/quarry/quarry-wails3/internal/inplace"
 	"github.com/quarry/quarry-wails3/internal/manualedit"
 	"github.com/quarry/quarry-wails3/internal/session"
 )
@@ -24,55 +24,80 @@ type StagedEdit struct {
 }
 
 const stagedPreviewBytes = 240
+const maxStagedEditPreviews = manualedit.DefaultMaxEditCount
+const maxStagedEditPreviewBytes = maxStagedEditPreviews * stagedPreviewBytes
 
 // GetStagedEdits returns the pending edits (source-anchored) for the diff panel.
 func (s *FileService) GetStagedEdits(fileID string) ([]StagedEdit, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return nil, fmt.Errorf("unknown file id %q", fileID)
+	lease, f, err := s.acquireReadFile(fileID)
+	if err != nil {
+		return nil, err
 	}
+	defer lease.Release()
 	if f.Edit == nil || !f.Edit.HasEdits() {
 		return nil, nil
 	}
 	edits := f.Edit.SourceMappedActiveEdits()
+	if len(edits) > maxStagedEditPreviews {
+		return nil, fmt.Errorf("staged edit count %d exceeds bounded preview limit %d", len(edits), maxStagedEditPreviews)
+	}
+	ranges := make([]manualedit.Range, len(edits))
+	for index, edit := range edits {
+		oldEnd := edit.End
+		if oldEnd-edit.Start > stagedPreviewBytes {
+			oldEnd = edit.Start + stagedPreviewBytes
+		}
+		ranges[index] = manualedit.Range{Start: edit.Start, End: oldEnd}
+	}
+	oldPreviews, err := f.Edit.ReadSourcePreviewRangesContext(
+		context.Background(),
+		ranges,
+		maxStagedEditPreviews,
+		stagedPreviewBytes,
+		maxStagedEditPreviewBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]StagedEdit, 0, len(edits))
-	for _, e := range edits {
-		oldEnd := e.End
-		if oldEnd > e.Start+stagedPreviewBytes {
-			oldEnd = e.Start + stagedPreviewBytes
-		}
-		oldBytes, err := f.Doc.ReadRange(e.Start, oldEnd)
-		if err != nil {
-			return nil, err
-		}
+	for index, e := range edits {
 		line, _ := f.Doc.ApproxOffsetToLine(e.Start)
 		out = append(out, StagedEdit{
 			Start: e.Start,
 			End:   e.End,
 			Line:  line,
-			Old:   string(oldBytes),
+			Old:   string(oldPreviews[index]),
 			New:   truncateBytes(e.Text, stagedPreviewBytes),
 		})
+	}
+	if err := f.Edit.ValidateSourceContext(context.Background()); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
 // SaveCopyViaDialog shows a native save dialog and writes the edited copy there.
 // A cancelled dialog returns an empty SaveResult (Mode == "") with nil error.
+var saveCopySaveDialog = saveDialog
+
 func (s *FileService) SaveCopyViaDialog(fileID string) (SaveResult, error) {
-	if _, ok := s.reg.Get(fileID); !ok {
-		return SaveResult{}, fmt.Errorf("unknown file id %q", fileID)
-	}
-	dst, err := application.Get().Dialog.SaveFile().
-		SetMessage("Save edited copy as").
-		PromptForSingleSelection()
+	lease, file, finishPreflight, err := s.acquireReadFilePreflight(fileID)
 	if err != nil {
 		return SaveResult{}, err
 	}
-	if strings.TrimSpace(dst) == "" {
+	approval, err := captureSaveCopyApproval(lease, file)
+	finishPreflight()
+	if err != nil {
+		return SaveResult{}, err
+	}
+	dst, err := saveCopySaveDialog("Save edited copy as", "")
+	if err != nil {
+		return SaveResult{}, err
+	}
+	if dst == "" {
 		return SaveResult{}, nil // cancelled
 	}
-	return s.SaveCopy(fileID, dst)
+	return s.saveCopyApproved(fileID, dst, approval)
 }
 
 func truncateBytes(b []byte, max int) string {
@@ -83,6 +108,13 @@ func truncateBytes(b []byte, max int) string {
 }
 
 const editWindowBytes = 1 << 20 // 1 MiB editable window budget
+const editRPCTextBytes = editWindowBytes + int(manualedit.DefaultMaxInsertedBytes)
+
+// Keep the aggregate retained edit-session population below the broader
+// 128-file registry cap. Each admitted session is already governed by fixed
+// history, inserted-text, piece, source-verification, and transient limits;
+// this service-owned cap makes their process-wide multiplier finite too.
+const maxPreparedEditSessions = 4
 
 // StagingState summarizes pending edits and which save modes are available.
 type StagingState struct {
@@ -101,34 +133,122 @@ type SaveResult struct {
 	OutputPath   string `json:"outputPath"`
 }
 
+var (
+	// ErrFileNotEditable is returned when a direct RPC caller attempts to edit
+	// a format that Quarry cannot round-trip byte-exactly yet.
+	ErrFileNotEditable = errors.New("file is not editable")
+	// ErrEditRequestTooLarge bounds direct RPC amplification independently of
+	// frontend behavior.
+	ErrEditRequestTooLarge = errors.New("edit request exceeds the bounded editor budget")
+	// ErrEditSessionNotPrepared keeps the StageEdit bridge call bounded. The
+	// first full-source fingerprint must run through cancellable
+	// PrepareEditSession before any edited text is accepted.
+	ErrEditSessionNotPrepared = errors.New("edit session is not prepared; prepare editing before staging text")
+	// ErrPreparedEditSessionLimit rejects before allocating another retained
+	// source fingerprint when the service-wide edit-session cap is occupied.
+	ErrPreparedEditSessionLimit = errors.New("prepared edit session limit reached")
+	// ErrStagedEditsPending prevents refresh/follow callers from discarding the
+	// only staged copy without an explicit save or discard decision.
+	ErrStagedEditsPending = errors.New("staged edits must be saved or discarded before refresh or close")
+	// ErrDiffCoordinateMapping prevents a side-by-side view from comparing
+	// unrelated source and edited offsets when an exact conservative mapping is
+	// unavailable.
+	ErrDiffCoordinateMapping = errors.New("diff window cannot map edited offsets to source offsets")
+	// ErrSaveCopyStateChanged means the exact staged state approved before the
+	// native save dialog no longer owns the file after that dialog returned.
+	ErrSaveCopyStateChanged = errors.New("staged edit state changed while choosing the save-copy destination")
+	// ErrInPlaceSaveDisabled keeps source mutation unavailable until Quarry can
+	// retain and verify a durable user-restorable backup after a successful save.
+	ErrInPlaceSaveDisabled = errors.New("in-place save is disabled until durable backup and recovery are available; use Save copy")
+)
+
 func sidecarPath(path string) string { return path + ".qrp" }
 
-// recoverInPlace replays any leftover in-place patch sidecar before a file is
-// opened, so reads see a consistent state after a crash mid-save.
-func recoverInPlace(path string) {
-	_, _ = inplace.Recover(path, sidecarPath(path))
+// ErrInPlaceRecoveryPending indicates that ordinary open was stopped because
+// adjacent crash-recovery data exists. The source and sidecar are left exactly
+// as found so recovery can be reviewed and performed through an explicit flow.
+var ErrInPlaceRecoveryPending = errors.New("in-place recovery data requires explicit review")
+
+// InPlaceRecoveryPendingError identifies the evidence that blocked an open.
+// It unwraps to ErrInPlaceRecoveryPending so callers can classify it without
+// parsing the user-facing error string.
+type InPlaceRecoveryPendingError struct {
+	SidecarPath string               `json:"sidecarPath"`
+	State       InPlaceRecoveryState `json:"state"`
+}
+
+func (e *InPlaceRecoveryPendingError) Error() string {
+	status := e.State.Status
+	if status == "" {
+		status = "unresolved"
+	}
+	return fmt.Sprintf("cannot open file: %v at %q (status: %s); %s", ErrInPlaceRecoveryPending, e.SidecarPath, status, e.State.RecommendedAction)
+}
+
+func (e *InPlaceRecoveryPendingError) Unwrap() error {
+	return ErrInPlaceRecoveryPending
+}
+
+// requireNoPendingInPlaceRecovery fails closed on any adjacent sidecar entry,
+// including corrupt files, directories, and links. Inspection is bounded and
+// read-only; this path never replays, removes, or follows the artifact.
+func requireNoPendingInPlaceRecovery(path string) error {
+	state, err := inspectInPlaceRecovery(path)
+	if err != nil {
+		return err
+	}
+	if !state.Detected {
+		return nil
+	}
+	return &InPlaceRecoveryPendingError{SidecarPath: state.SidecarPath, State: state}
 }
 
 // editableEncoding reports whether a file can be edited in v1: byte-exact
 // round-tripping is only guaranteed for UTF-8/ASCII with LF line endings.
 func editableEncoding(encoding, lineEnding string) bool {
 	enc := strings.ToLower(strings.TrimSpace(encoding))
-	utf8ish := strings.Contains(enc, "utf-8") || strings.Contains(enc, "utf8") || strings.Contains(enc, "ascii") || enc == ""
-	le := strings.ToLower(lineEnding)
-	crlf := strings.Contains(le, "crlf") || strings.Contains(lineEnding, "\r")
-	return utf8ish && !crlf
+	utf8ish := enc == "utf-8" || enc == "utf8" || enc == "ascii" || enc == ""
+	le := strings.ToLower(strings.TrimSpace(lineEnding))
+	return utf8ish && (le == "lf" || le == "none" || le == "unknown" || le == "")
+}
+
+func requireEditableFile(f *session.File) error {
+	m := f.Doc.Metadata()
+	if m.Binary {
+		return fmt.Errorf("%w: binary files are read-only", ErrFileNotEditable)
+	}
+	if !editableEncoding(m.Encoding, m.LineEnding) {
+		return fmt.Errorf("%w: encoding %q with %s line endings is read-only", ErrFileNotEditable, m.Encoding, m.LineEnding)
+	}
+	return nil
 }
 
 // GetEditWindow returns a byte-exact, line-aligned UTF-8 window that reflects
 // staged edits (reads the edited view when edits exist, else the raw document).
 // startByte is aligned down to a line start; pass any byte for go-to / prev.
 func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int) (Window, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return Window{}, fmt.Errorf("unknown file id %q", fileID)
+	if startByte < 0 {
+		return Window{}, fmt.Errorf("%w: start byte must not be negative", ErrEditRequestTooLarge)
 	}
-	if maxBytes <= 0 {
+	if maxBytes < 0 {
+		return Window{}, fmt.Errorf("%w: byte budget must not be negative", ErrEditRequestTooLarge)
+	}
+	lease, f, err := s.acquireReadFile(fileID)
+	if err != nil {
+		return Window{}, err
+	}
+	defer lease.Release()
+	if err := requireEditableFile(f); err != nil {
+		return Window{}, err
+	}
+	if maxBytes == 0 {
 		maxBytes = editWindowBytes
+	}
+	if maxBytes < utf8.UTFMax {
+		return Window{}, fmt.Errorf("%w: requested window %d < %d-byte UTF-8 boundary minimum", ErrEditRequestTooLarge, maxBytes, utf8.UTFMax)
+	}
+	if maxBytes > editWindowBytes {
+		return Window{}, fmt.Errorf("%w: requested window %d > %d bytes", ErrEditRequestTooLarge, maxBytes, editWindowBytes)
 	}
 
 	var size int64
@@ -136,15 +256,14 @@ func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int
 	if f.Edit != nil && f.Edit.HasEdits() {
 		sess := f.Edit
 		size = sess.Size()
-		readRange = func(a, b int64) ([]byte, error) { return sess.ReadRange(f.Doc, a, b) }
+		readRange = func(a, b int64) ([]byte, error) {
+			return sess.ReadRangeContext(context.Background(), a, b, editWindowBytes)
+		}
 	} else {
 		size = f.Doc.Size()
 		readRange = func(a, b int64) ([]byte, error) { return f.Doc.ReadRange(a, b) }
 	}
 
-	if startByte < 0 {
-		startByte = 0
-	}
 	if startByte > size {
 		startByte = size
 	}
@@ -153,10 +272,11 @@ func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int
 	if err != nil {
 		return Window{}, err
 	}
-	readEnd := aligned + int64(maxBytes)
-	if readEnd > size {
-		readEnd = size
+	aligned, err = alignUTF8WindowStart(readRange, aligned, size)
+	if err != nil {
+		return Window{}, err
 	}
+	readEnd := boundedEditWindowEnd(aligned, size, int64(maxBytes))
 	raw, err := readRange(aligned, readEnd)
 	if err != nil {
 		return Window{}, err
@@ -168,6 +288,11 @@ func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int
 			end = aligned + int64(nl+1)
 		}
 	}
+	raw, trimmed, err := trimEditableUTF8Suffix(raw, end >= size, "requested window")
+	if err != nil {
+		return Window{}, err
+	}
+	end -= int64(trimmed)
 
 	firstLine, lok := f.Doc.ApproxOffsetToLine(aligned)
 	approx := true
@@ -190,6 +315,11 @@ func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int
 			numbers = append(numbers, lineNo)
 		}
 	}
+	if f.Edit != nil && f.Edit.HasEdits() {
+		if err := f.Edit.ValidateSourceContext(context.Background()); err != nil {
+			return Window{}, err
+		}
+	}
 
 	return Window{
 		FileID:      f.ID,
@@ -204,40 +334,59 @@ func (s *FileService) GetEditWindow(fileID string, startByte int64, maxBytes int
 	}, nil
 }
 
-// DiffWindow holds the original vs edited text for a window, for side-by-side
-// review. (Offsets align exactly for length-preserving edits; for
-// length-changing edits the diff is still computed but may show a tail.)
+// DiffWindow holds corresponding original and edited spans for side-by-side
+// review. StartByte and NextByte remain edited-coordinate aliases for bridge
+// compatibility; the explicitly named fields label both coordinate spaces.
 type DiffWindow struct {
-	StartByte int64  `json:"startByte"`
-	NextByte  int64  `json:"nextByte"`
-	Original  string `json:"original"`
-	Edited    string `json:"edited"`
-	AtBOF     bool   `json:"atBof"`
-	AtEOF     bool   `json:"atEof"`
+	StartByte         int64  `json:"startByte"`
+	NextByte          int64  `json:"nextByte"`
+	EditedStartByte   int64  `json:"editedStartByte"`
+	EditedNextByte    int64  `json:"editedNextByte"`
+	OriginalStartByte int64  `json:"originalStartByte"`
+	OriginalNextByte  int64  `json:"originalNextByte"`
+	Original          string `json:"original"`
+	Edited            string `json:"edited"`
+	AtBOF             bool   `json:"atBof"`
+	AtEOF             bool   `json:"atEof"`
 }
 
 // GetDiffWindow returns the edited and original text for a line-aligned window,
 // for the side-by-side diff view.
 func (s *FileService) GetDiffWindow(fileID string, startByte int64, maxBytes int) (DiffWindow, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return DiffWindow{}, fmt.Errorf("unknown file id %q", fileID)
+	if startByte < 0 {
+		return DiffWindow{}, fmt.Errorf("%w: start byte must not be negative", ErrEditRequestTooLarge)
 	}
-	if maxBytes <= 0 {
+	if maxBytes < 0 {
+		return DiffWindow{}, fmt.Errorf("%w: byte budget must not be negative", ErrEditRequestTooLarge)
+	}
+	lease, f, err := s.acquireReadFile(fileID)
+	if err != nil {
+		return DiffWindow{}, err
+	}
+	defer lease.Release()
+	if err := requireEditableFile(f); err != nil {
+		return DiffWindow{}, err
+	}
+	if maxBytes == 0 {
 		maxBytes = editWindowBytes
+	}
+	if maxBytes < utf8.UTFMax {
+		return DiffWindow{}, fmt.Errorf("%w: requested diff window %d < %d-byte UTF-8 boundary minimum", ErrEditRequestTooLarge, maxBytes, utf8.UTFMax)
+	}
+	if maxBytes > editWindowBytes {
+		return DiffWindow{}, fmt.Errorf("%w: requested diff window %d > %d bytes", ErrEditRequestTooLarge, maxBytes, editWindowBytes)
 	}
 	var size int64
 	var editedRange func(a, b int64) ([]byte, error)
 	if f.Edit != nil && f.Edit.HasEdits() {
 		sess := f.Edit
 		size = sess.Size()
-		editedRange = func(a, b int64) ([]byte, error) { return sess.ReadRange(f.Doc, a, b) }
+		editedRange = func(a, b int64) ([]byte, error) {
+			return sess.ReadRangeContext(context.Background(), a, b, editWindowBytes)
+		}
 	} else {
 		size = f.Doc.Size()
 		editedRange = func(a, b int64) ([]byte, error) { return f.Doc.ReadRange(a, b) }
-	}
-	if startByte < 0 {
-		startByte = 0
 	}
 	if startByte > size {
 		startByte = size
@@ -246,10 +395,11 @@ func (s *FileService) GetDiffWindow(fileID string, startByte int64, maxBytes int
 	if err != nil {
 		return DiffWindow{}, err
 	}
-	end := aligned + int64(maxBytes)
-	if end > size {
-		end = size
+	aligned, err = alignUTF8WindowStart(editedRange, aligned, size)
+	if err != nil {
+		return DiffWindow{}, err
 	}
+	end := boundedEditWindowEnd(aligned, size, int64(maxBytes))
 	ed, err := editedRange(aligned, end)
 	if err != nil {
 		return DiffWindow{}, err
@@ -260,42 +410,305 @@ func (s *FileService) GetDiffWindow(fileID string, startByte int64, maxBytes int
 			end = aligned + int64(nl+1)
 		}
 	}
+	ed, trimmed, err := trimEditableUTF8Suffix(ed, end >= size, "diff window")
+	if err != nil {
+		return DiffWindow{}, err
+	}
+	end -= int64(trimmed)
 	docSize := f.Doc.Size()
 	oStart, oEnd := aligned, end
-	if oStart > docSize {
-		oStart = docSize
+	if f.Edit != nil && f.Edit.HasEdits() {
+		mapped, ok := f.Edit.TransformedRangeToSource(aligned, end)
+		if !ok {
+			return DiffWindow{}, fmt.Errorf("%w: edited range [%d,%d)", ErrDiffCoordinateMapping, aligned, end)
+		}
+		oStart, oEnd = mapped.Start, mapped.End
 	}
-	if oEnd > docSize {
-		oEnd = docSize
+	if oStart < 0 || oEnd < oStart || oEnd > docSize {
+		return DiffWindow{}, fmt.Errorf("%w: edited range [%d,%d) mapped outside source size %d as [%d,%d)", ErrDiffCoordinateMapping, aligned, end, docSize, oStart, oEnd)
+	}
+	if oEnd-oStart > int64(maxBytes) {
+		return DiffWindow{}, fmt.Errorf("%w: mapped original diff span %d > %d bytes", ErrEditRequestTooLarge, oEnd-oStart, maxBytes)
 	}
 	var orig []byte
 	if oEnd > oStart {
-		if orig, err = f.Doc.ReadRange(oStart, oEnd); err != nil {
+		if f.Edit != nil && f.Edit.HasEdits() {
+			orig, err = f.Edit.ReadSourceRangeContext(context.Background(), oStart, oEnd, int64(maxBytes))
+		} else {
+			orig, err = f.Doc.ReadRange(oStart, oEnd)
+		}
+		if err != nil {
+			return DiffWindow{}, err
+		}
+		if err := validateEditableWindowBytes(orig, "original diff window"); err != nil {
 			return DiffWindow{}, err
 		}
 	}
 	return DiffWindow{
-		StartByte: aligned,
-		NextByte:  end,
-		Original:  string(orig),
-		Edited:    string(ed),
-		AtBOF:     aligned == 0,
-		AtEOF:     end >= size,
+		StartByte:         aligned,
+		NextByte:          end,
+		EditedStartByte:   aligned,
+		EditedNextByte:    end,
+		OriginalStartByte: oStart,
+		OriginalNextByte:  oEnd,
+		Original:          string(orig),
+		Edited:            string(ed),
+		AtBOF:             aligned == 0,
+		AtEOF:             end >= size,
 	}, nil
+}
+
+// boundedEditWindowEnd returns min(start+budget, size) without evaluating an
+// overflowing addition. Callers validate budget and clamp start into [0,size]
+// before using it.
+func boundedEditWindowEnd(start, size, budget int64) int64 {
+	if budget <= 0 || start >= size {
+		return start
+	}
+	if budget >= size-start {
+		return size
+	}
+	return start + budget
+}
+
+func validateEditableWindowBytes(raw []byte, label string) error {
+	if bytes.IndexByte(raw, '\r') >= 0 {
+		return fmt.Errorf("%w: %s contains CR or CRLF line endings", ErrFileNotEditable, label)
+	}
+	if bytes.IndexByte(raw, 0) >= 0 || !utf8.Valid(raw) {
+		return fmt.Errorf("%w: %s is not valid UTF-8 text", ErrFileNotEditable, label)
+	}
+	return nil
+}
+
+func alignUTF8WindowStart(readRange func(a, b int64) ([]byte, error), start, size int64) (int64, error) {
+	if start <= 0 || start >= size {
+		return start, nil
+	}
+	probeStart := start - (utf8.UTFMax - 1)
+	if probeStart < 0 {
+		probeStart = 0
+	}
+	probeEnd := boundedEditWindowEnd(start, size, utf8.UTFMax)
+	probe, err := readRange(probeStart, probeEnd)
+	if err != nil {
+		return 0, err
+	}
+	relative := int(start - probeStart)
+	if relative >= len(probe) || probe[relative]&0xc0 != 0x80 {
+		return start, nil
+	}
+	for candidate := relative - 1; candidate >= 0 && relative-candidate < utf8.UTFMax; candidate-- {
+		if probe[candidate]&0xc0 == 0x80 {
+			continue
+		}
+		_, width := utf8.DecodeRune(probe[candidate:])
+		if width > 1 && candidate+width > relative && candidate+width <= len(probe) && utf8.Valid(probe[candidate:candidate+width]) {
+			return probeStart + int64(candidate+width), nil
+		}
+		break
+	}
+	return 0, fmt.Errorf("%w: byte offset %d begins at an isolated UTF-8 continuation byte", ErrFileNotEditable, start)
+}
+
+func trimEditableUTF8Suffix(raw []byte, atEOF bool, label string) ([]byte, int, error) {
+	if bytes.IndexByte(raw, '\r') >= 0 {
+		return nil, 0, fmt.Errorf("%w: %s contains CR or CRLF line endings", ErrFileNotEditable, label)
+	}
+	if bytes.IndexByte(raw, 0) >= 0 {
+		return nil, 0, fmt.Errorf("%w: %s contains NUL bytes", ErrFileNotEditable, label)
+	}
+	if utf8.Valid(raw) {
+		return raw, 0, nil
+	}
+	if !atEOF {
+		for trim := 1; trim < utf8.UTFMax && trim <= len(raw); trim++ {
+			prefix := raw[:len(raw)-trim]
+			suffix := raw[len(raw)-trim:]
+			if utf8.Valid(prefix) && !utf8.FullRune(suffix) {
+				return prefix, trim, nil
+			}
+		}
+	}
+	return nil, 0, fmt.Errorf("%w: %s is not valid UTF-8 text", ErrFileNotEditable, label)
 }
 
 // StageEdit reconciles the window [startByte, startByte+origLen) with newText.
 // It trims the common prefix/suffix so only the genuinely changed bytes are
 // staged — keeping the diff granular and in-place patches minimal.
-func (s *FileService) StageEdit(fileID string, startByte int64, origLen int64, newText string) (StagingState, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return StagingState{}, fmt.Errorf("unknown file id %q", fileID)
+func (s *FileService) hasPreparedEdit(fileID string) bool {
+	s.editMu.Lock()
+	_, ok := s.preparedEdits[fileID]
+	s.editMu.Unlock()
+	return ok
+}
+
+func (s *FileService) reservePreparedEdit(fileID string) error {
+	s.editMu.Lock()
+	defer s.editMu.Unlock()
+	if s.preparedEdits == nil {
+		s.preparedEdits = make(map[string]struct{})
 	}
-	sess := f.EditSession()
-	oldBytes, err := sess.ReadRange(f.Doc, startByte, startByte+origLen)
+	if _, ok := s.preparedEdits[fileID]; ok {
+		return nil
+	}
+	if len(s.preparedEdits) >= maxPreparedEditSessions {
+		return fmt.Errorf("%w (%d)", ErrPreparedEditSessionLimit, maxPreparedEditSessions)
+	}
+	s.preparedEdits[fileID] = struct{}{}
+	return nil
+}
+
+func (s *FileService) releasePreparedEdit(fileID string) {
+	s.editMu.Lock()
+	delete(s.preparedEdits, fileID)
+	s.editMu.Unlock()
+}
+
+// PrepareEditSession performs the first exact full-source fingerprint as an
+// ID-cancellable service job before the frontend enables editing. StageEdit is
+// intentionally unable to create this session itself, so its bridge call stays
+// bounded by the edit RPC byte/history limits instead of file size.
+func (s *FileService) PrepareEditSession(fileID string) (StagingState, error) {
+	return runServiceJob(s, jobSpec{
+		Title:  "Prepare editing",
+		Kind:   jobKindSourceVerification,
+		FileID: fileID,
+	}, func(ctx context.Context, progress func(int64, int64, string)) (StagingState, error) {
+		lease, current, err := s.acquireExclusiveFileContext(ctx, fileID)
+		if err != nil {
+			return StagingState{}, err
+		}
+		defer lease.Release()
+		notifyServiceLease("prepare-edit", fileID, lease)
+		if err := requireEditableFile(current); err != nil {
+			return StagingState{}, err
+		}
+		prepared := s.hasPreparedEdit(fileID)
+		if current.Edit != nil {
+			if !prepared {
+				return StagingState{}, ErrEditSessionNotPrepared
+			}
+			return stagingState(current), nil
+		}
+		if prepared {
+			// No production path removes a session without releasing its ledger
+			// entry. Repair a stale empty reservation conservatively before retrying.
+			s.releasePreparedEdit(fileID)
+		}
+		if err := s.reservePreparedEdit(fileID); err != nil {
+			return StagingState{}, err
+		}
+		keepReservation := false
+		defer func() {
+			if !keepReservation {
+				s.releasePreparedEdit(fileID)
+			}
+		}()
+
+		progress(0, current.Doc.Size(), "verifying source bytes")
+		candidate, err := manualedit.NewSourceBoundSessionContextWithProgress(
+			ctx,
+			current.Doc,
+			current.Path,
+			lease.Snapshot().Generation,
+			manualedit.DefaultLimits(),
+			func(completed, total int64) {
+				progress(completed, total, "verifying source bytes")
+			},
+		)
+		if err != nil {
+			return StagingState{}, err
+		}
+		if err := ctx.Err(); err != nil {
+			return StagingState{}, err
+		}
+		jobID, ok := serviceJobID(ctx)
+		if !ok {
+			return StagingState{}, errors.New("prepare-edit job identity is unavailable")
+		}
+		installed := false
+		if !s.jobs().commit(jobID, func() bool {
+			if current.Edit != nil {
+				return false
+			}
+			current.Edit = candidate
+			installed = true
+			return true
+		}) || !installed {
+			if err := ctx.Err(); err != nil {
+				return StagingState{}, err
+			}
+			return StagingState{}, ErrJobCancelled
+		}
+		keepReservation = true
+		return stagingState(current), nil
+	})
+}
+
+// ReleaseCleanEditSession releases the retained source fingerprint and its
+// aggregate admission slot only when no edits exist. It is safe to call after
+// edit mode is turned off or an editor is detached; a dirty session fails
+// closed and remains available for Save Copy or an explicit DiscardEdits.
+func (s *FileService) ReleaseCleanEditSession(fileID string) (StagingState, error) {
+	lease, f, err := s.acquireExclusiveFile(fileID)
 	if err != nil {
 		return StagingState{}, err
+	}
+	defer lease.Release()
+	notifyServiceLease("release-clean-edit", fileID, lease)
+	if f.Edit != nil && f.Edit.HasEdits() {
+		return stagingState(f), ErrStagedEditsPending
+	}
+	f.ResetEdits()
+	s.releasePreparedEdit(fileID)
+	return stagingState(f), nil
+}
+
+func validateStageEditRequest(startByte int64, origLen int64, newText string) error {
+	if startByte < 0 || origLen < 0 || origLen > int64(editRPCTextBytes) || startByte > math.MaxInt64-origLen {
+		return fmt.Errorf("%w: invalid source range start=%d length=%d", ErrEditRequestTooLarge, startByte, origLen)
+	}
+	if len(newText) > editRPCTextBytes {
+		return fmt.Errorf("%w: edited text %d > %d bytes", ErrEditRequestTooLarge, len(newText), editRPCTextBytes)
+	}
+	if strings.ContainsRune(newText, '\r') {
+		return fmt.Errorf("%w: edited text contains CR or CRLF line endings", ErrFileNotEditable)
+	}
+	if strings.ContainsRune(newText, 0) || !utf8.ValidString(newText) {
+		return fmt.Errorf("%w: edited text is not valid UTF-8 text", ErrFileNotEditable)
+	}
+	return nil
+}
+
+func (s *FileService) StageEdit(fileID string, startByte int64, origLen int64, newText string) (StagingState, error) {
+	if err := validateStageEditRequest(startByte, origLen, newText); err != nil {
+		return StagingState{}, err
+	}
+	s.editWorkMu.Lock()
+	defer s.editWorkMu.Unlock()
+	lease, f, err := s.acquireExclusiveFile(fileID)
+	if err != nil {
+		return StagingState{}, err
+	}
+	defer lease.Release()
+	notifyServiceLease("stage-edit", fileID, lease)
+	if err := requireEditableFile(f); err != nil {
+		return StagingState{}, err
+	}
+	if f.Edit == nil || !s.hasPreparedEdit(fileID) {
+		return StagingState{}, ErrEditSessionNotPrepared
+	}
+	sess := f.Edit
+	oldBytes, err := sess.ReadRangeContext(context.Background(), startByte, startByte+origLen, int64(editRPCTextBytes))
+	if err != nil {
+		return StagingState{}, err
+	}
+	if bytes.IndexByte(oldBytes, '\r') >= 0 {
+		return StagingState{}, fmt.Errorf("%w: the edited range contains CR or CRLF line endings", ErrFileNotEditable)
+	}
+	if bytes.IndexByte(oldBytes, 0) >= 0 || !utf8.Valid(oldBytes) {
+		return StagingState{}, fmt.Errorf("%w: the edited range is not valid UTF-8 text", ErrFileNotEditable)
 	}
 	newBytes := []byte(newText)
 
@@ -317,7 +730,8 @@ func (s *FileService) StageEdit(fileID string, startByte int64, origLen int64, n
 	if editEnd == editStart && len(editText) == 0 {
 		return stagingState(f), nil // no net change
 	}
-	if err := sess.ApplyEdit(manualedit.Edit{Start: editStart, End: editEnd, Text: editText}); err != nil {
+	expectedOld := oldBytes[pre : len(oldBytes)-suf]
+	if err := sess.ApplyVerifiedEditContext(context.Background(), manualedit.Edit{Start: editStart, End: editEnd, Text: editText}, expectedOld); err != nil {
 		return StagingState{}, err
 	}
 	return stagingState(f), nil
@@ -325,82 +739,128 @@ func (s *FileService) StageEdit(fileID string, startByte int64, origLen int64, n
 
 // DiscardEdits drops all staged edits.
 func (s *FileService) DiscardEdits(fileID string) (StagingState, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return StagingState{}, fmt.Errorf("unknown file id %q", fileID)
+	lease, f, err := s.acquireExclusiveFile(fileID)
+	if err != nil {
+		return StagingState{}, err
 	}
+	defer lease.Release()
+	notifyServiceLease("discard-edits", fileID, lease)
 	f.ResetEdits()
+	s.releasePreparedEdit(fileID)
 	return stagingState(f), nil
 }
 
 // GetStagingState reports current pending-edit status.
 func (s *FileService) GetStagingState(fileID string) (StagingState, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return StagingState{}, fmt.Errorf("unknown file id %q", fileID)
+	lease, f, err := s.acquireReadFile(fileID)
+	if err != nil {
+		return StagingState{}, err
 	}
+	defer lease.Release()
 	return stagingState(f), nil
 }
 
-// SaveCopy writes the edited file to dstPath via the streaming copy-through
-// pipeline (source untouched; staged edits remain).
-func (s *FileService) SaveCopy(fileID string, dstPath string) (SaveResult, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return SaveResult{}, fmt.Errorf("unknown file id %q", fileID)
+// saveCopy writes the edited file to dstPath via the streaming copy-through
+// pipeline (source untouched; staged edits remain). It is deliberately
+// unexported so Wails callers cannot supply an arbitrary destination path;
+// SaveCopyViaDialog is the only bridge-visible entry point.
+type saveCopyApproval struct {
+	generation   uint64
+	editIdentity uint64
+	revision     uint64
+}
+
+func captureSaveCopyApproval(lease *session.Lease, file *session.File) (saveCopyApproval, error) {
+	if lease == nil || file == nil || file.Edit == nil || !file.Edit.HasEdits() {
+		return saveCopyApproval{}, errors.New("no staged edits")
 	}
-	if f.Edit == nil || !f.Edit.HasEdits() {
-		return SaveResult{}, errors.New("no staged edits")
+	identity := file.Edit.Identity()
+	if identity == 0 {
+		return saveCopyApproval{}, errors.New("staged edit session identity is unavailable")
 	}
-	summary, err := manualedit.WriteSessionToFile(context.Background(), f.Path, dstPath, f.Edit, manualedit.FileOptions{})
+	return saveCopyApproval{
+		generation:   lease.Snapshot().Generation,
+		editIdentity: identity,
+		revision:     file.Edit.Revision(),
+	}, nil
+}
+
+func (a saveCopyApproval) matches(lease *session.Lease, file *session.File) bool {
+	return lease != nil && file != nil && a.generation != 0 && a.editIdentity != 0 &&
+		lease.Snapshot().Generation == a.generation && file.Edit != nil &&
+		file.Edit.Identity() == a.editIdentity && file.Edit.HasEdits() &&
+		file.Edit.Revision() == a.revision
+}
+
+func (s *FileService) saveCopy(fileID string, dstPath string) (SaveResult, error) {
+	lease, file, finishPreflight, err := s.acquireReadFilePreflight(fileID)
 	if err != nil {
 		return SaveResult{}, err
 	}
-	return SaveResult{Mode: "copy", BytesWritten: summary.BytesWritten, OutputPath: summary.OutputPath}, nil
+	approval, err := captureSaveCopyApproval(lease, file)
+	finishPreflight()
+	if err != nil {
+		return SaveResult{}, err
+	}
+	return s.saveCopyApproved(fileID, dstPath, approval)
 }
 
-// SavePatch applies the staged edits in place (length-preserving only) with a
-// crash-safe reverse-patch sidecar, then refreshes the document from disk.
-func (s *FileService) SavePatch(fileID string) (SaveResult, error) {
-	f, ok := s.reg.Get(fileID)
-	if !ok {
-		return SaveResult{}, fmt.Errorf("unknown file id %q", fileID)
-	}
-	if f.Edit == nil || !f.Edit.HasEdits() {
-		return SaveResult{}, errors.New("no staged edits")
-	}
-	if !stagingState(f).InPlaceEligible {
-		return SaveResult{}, errors.New("edits change the file length; use Save as copy")
-	}
-
-	edits := f.Edit.SourceMappedActiveEdits()
-	patches := make([]inplace.Patch, 0, len(edits))
-	for _, e := range edits {
-		if int64(len(e.Text)) != e.End-e.Start {
-			return SaveResult{}, errors.New("edits change the file length; use Save as copy")
-		}
-		old, err := f.Doc.ReadRange(e.Start, e.End)
+func (s *FileService) saveCopyApproved(fileID string, dstPath string, approval saveCopyApproval) (SaveResult, error) {
+	return runServiceJob(s, jobSpec{
+		Title:  "Save edited copy",
+		Kind:   jobKindTransform,
+		FileID: fileID,
+	}, func(ctx context.Context, progress func(int64, int64, string)) (SaveResult, error) {
+		lease, f, err := s.acquireExclusiveFileContext(ctx, fileID)
 		if err != nil {
 			return SaveResult{}, err
 		}
-		patches = append(patches, inplace.Patch{Offset: e.Start, Old: old, New: append([]byte(nil), e.Text...)})
-	}
+		defer lease.Release()
+		notifyServiceLease("save-copy", fileID, lease)
+		if !approval.matches(lease, f) {
+			return SaveResult{}, ErrSaveCopyStateChanged
+		}
+		summary, err := manualedit.WriteSessionToFile(ctx, f.Path, dstPath, f.Edit, manualedit.FileOptions{
+			SourceGeneration: lease.Snapshot().Generation,
+			Progress: func(update manualedit.Progress) {
+				progress(update.BytesWritten, update.BytesTotal, "bytes written")
+			},
+		})
+		if err != nil {
+			// A PublicationError means the complete copy became visible but final
+			// durability/finalization failed. Preserve that result contract instead
+			// of returning an indistinguishable empty result for an existing output.
+			if result, ok := confirmedSaveCopyResult(summary, dstPath); ok {
+				return result, err
+			}
+			return SaveResult{}, err
+		}
+		result, ok := confirmedSaveCopyResult(summary, dstPath)
+		if !ok {
+			return SaveResult{}, errors.New("save copy completed without confirmed publication at the selected path")
+		}
+		return result, nil
+	})
+}
 
-	// inplace.Apply commits then deletes the sidecar on success, so it is not a
-	// durable "undo" artifact and must not be reported as one — in-place rollback
-	// is a crash-recovery feature handled by inplace.Recover at open time.
-	if err := inplace.Apply(f.Path, patches, sidecarPath(f.Path)); err != nil {
-		return SaveResult{}, err
+// confirmedSaveCopyResult reports output evidence only when manualedit proved
+// that the complete copy is visible at the exact path selected by the user.
+// Location-uncertain publication errors and mismatched publication paths must
+// not be surfaced as a successful, directly openable SaveResult.
+func confirmedSaveCopyResult(summary manualedit.FileSummary, selectedPath string) (SaveResult, bool) {
+	if !summary.Complete || !summary.Published || summary.PublicationUncertain || summary.OutputPath != selectedPath {
+		return SaveResult{}, false
 	}
-	if _, err := s.reg.Reopen(fileID); err != nil {
-		return SaveResult{}, err
-	}
+	return SaveResult{Mode: "copy", BytesWritten: summary.BytesWritten, OutputPath: summary.OutputPath}, true
+}
 
-	var written int64
-	for _, p := range patches {
-		written += int64(len(p.New))
-	}
-	return SaveResult{Mode: "patch", BytesWritten: written, OutputPath: f.Path}, nil
+// SavePatch is retained as an RPC compatibility boundary but fails closed.
+// Source mutation must remain unavailable until the transaction retains a
+// durable, verified user-restorable backup after successful completion.
+func (s *FileService) SavePatch(fileID string) (SaveResult, error) {
+	_ = s
+	_ = fileID
+	return SaveResult{}, ErrInPlaceSaveDisabled
 }
 
 func stagingState(f *session.File) StagingState {
@@ -412,22 +872,13 @@ func stagingState(f *session.File) StagingState {
 	edited := f.Edit.Size()
 	net := edited - orig
 	lengthPreserving := net == 0
-	inPlace := lengthPreserving
-	if inPlace {
-		for _, e := range f.Edit.SourceMappedActiveEdits() {
-			if int64(len(e.Text)) != e.End-e.Start {
-				inPlace = false
-				break
-			}
-		}
-	}
 	return StagingState{
 		EditCount:        f.Edit.EditCount(),
 		OriginalSize:     orig,
 		EditedSize:       edited,
 		NetDelta:         net,
 		LengthPreserving: lengthPreserving,
-		InPlaceEligible:  inPlace,
+		InPlaceEligible:  false,
 	}
 }
 
@@ -457,8 +908,8 @@ func alignToLineStart(readRange func(a, b int64) ([]byte, error), start int64, m
 	if nl := lastIndexByte(buf, '\n'); nl >= 0 {
 		return from + int64(nl) + 1, nil
 	}
-	if from == 0 {
-		return 0, nil
-	}
-	return from, nil // pathological long line; accept the scan floor
+	// No line boundary exists within the bounded backward scan. Starting at the
+	// requested offset keeps the window bounded and guarantees forward progress;
+	// callers treat it as a long-line fragment rather than an exact line start.
+	return start, nil
 }

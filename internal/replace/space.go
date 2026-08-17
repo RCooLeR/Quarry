@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/quarry/quarry-wails3/internal/fileio"
+	"github.com/quarry/quarry-wails3/internal/regularfile"
 	"github.com/quarry/quarry-wails3/internal/search"
 )
 
@@ -72,7 +74,10 @@ func EstimatePlainOutputSize(ctx context.Context, r ReaderAtSize, pattern []byte
 
 // CheckPlainReplaceSpace estimates output size and compares it to free space in the output directory.
 func CheckPlainReplaceSpace(ctx context.Context, sourcePath string, outputPath string, pattern []byte, repl []byte, opts SpaceOptions) (SpaceEstimate, error) {
-	src, err := os.Open(sourcePath)
+	if err := fileio.ValidateExactOutputPath(outputPath); err != nil {
+		return SpaceEstimate{}, err
+	}
+	src, err := regularfile.Open(sourcePath)
 	if err != nil {
 		return SpaceEstimate{}, err
 	}
@@ -89,7 +94,10 @@ func CheckPlainReplaceSpace(ctx context.Context, sourcePath string, outputPath s
 		return SpaceEstimate{}, err
 	}
 
-	outputDir := filepath.Dir(outputPath)
+	outputDir, _ := filepath.Split(outputPath)
+	if outputDir == "" {
+		outputDir = "."
+	}
 	available, err := availableDiskBytes(outputDir)
 	if err != nil {
 		return SpaceEstimate{}, err

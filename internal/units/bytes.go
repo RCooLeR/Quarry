@@ -3,10 +3,12 @@ package units
 import (
 	"errors"
 	"fmt"
-	"math"
+	"math/big"
 	"strconv"
 	"strings"
 )
+
+const maxNumericInputLength = 128
 
 // ParseLineNumber parses a 1-based line number.
 func ParseLineNumber(input string) (int64, error) {
@@ -50,6 +52,9 @@ func FormatBytesUint(n uint64) string {
 
 // ParseByteOffset parses a byte offset or percentage within a file size.
 func ParseByteOffset(input string, size int64) (int64, error) {
+	if size < 0 {
+		return 0, errors.New("file size cannot be negative")
+	}
 	s := strings.TrimSpace(input)
 	if s == "" {
 		return 0, errors.New("empty offset")
@@ -71,11 +76,11 @@ func ParseByteOffset(input string, size int64) (int64, error) {
 		number, unit = splitNumberUnit(number)
 	}
 
-	value, err := strconv.ParseFloat(number, 64)
-	if err != nil {
+	value, ok := parseDecimal(number)
+	if !ok {
 		return 0, fmt.Errorf("invalid offset %q", input)
 	}
-	if value < 0 {
+	if value.Sign() < 0 {
 		return 0, errors.New("offset cannot be negative")
 	}
 
@@ -84,11 +89,12 @@ func ParseByteOffset(input string, size int64) (int64, error) {
 		return 0, err
 	}
 
-	offset := int64(math.Round(value * float64(multiplier)))
-	if offset > size {
+	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt64(multiplier))
+	offset := roundNonNegativeRat(scaled)
+	if offset.Cmp(big.NewInt(size)) > 0 {
 		return size, nil
 	}
-	return offset, nil
+	return offset.Int64(), nil
 }
 
 // ParseByteSize parses a byte-size value such as "64 KB" or "1.5 MiB".
@@ -114,11 +120,11 @@ func ParseByteSize(input string) (int64, error) {
 		number, unit = splitNumberUnit(number)
 	}
 
-	value, err := strconv.ParseFloat(number, 64)
-	if err != nil {
+	value, ok := parseDecimal(number)
+	if !ok {
 		return 0, fmt.Errorf("invalid size %q", input)
 	}
-	if value <= 0 {
+	if value.Sign() <= 0 {
 		return 0, errors.New("size must be positive")
 	}
 
@@ -127,25 +133,55 @@ func ParseByteSize(input string) (int64, error) {
 		return 0, err
 	}
 
-	size := int64(math.Round(value * float64(multiplier)))
-	if size <= 0 {
+	scaled := new(big.Rat).Mul(value, new(big.Rat).SetInt64(multiplier))
+	size := roundNonNegativeRat(scaled)
+	if !size.IsInt64() {
+		return 0, errors.New("size exceeds the supported byte range")
+	}
+	result := size.Int64()
+	if result <= 0 {
 		return 0, errors.New("size must be positive")
 	}
-	return size, nil
+	return result, nil
 }
 
 func parsePercent(input string, size int64) (int64, error) {
-	value, err := strconv.ParseFloat(strings.TrimSpace(input), 64)
-	if err != nil {
+	if size < 0 {
+		return 0, errors.New("file size cannot be negative")
+	}
+	value, ok := parseDecimal(strings.TrimSpace(input))
+	if !ok {
 		return 0, fmt.Errorf("invalid percentage %q", input+"%")
 	}
-	if value < 0 {
+	if value.Sign() < 0 {
 		return 0, errors.New("percentage cannot be negative")
 	}
-	if value > 100 {
-		value = 100
+	if value.Cmp(big.NewRat(100, 1)) > 0 {
+		return 0, errors.New("percentage cannot exceed 100")
 	}
-	return int64(math.Round(float64(size) * value / 100)), nil
+	scaled := new(big.Rat).Mul(value, new(big.Rat).SetFrac(big.NewInt(size), big.NewInt(100)))
+	return roundNonNegativeRat(scaled).Int64(), nil
+}
+
+func parseDecimal(input string) (*big.Rat, bool) {
+	if input == "" || len(input) > maxNumericInputLength {
+		return nil, false
+	}
+	value, ok := new(big.Rat).SetString(input)
+	return value, ok
+}
+
+// roundNonNegativeRat implements math.Round's positive-value behavior without
+// converting through float64: halves round away from zero.
+func roundNonNegativeRat(value *big.Rat) *big.Int {
+	numerator := new(big.Int).Set(value.Num())
+	denominator := new(big.Int).Set(value.Denom())
+	quotient, remainder := new(big.Int), new(big.Int)
+	quotient.QuoRem(numerator, denominator, remainder)
+	if new(big.Int).Lsh(remainder, 1).Cmp(denominator) >= 0 {
+		quotient.Add(quotient, big.NewInt(1))
+	}
+	return quotient
 }
 
 func splitNumberUnit(input string) (string, string) {

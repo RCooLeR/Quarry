@@ -51,7 +51,7 @@ func FuzzReplacePlainCaseSensitiveMatchesReference(f *testing.F) {
 		})
 
 		dst := &fuzzSyncBuffer{}
-		matches, err := ReplacePlain(context.Background(), file, dst, needle, replacement, PlainOptions{
+		matches, err := replacePlain(context.Background(), file, dst, needle, replacement, PlainOptions{
 			ChunkSize: chunkSize,
 		})
 		if err != nil {
@@ -104,7 +104,7 @@ func FuzzReplacePlainCaseInsensitiveMatchesReference(f *testing.F) {
 		})
 
 		dst := &fuzzSyncBuffer{}
-		matches, err := ReplacePlain(context.Background(), file, dst, needle, replacement, PlainOptions{
+		matches, err := replacePlain(context.Background(), file, dst, needle, replacement, PlainOptions{
 			ChunkSize:       chunkSize,
 			CaseInsensitive: true,
 		})

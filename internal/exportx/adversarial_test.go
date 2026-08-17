@@ -5,13 +5,13 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/quarry/quarry-wails3/internal/document"
+	"github.com/quarry/quarry-wails3/internal/fileio"
 )
 
-func TestExportByteRangeManifestPublishFailureDeletesOutputAndPreservesSource(t *testing.T) {
+func TestExportByteRangeManifestPublishFailureLeavesPublishedOutputAndPreservesSource(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	outPath := filepath.Join(dir, "output.txt")
@@ -27,20 +27,30 @@ func TestExportByteRangeManifestPublishFailureDeletesOutputAndPreservesSource(t 
 	}
 	defer doc.Close()
 
-	_, err = ExportByteRange(context.Background(), doc, srcPath, outPath, 6, 12, Options{
+	summary, err := ExportByteRange(context.Background(), doc, srcPath, outPath, 6, 12, Options{
 		ComputeSHA256: true,
 		ManifestPath:  manifestPath,
 	})
 	if err == nil {
 		t.Fatal("expected manifest publish failure")
 	}
-	if _, statErr := os.Stat(outPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("output stat err = %v, want cleanup after manifest failure", statErr)
+	var publication *fileio.PublicationError
+	if !errors.As(err, &publication) {
+		t.Fatalf("error = %v, want PublicationError", err)
+	}
+	if publication.FinalPath != outPath || !publication.Durable {
+		t.Fatalf("publication = %+v, want durable output %q", publication, outPath)
+	}
+	if summary.OutputPath != outPath || summary.ManifestPath != manifestPath || summary.BytesWritten != 6 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if got, readErr := os.ReadFile(outPath); readErr != nil || string(got) != "bravo\n" {
+		t.Fatalf("published output = %q, %v", got, readErr)
 	}
 	assertFileBytes(t, srcPath, source)
 }
 
-func TestExportByteRangeManifestPublishFailureReportsOutputCleanupFailure(t *testing.T) {
+func TestExportByteRangeTextManifestFailureNeverPathDeletesPublishedOutput(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	outPath := filepath.Join(dir, "output.txt")
@@ -56,34 +66,24 @@ func TestExportByteRangeManifestPublishFailureReportsOutputCleanupFailure(t *tes
 	}
 	defer doc.Close()
 
-	originalRemoveFile := removeFile
-	removeFile = func(path string) error {
-		if path == outPath {
-			return errors.New("cleanup denied")
-		}
-		return originalRemoveFile(path)
-	}
-	defer func() {
-		removeFile = originalRemoveFile
-	}()
-
-	_, err = ExportByteRange(context.Background(), doc, srcPath, outPath, 6, 12, Options{
+	_, err = ExportByteRangeText(context.Background(), doc, srcPath, outPath, 6, 12, "UTF-8", "UTF-8", Options{
 		WriteManifest: true,
 		ManifestPath:  manifestPath,
 	})
 	if err == nil {
-		t.Fatal("expected manifest and cleanup failure")
+		t.Fatal("expected manifest failure")
 	}
-	if !strings.Contains(err.Error(), "cleanup denied") || !strings.Contains(err.Error(), "remove export output") {
-		t.Fatalf("err = %v, want manifest failure joined with cleanup context", err)
+	var publication *fileio.PublicationError
+	if !errors.As(err, &publication) || publication.FinalPath != outPath {
+		t.Fatalf("error = %v, want output PublicationError", err)
 	}
 	assertFileBytes(t, srcPath, source)
 	if got, readErr := os.ReadFile(outPath); readErr != nil || string(got) != "bravo\n" {
-		t.Fatalf("uncleaned output = %q, %v; want written range after simulated cleanup failure", got, readErr)
+		t.Fatalf("published output = %q, %v; want written range", got, readErr)
 	}
 }
 
-func TestSplitBySizeManifestPublishFailureDeletesPartsAndPreservesSource(t *testing.T) {
+func TestSplitBySizeManifestPublishFailurePreservesVerifiedParts(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	basePath := filepath.Join(dir, "split.txt")
@@ -99,18 +99,23 @@ func TestSplitBySizeManifestPublishFailureDeletesPartsAndPreservesSource(t *test
 	}
 	defer doc.Close()
 
-	_, err = SplitBySize(context.Background(), doc, srcPath, basePath, 5, SplitOptions{
+	summary, err := SplitBySize(context.Background(), doc, srcPath, basePath, 5, SplitOptions{
 		ComputeSHA256: true,
 		ManifestPath:  manifestPath,
 	})
 	if err == nil {
 		t.Fatal("expected manifest publish failure")
 	}
-	if matches, matchErr := filepath.Glob(filepath.Join(dir, "split.part*.txt")); matchErr != nil {
-		t.Fatal(matchErr)
-	} else if len(matches) != 0 {
-		t.Fatalf("expected split part cleanup after manifest failure, found %v", matches)
+	var incomplete *SplitIncompleteError
+	if !errors.As(err, &incomplete) {
+		t.Fatalf("error = %v, want SplitIncompleteError", err)
 	}
+	if summary.Complete || summary.Failure == "" || len(summary.Outputs) != 3 || len(incomplete.Outputs) != 3 {
+		t.Fatalf("summary = %+v, error = %+v", summary, incomplete)
+	}
+	assertFileBytes(t, partPath(basePath, 1), []byte("abcde"))
+	assertFileBytes(t, partPath(basePath, 2), []byte("fghij"))
+	assertFileBytes(t, partPath(basePath, 3), []byte("kl"))
 	assertFileBytes(t, srcPath, source)
 }
 

@@ -20,7 +20,7 @@ func TestReplaceRegexpFileReportsLockedOutputDuringFinalize(t *testing.T) {
 	restore := installFinalizeLock(t, outPath, lockedErr)
 	defer restore()
 
-	summary, err := ReplaceRegexpFile(context.Background(), srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{}, RegexOptions{
+	summary, err := replaceRegexpFile(context.Background(), srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{}, RegexOptions{
 		ChunkSize:      8,
 		MaxMatchWindow: 8,
 	})
@@ -42,7 +42,7 @@ func TestReplaceBatchPlainFileReportsLockedOutputDuringFinalize(t *testing.T) {
 	rules := []BatchRule{
 		{Name: "Rule 1", Find: []byte("hello"), Replace: []byte("bye"), Priority: 0},
 	}
-	summary, err := ReplaceBatchPlainFile(context.Background(), srcPath, outPath, rules, FileOptions{}, BatchOptions{
+	summary, err := replaceBatchPlainFile(context.Background(), srcPath, outPath, rules, FileOptions{}, BatchOptions{
 		ChunkSize: 8,
 	})
 	assertFinalizeLockFailure(t, outPath, summary.TempPath, summary.ManifestPath, err, lockedErr)
@@ -61,9 +61,9 @@ func TestReplaceBatchRegexpFileReportsLockedOutputDuringFinalize(t *testing.T) {
 	defer restore()
 
 	rules := []BatchRule{
-		{Name: "Rule 1", Find: []byte(`id=(\d+)`), Replace: []byte(`row-$1`), Priority: 0},
+		{Name: "Rule 1", Find: []byte(`id=(\d{2})`), Replace: []byte(`row-$1`), Priority: 0},
 	}
-	summary, err := ReplaceBatchRegexpFile(context.Background(), srcPath, outPath, rules, FileOptions{}, RegexOptions{
+	summary, err := replaceBatchRegexpFile(context.Background(), srcPath, outPath, rules, FileOptions{}, RegexOptions{
 		ChunkSize:      8,
 		MaxMatchWindow: 8,
 	})
@@ -82,7 +82,7 @@ func TestConvertLineEndingsFileReportsLockedOutputDuringFinalize(t *testing.T) {
 	restore := installFinalizeLock(t, outPath, lockedErr)
 	defer restore()
 
-	summary, err := ConvertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
+	summary, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
 	assertFinalizeLockFailure(t, outPath, summary.TempPath, summary.ManifestPath, err, lockedErr)
 }
 
@@ -98,7 +98,7 @@ func TestConvertEncodingFileReportsLockedOutputDuringFinalize(t *testing.T) {
 	restore := installFinalizeLock(t, outPath, lockedErr)
 	defer restore()
 
-	summary, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-16LE", FileOptions{})
+	summary, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-16LE", FileOptions{})
 	assertFinalizeLockFailure(t, outPath, summary.TempPath, summary.ManifestPath, err, lockedErr)
 }
 

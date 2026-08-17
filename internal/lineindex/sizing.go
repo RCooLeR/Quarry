@@ -1,9 +1,10 @@
 package lineindex
 
+const defaultEveryLines int64 = 4096
+
 const (
-	defaultEveryLines     int64 = 4096
-	targetMaxIndexAnchors       = 1_000_000
-	minTextBytesPerLine   int64 = 10
+	MaxIndexEntries         = 250_000
+	maxPriorityIndexEntries = 4096
 )
 
 // EveryLinesForSize returns a sparse-index stride sized to keep anchor counts
@@ -13,7 +14,13 @@ func EveryLinesForSize(sizeBytes int64) int64 {
 	if sizeBytes <= 0 {
 		return defaultEveryLines
 	}
-	minEvery := sizeBytes / (minTextBytesPerLine * targetMaxIndexAnchors)
+	// A file made entirely of one-byte LF records is the real worst case. Keep
+	// room for the mandatory line-1 anchor as well as sparse newline anchors.
+	anchorBudget := int64(MaxIndexEntries - 1)
+	minEvery := sizeBytes / anchorBudget
+	if sizeBytes%anchorBudget != 0 {
+		minEvery++
+	}
 	if minEvery <= defaultEveryLines {
 		return defaultEveryLines
 	}

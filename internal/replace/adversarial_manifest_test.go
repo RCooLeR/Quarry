@@ -26,7 +26,7 @@ func TestReplacePlainFileReadyManifestFailurePreservesSourceAndTemp(t *testing.T
 	restore := failReplaceManifestOpenOnCall(t, 2, manifestErr)
 	defer restore()
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 5})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 5})
 	if !errors.Is(err, manifestErr) {
 		t.Fatalf("err = %v, want ready manifest failure", err)
 	}
@@ -55,7 +55,7 @@ func TestReplacePlainFileCompletedManifestFailurePreservesSourceAndOutput(t *tes
 	restore := failReplaceManifestOpenOnCall(t, 3, manifestErr)
 	defer restore()
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 5})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 5})
 	if !errors.Is(err, manifestErr) {
 		t.Fatalf("err = %v, want completed manifest failure", err)
 	}
@@ -82,7 +82,7 @@ func TestReplaceTransformReadyManifestFailurePreservesSourceAndTemp(t *testing.T
 			name:   "regex",
 			source: []byte("aa11 bb22\n"),
 			run: func(ctx context.Context, srcPath string, outPath string) (FileSummary, error) {
-				return ReplaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{ChunkSize: 5}, RegexOptions{
+				return replaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{ChunkSize: 5}, RegexOptions{
 					ChunkSize:      5,
 					MaxMatchWindow: 16,
 				})
@@ -96,7 +96,7 @@ func TestReplaceTransformReadyManifestFailurePreservesSourceAndTemp(t *testing.T
 			name:   "line-ending",
 			source: []byte("alpha\r\nbeta\r\n"),
 			run: func(ctx context.Context, srcPath string, outPath string) (FileSummary, error) {
-				return ConvertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{ChunkSize: 5})
+				return convertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{ChunkSize: 5})
 			},
 			assertTemp: func(t *testing.T, path string) {
 				t.Helper()
@@ -147,7 +147,7 @@ func TestReplaceTransformCompletedManifestFailurePreservesSourceAndOutput(t *tes
 			name:   "regex",
 			source: []byte("aa11 bb22\n"),
 			run: func(ctx context.Context, srcPath string, outPath string) (FileSummary, error) {
-				return ReplaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{ChunkSize: 5}, RegexOptions{
+				return replaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{ChunkSize: 5}, RegexOptions{
 					ChunkSize:      5,
 					MaxMatchWindow: 16,
 				})
@@ -165,7 +165,7 @@ func TestReplaceTransformCompletedManifestFailurePreservesSourceAndOutput(t *tes
 					{Name: "Greeting", Find: []byte("hello"), Replace: []byte("bye"), Priority: 0},
 					{Name: "Place", Find: []byte("world"), Replace: []byte("earth"), Priority: 1},
 				}
-				return ReplaceBatchPlainFile(ctx, srcPath, outPath, rules, FileOptions{ChunkSize: 5}, BatchOptions{ChunkSize: 5})
+				return replaceBatchPlainFile(ctx, srcPath, outPath, rules, FileOptions{ChunkSize: 5}, BatchOptions{ChunkSize: 5})
 			},
 			assertOutput: func(t *testing.T, path string) {
 				t.Helper()
@@ -179,7 +179,7 @@ func TestReplaceTransformCompletedManifestFailurePreservesSourceAndOutput(t *tes
 				rules := []BatchRule{
 					{Name: "ID", Find: []byte(`id=(\d\d)`), Replace: []byte(`row-$1`), Priority: 0},
 				}
-				return ReplaceBatchRegexpFile(ctx, srcPath, outPath, rules, FileOptions{ChunkSize: 5}, RegexOptions{
+				return replaceBatchRegexpFile(ctx, srcPath, outPath, rules, FileOptions{ChunkSize: 5}, RegexOptions{
 					ChunkSize:      5,
 					MaxMatchWindow: 16,
 				})
@@ -193,7 +193,7 @@ func TestReplaceTransformCompletedManifestFailurePreservesSourceAndOutput(t *tes
 			name:   "line-ending",
 			source: []byte("alpha\r\nbeta\r\n"),
 			run: func(ctx context.Context, srcPath string, outPath string) (FileSummary, error) {
-				return ConvertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{ChunkSize: 5})
+				return convertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{ChunkSize: 5})
 			},
 			assertOutput: func(t *testing.T, path string) {
 				t.Helper()
@@ -204,7 +204,7 @@ func TestReplaceTransformCompletedManifestFailurePreservesSourceAndOutput(t *tes
 			name:   "encoding",
 			source: []byte("alpha\nbeta\n"),
 			run: func(ctx context.Context, srcPath string, outPath string) (FileSummary, error) {
-				return ConvertEncodingFile(ctx, srcPath, outPath, "UTF-16LE", FileOptions{ChunkSize: 5})
+				return convertEncodingFile(ctx, srcPath, outPath, "UTF-16LE", FileOptions{ChunkSize: 5})
 			},
 			assertOutput: func(t *testing.T, path string) {
 				t.Helper()

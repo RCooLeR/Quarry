@@ -134,3 +134,22 @@ func TestExclusiveOutputCleanupSyncsDirectoryAfterRemove(t *testing.T) {
 		t.Fatalf("syncDirPath called %d times, want close and remove syncs", calls)
 	}
 }
+
+func TestOpenExclusiveOutputPreservesExactPathSpelling(t *testing.T) {
+	originalOpen := openPath
+	defer func() { openPath = originalOpen }()
+	sentinel := errors.New("captured path")
+	var seen string
+	openPath = func(path string, flag int, perm os.FileMode) (*os.File, error) {
+		seen = path
+		return nil, sentinel
+	}
+
+	const selected = " output.txt"
+	if _, err := OpenExclusiveOutput(selected, 0o600); !errors.Is(err, sentinel) {
+		t.Fatalf("err = %v, want sentinel", err)
+	}
+	if seen != selected {
+		t.Fatalf("open path = %q, want exact %q", seen, selected)
+	}
+}

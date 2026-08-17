@@ -1,13 +1,17 @@
 package lineindex
 
 import (
-	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"sync"
+
+	"github.com/quarry/quarry-wails3/internal/newlines"
 )
+
+var ErrIndexEntryLimit = errors.New("line index exceeds the bounded anchor limit")
 
 // Entry maps a known line number to a byte offset.
 type Entry struct {
@@ -54,11 +58,125 @@ func New(everyLines int64) *Index {
 // FromSnapshot restores an index snapshot.
 func FromSnapshot(s Snapshot) *Index {
 	idx := New(s.EveryLines)
-	idx.entries = append(idx.entries, s.Entries...)
+	_ = idx.RestoreSnapshot(s)
+	return idx
+}
+
+// ValidateSnapshot rejects malformed or oversized persistent anchors before
+// navigation code can rely on their ordering and ranges.
+func ValidateSnapshot(s Snapshot, sourceBytes int64) error {
+	if s.EveryLines <= 0 {
+		return errors.New("line index stride must be positive")
+	}
+	if s.Lines < 0 || s.Bytes < 0 || sourceBytes < 0 || s.Bytes != sourceBytes {
+		return errors.New("line index totals do not match the source")
+	}
+	if s.Lines > s.Bytes {
+		return errors.New("line index has more line breaks than source bytes")
+	}
+	if len(s.Entries) > MaxIndexEntries {
+		return fmt.Errorf("%w: %d > %d", ErrIndexEntryLimit, len(s.Entries), MaxIndexEntries)
+	}
+	if len(s.Entries) == 0 {
+		if s.Bytes == 0 && s.Lines == 0 {
+			return nil
+		}
+		return errors.New("non-empty line index is missing its first anchor")
+	}
+	expectedEntries := int64(1) + s.Lines/s.EveryLines
+	if expectedEntries > int64(MaxIndexEntries) || int64(len(s.Entries)) != expectedEntries {
+		return fmt.Errorf("line index anchor count %d does not match completed totals (want %d)", len(s.Entries), expectedEntries)
+	}
+	if s.Entries[0] != (Entry{Line: 1, Offset: 0}) {
+		return errors.New("line index must begin at line 1, byte 0")
+	}
+	previous := Entry{}
+	for i, entry := range s.Entries {
+		if entry.Line <= 0 || entry.Offset < 0 || entry.Offset > sourceBytes || entry.Line > s.Lines+1 {
+			return fmt.Errorf("line index anchor %d is out of range", i)
+		}
+		expectedLine := int64(1) + int64(i)*s.EveryLines
+		if entry.Line != expectedLine {
+			return fmt.Errorf("line index anchor %d has line %d, want %d for stride %d", i, entry.Line, expectedLine, s.EveryLines)
+		}
+		if i > 0 && (entry.Line <= previous.Line || entry.Offset <= previous.Offset) {
+			return fmt.Errorf("line index anchor %d is not strictly monotonic", i)
+		}
+		previous = entry
+	}
+	return nil
+}
+
+// RestoreSnapshot imports a validated snapshot into the existing Index object,
+// keeping the document's pointer stable for concurrent readers.
+func (idx *Index) RestoreSnapshot(s Snapshot) error {
+	if idx == nil {
+		return errors.New("line index is required")
+	}
+	if s.EveryLines != idx.EveryLines {
+		return fmt.Errorf("line index stride changed from %d to %d", idx.EveryLines, s.EveryLines)
+	}
+	if err := ValidateSnapshot(s, s.Bytes); err != nil {
+		return err
+	}
+	entries := append([]Entry(nil), s.Entries...)
+	return idx.restoreSnapshotOwned(Snapshot{
+		EveryLines: s.EveryLines,
+		Entries:    entries,
+		Lines:      s.Lines,
+		Bytes:      s.Bytes,
+		Done:       s.Done,
+	})
+}
+
+// RestoreSnapshotOwned imports a validated snapshot without copying its entry
+// slice. The caller transfers ownership and must not retain or mutate Entries
+// after this call. It exists for bounded streaming cache decoders, which
+// already allocate a private, capped entry slice.
+func (idx *Index) RestoreSnapshotOwned(s Snapshot) error {
+	if idx == nil {
+		return errors.New("line index is required")
+	}
+	if s.EveryLines != idx.EveryLines {
+		return fmt.Errorf("line index stride changed from %d to %d", idx.EveryLines, s.EveryLines)
+	}
+	if err := ValidateSnapshot(s, s.Bytes); err != nil {
+		return err
+	}
+	return idx.restoreSnapshotOwned(s)
+}
+
+func (idx *Index) restoreSnapshotOwned(s Snapshot) error {
+	idx.mu.Lock()
+	idx.entries = s.Entries
+	idx.priorityEntries = nil
 	idx.lines = s.Lines
 	idx.bytes = s.Bytes
 	idx.done = s.Done
-	return idx
+	idx.mu.Unlock()
+	return nil
+}
+
+// WithSnapshotView runs fn while holding the index read lock. The Entries
+// slice in the supplied snapshot is a read-only view owned by the Index and is
+// valid only for the duration of fn. This lets persistent encoders stream a
+// completed index without Snapshot's full-slice copy.
+func (idx *Index) WithSnapshotView(fn func(Snapshot) error) error {
+	if idx == nil {
+		return errors.New("line index is required")
+	}
+	if fn == nil {
+		return errors.New("snapshot callback is required")
+	}
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return fn(Snapshot{
+		EveryLines: idx.EveryLines,
+		Entries:    idx.entries,
+		Lines:      idx.lines,
+		Bytes:      idx.bytes,
+		Done:       idx.done,
+	})
 }
 
 func (idx *Index) Entries() []Entry {
@@ -110,14 +228,32 @@ func (idx *Index) Build(ctx context.Context, r io.Reader) error {
 // BuildWithEncoding scans a reader sequentially and records sparse line offsets
 // using encoding-aware newline detection.
 func (idx *Index) BuildWithEncoding(ctx context.Context, r io.Reader, encodingName string) error {
-	const chunkSize = 4 * 1024 * 1024
+	return idx.buildWithEncodingChunkSize(ctx, r, encodingName, 4*1024*1024)
+}
 
+func (idx *Index) buildWithEncodingChunkSize(ctx context.Context, r io.Reader, encodingName string, chunkSize int) error {
+	if chunkSize <= 0 {
+		return errors.New("line-index chunk size must be positive")
+	}
 	buf := make([]byte, chunkSize)
 	var offset int64
 	var line int64
-	carry := make([]byte, 0, lineBreakOverlap(encodingName))
+	scanner := newlines.New(encodingName)
 
-	idx.addExact(Entry{Line: 1, Offset: 0})
+	if !idx.tryAddExact(Entry{Line: 1, Offset: 0}) {
+		return ErrIndexEntryLimit
+	}
+	var scanErr error
+	emit := func(br newlines.Break) bool {
+		line++
+		if line%idx.EveryLines == 0 {
+			if !idx.tryAddExact(Entry{Line: line + 1, Offset: br.End}) {
+				scanErr = ErrIndexEntryLimit
+				return false
+			}
+		}
+		return true
+	}
 
 	for {
 		select {
@@ -128,19 +264,17 @@ func (idx *Index) BuildWithEncoding(ctx context.Context, r io.Reader, encodingNa
 
 		n, err := r.Read(buf)
 		if n > 0 {
-			part := buf[:n]
-			carry = scanLineBreaks(encodingName, carry, part, offset, func(nextOffset int64) bool {
-				line++
-				if line%idx.EveryLines == 0 {
-					idx.addExact(Entry{Line: line + 1, Offset: nextOffset})
-				}
-				return true
-			})
+			if !scanner.Scan(buf[:n], offset, emit) {
+				return scanErr
+			}
 			offset += int64(n)
 			idx.setProgress(line, offset)
 		}
 
 		if errors.Is(err, io.EOF) {
+			if !scanner.Finish(emit) {
+				return scanErr
+			}
 			idx.setDone(line, offset)
 			return nil
 		}
@@ -150,96 +284,14 @@ func (idx *Index) BuildWithEncoding(ctx context.Context, r io.Reader, encodingNa
 	}
 }
 
-func scanLineBreaks(encodingName string, carry []byte, data []byte, baseOffset int64, emit func(nextOffset int64) bool) []byte {
-	overlap := lineBreakOverlap(encodingName)
-	if len(data) == 0 {
-		if overlap > len(carry) {
-			overlap = len(carry)
-		}
-		return append(carry[:0], carry[len(carry)-overlap:]...)
-	}
-
-	if overlap > 0 && len(carry) > 0 {
-		seam := [2]byte{carry[len(carry)-1], data[0]}
-		if idx, width := findLineBreak(seam[:], encodingName); idx == 0 {
-			if !emit(baseOffset - int64(len(carry)) + int64(width)) {
-				return retainLineBreakCarry(carry, data, overlap)
-			}
-		}
-	}
-
-	searchFrom := 0
-	for {
-		idx, width := findLineBreak(data[searchFrom:], encodingName)
-		if idx < 0 {
-			break
-		}
-		rel := searchFrom + idx
-		if !emit(baseOffset + int64(rel+width)) {
-			break
-		}
-		searchFrom = rel + width
-	}
-	return retainLineBreakCarry(carry, data, overlap)
-}
-
-func retainLineBreakCarry(carry []byte, data []byte, overlap int) []byte {
-	if overlap <= 0 {
-		return carry[:0]
-	}
-	if overlap > len(data) {
-		overlap = len(data)
-	}
-	return append(carry[:0], data[len(data)-overlap:]...)
-}
-
-func lineBreakOverlap(encodingName string) int {
-	switch encodingName {
-	case "UTF-16LE", "UTF-16BE":
-		return 1
-	default:
-		return 0
-	}
-}
-
-func findLineBreak(data []byte, encodingName string) (index int, width int) {
-	switch encodingName {
-	case "UTF-16LE":
-		lf := bytes.Index(data, []byte{0x0A, 0x00})
-		cr := bytes.Index(data, []byte{0x0D, 0x00})
-		if lf >= 0 && (cr < 0 || lf <= cr+2) {
-			return lf, 2
-		}
-		if cr >= 0 {
-			return cr, 2
-		}
-	case "UTF-16BE":
-		lf := bytes.Index(data, []byte{0x00, 0x0A})
-		cr := bytes.Index(data, []byte{0x00, 0x0D})
-		if lf >= 0 && (cr < 0 || lf <= cr+2) {
-			return lf, 2
-		}
-		if cr >= 0 {
-			return cr, 2
-		}
-	default:
-		lf := bytes.IndexByte(data, '\n')
-		cr := bytes.IndexByte(data, '\r')
-		if lf >= 0 && (cr < 0 || lf <= cr+1) {
-			return lf, 1
-		}
-		if cr >= 0 {
-			return cr, 1
-		}
-	}
-	return -1, 0
-}
-
 // AddPriorityEntry records an approximate sparse anchor near the active viewport.
 func (idx *Index) AddPriorityEntry(e Entry) {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	if len(idx.priorityEntries) >= maxPriorityIndexEntries {
+		return
+	}
 	insertEntry(&idx.priorityEntries, e)
 }
 
@@ -303,11 +355,15 @@ func (idx *Index) FloorOffsetEntry(offset int64) (Entry, bool) {
 	return floorEntryByOffset(idx.entries, offset)
 }
 
-func (idx *Index) addExact(e Entry) {
+func (idx *Index) tryAddExact(e Entry) bool {
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
 
+	if len(idx.entries) >= MaxIndexEntries {
+		return false
+	}
 	insertEntry(&idx.entries, e)
+	return true
 }
 
 func (idx *Index) setProgress(lines, bytes int64) {

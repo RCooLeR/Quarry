@@ -2,9 +2,11 @@ package csv
 
 import (
 	"context"
+	stdcsv "encoding/csv"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -42,6 +44,26 @@ func TestProjectColumnsHandlesTSV(t *testing.T) {
 	}
 	if got, want := out.String(), "name\tcity\nAda\tLondon\n"; got != want {
 		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
+
+func TestProjectColumnsPreservesUnquotedLeadingWhitespace(t *testing.T) {
+	input := "id,value\n1,  padded\n2,\tTabbed\n3, \n4,\"  quoted\"\n5, +001\n6,-001\n7,\n"
+	var output strings.Builder
+	_, err := ProjectColumns(context.Background(), strings.NewReader(input), &output, ProjectOptions{
+		Delimiter: ',', Columns: []int{0, 1},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := stdcsv.NewReader(strings.NewReader(output.String()))
+	rows, err := reader.ReadAll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := [][]string{{"id", "value"}, {"1", "  padded"}, {"2", "\tTabbed"}, {"3", " "}, {"4", "  quoted"}, {"5", " +001"}, {"6", "-001"}, {"7", ""}}
+	if !reflect.DeepEqual(rows, want) {
+		t.Fatalf("rows = %#v, want %#v", rows, want)
 	}
 }
 
@@ -161,7 +183,8 @@ func TestProjectColumnsFileDeletesPartialOutputOnCancel(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	_, err := ProjectColumnsFile(ctx, input, output, ProjectOptions{
-		Columns: []int{0},
+		Delimiter: ',',
+		Columns:   []int{0},
 		Progress: func(ProjectProgress) {
 			cancel()
 		},
@@ -180,7 +203,7 @@ func TestProjectColumnsFileRejectsSamePath(t *testing.T) {
 	if err := os.WriteFile(input, []byte("id,name\n1,Ada\n"), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ProjectColumnsFile(context.Background(), input, input, ProjectOptions{Columns: []int{0}}); err == nil {
+	if _, err := ProjectColumnsFile(context.Background(), input, input, ProjectOptions{Delimiter: ',', Columns: []int{0}}); err == nil {
 		t.Fatal("expected same-path error")
 	}
 }
@@ -195,7 +218,7 @@ func TestProjectColumnsFileRejectsExistingOutput(t *testing.T) {
 	if err := os.WriteFile(output, []byte("preexisting"), 0o666); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ProjectColumnsFile(context.Background(), input, output, ProjectOptions{Columns: []int{0}}); err == nil {
+	if _, err := ProjectColumnsFile(context.Background(), input, output, ProjectOptions{Delimiter: ',', Columns: []int{0}}); err == nil {
 		t.Fatal("expected existing-output error")
 	}
 	if data, err := os.ReadFile(output); err != nil || string(data) != "preexisting" {

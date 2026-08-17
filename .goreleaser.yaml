@@ -3,23 +3,15 @@ version: 2
 
 project_name: quarry
 
-# Wails desktop artifacts are built by native GitHub Actions runners so each OS
-# uses the platform toolchain it expects. GoReleaser owns the release creation,
-# changelog, and artifact upload.
+# Wails desktop candidates are built by native GitHub Actions runners so each
+# OS uses the platform toolchain it expects. Public GoReleaser publication is
+# intentionally disabled until licensing, signing/notarization, authenticated
+# provenance, and packaged-app safety gates are complete.
 builds:
   - skip: true
 
 release:
-  github:
-    owner: RCooLeR
-    name: Quarry
-  name_template: "{{ .ProjectName }} {{ .Tag }}"
-  draft: false
-  prerelease: auto
-  make_latest: true
-  mode: append
-  extra_files:
-    - glob: ./release-artifacts/*
+  disable: true
 
 changelog:
   sort: asc

@@ -8,8 +8,6 @@ import (
 	analyzepkg "github.com/quarry/quarry-wails3/internal/plugins/sql/analyze"
 	extractpkg "github.com/quarry/quarry-wails3/internal/plugins/sql/extract"
 	sqlhighlight "github.com/quarry/quarry-wails3/internal/plugins/sql/highlight"
-	presetpkg "github.com/quarry/quarry-wails3/internal/plugins/sql/preset"
-	replacepkg "github.com/quarry/quarry-wails3/internal/replace"
 )
 
 type ReaderAtSize = analyzepkg.ReaderAtSize
@@ -22,23 +20,6 @@ type ExtractTableRange = extractpkg.TableRange
 type ExtractManifestPreview = extractpkg.ManifestPreview
 type ExtractWriteOptions = extractpkg.WriteOptions
 type ExtractWriteSummary = extractpkg.WriteSummary
-
-type PresetMode = presetpkg.Mode
-type PresetConfig = presetpkg.Config
-
-const (
-	PresetModePlain = presetpkg.ModePlain
-	PresetModeRegex = presetpkg.ModeRegex
-	PresetModeBatch = presetpkg.ModeBatch
-
-	RemoveDefinerPreset       = presetpkg.RemoveDefinerPreset
-	ChangeDatabasePreset      = presetpkg.ChangeDatabasePreset
-	ChangeCharsetPreset       = presetpkg.ChangeCharsetPreset
-	ConvertEnginePreset       = presetpkg.ConvertEnginePreset
-	RemoveAutoIncrementPreset = presetpkg.RemoveAutoIncrementPreset
-)
-
-var PresetNames = append([]string(nil), presetpkg.PresetNames...)
 
 type TokenKind = highlight.TokenKind
 type Token = highlight.Token
@@ -57,9 +38,7 @@ type Runtime interface {
 	plugins.RuntimePlugin
 	Analyze(context.Context, ReaderAtSize, AnalyzeOptions) (Summary, error)
 	AnalyzeFile(context.Context, string, AnalyzeOptions) (Summary, error)
-	BuildPreset(name string, arg1 string, arg2 string, arg3 string, arg4 string) (PresetConfig, error)
 	HighlightVisible(text string) []Token
-	BatchRules(PresetConfig) []replacepkg.BatchRule
 	SplitByTablePreview(Summary, int64, ExtractPlanOptions) (ExtractManifestPreview, error)
 	ExtractTablePreview(Summary, int64, string, ExtractPlanOptions) (ExtractManifestPreview, error)
 	SplitByTable(context.Context, ReaderAtSize, string, Summary, ExtractWriteOptions) (ExtractWriteSummary, error)
@@ -84,16 +63,8 @@ func (BuiltIn) AnalyzeFile(ctx context.Context, path string, opts AnalyzeOptions
 	return AnalyzeFile(ctx, path, opts)
 }
 
-func (BuiltIn) BuildPreset(name string, arg1 string, arg2 string, arg3 string, arg4 string) (PresetConfig, error) {
-	return BuildPreset(name, arg1, arg2, arg3, arg4)
-}
-
 func (BuiltIn) HighlightVisible(text string) []Token {
 	return HighlightVisible(text)
-}
-
-func (BuiltIn) BatchRules(cfg PresetConfig) []replacepkg.BatchRule {
-	return BatchRules(cfg)
 }
 
 func (BuiltIn) SplitByTablePreview(summary Summary, sourceSize int64, opts ExtractPlanOptions) (ExtractManifestPreview, error) {
@@ -117,8 +88,8 @@ func Plugin() plugins.Descriptor {
 		ID:           "sql",
 		DisplayName:  "SQL Dumps",
 		Category:     "data",
-		Description:  "SQL dump highlighting, analysis, navigation, cleanup presets, and future table extraction/splitting tools.",
-		FilePatterns: plugins.SQLFilePatterns,
+		Description:  "SQL dump highlighting, analysis, navigation, reshape, and table extraction/splitting tools.",
+		FilePatterns: plugins.SQLPatterns(),
 		Capabilities: []plugins.Capability{
 			plugins.CapabilitySyntax,
 			plugins.CapabilityAnalyze,
@@ -126,10 +97,48 @@ func Plugin() plugins.Descriptor {
 			plugins.CapabilityNavigate,
 			plugins.CapabilityExtract,
 		},
-		Modes:        []plugins.Mode{plugins.ModeInteractive, plugins.ModeStreaming},
-		HugeFileSafe: true,
+		Operations: []plugins.OperationCapability{
+			{
+				ID: "highlight-visible", Capability: plugins.CapabilitySyntax,
+				Processing: plugins.ProcessingBoundedWindow, Memory: plugins.MemoryBounded,
+				MaxInputBytes: 32 << 20,
+				Notes:         []string{"Highlighting consumes only the bounded visible window supplied by the editor."},
+			},
+			{
+				ID: "analyze-dump", Capability: plugins.CapabilityAnalyze,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryMetadataProportional,
+				Cancellable: true,
+				Notes:       []string{"Input scanning is streaming; retained table and statement metadata grows with dump cardinality."},
+			},
+			{
+				ID: "navigate-tables", Capability: plugins.CapabilityNavigate,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryMetadataProportional,
+				Cancellable: true,
+				Notes:       []string{"Navigation uses analyzer metadata and inherits its cardinality-proportional retention."},
+			},
+			{
+				ID: "reshape-inserts", Capability: plugins.CapabilityTransform,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryBatchProportional,
+				Cancellable: true, AtomicOutput: true,
+				Notes: []string{"Reshape memory grows with the configured tuple batch and statement size."},
+			},
+			{
+				ID: "extract-tables", Capability: plugins.CapabilityExtract,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryStatementProportional,
+				Cancellable: true, AtomicOutput: true,
+				Notes: []string{"Table writes stream source ranges, while statement and manifest metadata remain input-dependent."},
+			},
+			{
+				ID: "fixture-sample", Capability: plugins.CapabilityExtract,
+				Processing: plugins.ProcessingMaterialized, Memory: plugins.MemoryInputProportional,
+				Cancellable: true,
+				Notes:       []string{"Fixture sampling returns a buffer and must not be treated as huge-file safe without a separate hard sample cap."},
+			},
+		},
+		Modes: []plugins.Mode{plugins.ModeInteractive, plugins.ModeStreaming},
 		Notes: []string{
-			"SQL analyzer, cleanup presets, visible SQL highlighting, split/extract manifest previews, and streaming SQL table writes are routed through this built-in plugin adapter.",
+			"SQL analyzer, visible SQL highlighting, reshape, split/extract manifest previews, and streaming SQL table writes are routed through this built-in plugin adapter.",
+			"Cleanup presets are not advertised because byte-level replacement is not safe for structural SQL transformations.",
 		},
 	}
 }
@@ -142,18 +151,8 @@ func AnalyzeFile(ctx context.Context, path string, opts AnalyzeOptions) (Summary
 	return analyzepkg.AnalyzeFile(ctx, path, opts)
 }
 
-func BuildPreset(name string, arg1 string, arg2 string, arg3 string, arg4 string) (PresetConfig, error) {
-	return presetpkg.Build(name, arg1, arg2, arg3, arg4)
-}
-
 func HighlightVisible(text string) []Token {
 	return sqlhighlight.SQLVisible(text)
-}
-
-// BatchRules returns the replacement rules for callers that need an explicit
-// replace package type while keeping preset construction owned by the SQL plugin.
-func BatchRules(cfg PresetConfig) []replacepkg.BatchRule {
-	return append([]replacepkg.BatchRule(nil), cfg.BatchRules...)
 }
 
 func SplitByTablePreview(summary Summary, sourceSize int64, opts ExtractPlanOptions) (ExtractManifestPreview, error) {

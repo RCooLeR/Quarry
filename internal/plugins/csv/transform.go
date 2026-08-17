@@ -5,10 +5,12 @@ import (
 	"context"
 	stdcsv "encoding/csv"
 	"errors"
+	"fmt"
 	"io"
-	"os"
 	"strconv"
 	"strings"
+
+	"github.com/quarry/quarry-wails3/internal/fileio"
 )
 
 // TransformSummary is the result of a streaming row transform.
@@ -19,60 +21,48 @@ type TransformSummary struct {
 }
 
 type rowTransform struct {
-	reader  *stdcsv.Reader
-	writer  *stdcsv.Writer
-	bw      *bufio.Writer
-	in      *os.File
-	out     *os.File
-	cleanup bool
-	tmpPath string
-	dstPath string
+	reader *stdcsv.Reader
+	writer *stdcsv.Writer
+	bw     *bufio.Writer
+	in     *sourceHandle
+	out    *fileio.AtomicOutput
 }
 
-// tempOutputPath is the scratch file a transform/export writes to before it is
-// atomically renamed over the destination on success. Writing to a temp file
-// means the Save dialog's confirmed "replace" overwrites the target only when
-// the new output completed — a failed/cancelled run never destroys it.
-func tempOutputPath(dst string) string { return dst + ".quarry-part" }
-
-func openRowTransform(srcPath, dstPath string, delim rune) (*rowTransform, error) {
-	if delim == 0 {
-		delim = ','
-	}
-	if same, err := sameFilePath(srcPath, dstPath); err != nil {
+// openRowTransform writes through an operation-owned atomic output. No final
+// pathname is visible until the complete transform is synced and published.
+func openRowTransform(ctx context.Context, srcPath, dstPath string, delim rune, maxRecordBytes int64, expected *SourceExpectation) (*rowTransform, error) {
+	if err := ValidateDelimiter(delim); err != nil {
 		return nil, err
-	} else if same {
-		return nil, errors.New("output path must be different from input path")
 	}
-	in, err := os.Open(srcPath)
+	if _, err := normalizeLogicalRecordLimit(maxRecordBytes); err != nil {
+		return nil, err
+	}
+	in, err := openCSVSource(ctx, srcPath, expected)
 	if err != nil {
 		return nil, err
 	}
-	tmpPath := tempOutputPath(dstPath)
-	out, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	out, err := fileio.OpenAtomicOutput(dstPath, []string{srcPath}, 0o600)
 	if err != nil {
-		_ = in.Close()
-		return nil, err
+		return nil, errors.Join(err, in.Close())
 	}
 	br := bufio.NewReader(in)
 	if err := skipInputBOM(br); err != nil {
-		_ = in.Close()
-		_ = out.Close()
-		_ = os.Remove(tmpPath)
-		return nil, err
+		return nil, errors.Join(err, in.Close(), out.Cleanup())
 	}
-	reader := stdcsv.NewReader(br)
-	reader.Comma = delim
-	reader.FieldsPerRecord = -1
-	reader.LazyQuotes = true
-	reader.ReuseRecord = false
+	reader, err := newBoundedCSVReader(ctx, br, csvReaderConfig{
+		Delimiter: delim, MaxRecordBytes: maxRecordBytes,
+		FieldsPerRecord: -1, LazyQuotes: false,
+	})
+	if err != nil {
+		return nil, errors.Join(err, in.Close(), out.Cleanup())
+	}
 	bw := bufio.NewWriter(out)
 	writer := stdcsv.NewWriter(bw)
 	writer.Comma = delim
-	return &rowTransform{reader: reader, writer: writer, bw: bw, in: in, out: out, cleanup: true, tmpPath: tmpPath, dstPath: dstPath}, nil
+	return &rowTransform{reader: reader, writer: writer, bw: bw, in: in, out: out}, nil
 }
 
-func (t *rowTransform) finish() error {
+func (t *rowTransform) finish(ctx context.Context) error {
 	t.writer.Flush()
 	if err := t.writer.Error(); err != nil {
 		return err
@@ -80,36 +70,36 @@ func (t *rowTransform) finish() error {
 	if err := t.bw.Flush(); err != nil {
 		return err
 	}
-	if err := t.out.Sync(); err != nil {
-		return err
-	}
-	if err := t.out.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(t.tmpPath, t.dstPath); err != nil {
-		return err
-	}
-	t.cleanup = false
-	return nil
+	return t.out.CommitContextValidated(ctx, t.in.ValidateContext)
 }
 
-func (t *rowTransform) close() {
-	_ = t.in.Close()
-	if t.cleanup {
-		_ = t.out.Close()
-		_ = os.Remove(t.tmpPath)
-	}
+func (t *rowTransform) close() error {
+	return errors.Join(t.in.Close(), t.out.Cleanup())
 }
+
+type FilterOp string
+
+const (
+	FilterEqual    FilterOp = "eq"
+	FilterNotEqual FilterOp = "ne"
+	FilterContains FilterOp = "contains"
+	FilterGreater  FilterOp = "gt"
+	FilterLess     FilterOp = "lt"
+	FilterEmpty    FilterOp = "empty"
+	FilterNonEmpty FilterOp = "nonempty"
+)
 
 // FilterOptions selects rows where column[Column] matches Op/Value.
 type FilterOptions struct {
-	Delimiter rune
-	HasHeader bool
-	Column    int
-	Op        string // eq | ne | contains | gt | lt | empty | nonempty
-	Value     string
-	Negate    bool
-	Progress  func(records int64)
+	Delimiter      rune
+	HasHeader      bool
+	Column         int
+	Op             FilterOp
+	Value          string
+	Negate         bool
+	MaxRecordBytes int64
+	ExpectedSource *SourceExpectation
+	Progress       func(records int64)
 }
 
 // reportEvery throttles a progress callback to multiples of n records.
@@ -119,28 +109,53 @@ func reportEvery(p func(records int64), records, n int64) {
 	}
 }
 
-func rowMatches(cell, op, value string) bool {
+func ValidateFilterOptions(opts FilterOptions) error {
+	configStringBytes := 0
+	if err := addTransformConfigString(&configStringBytes, "CSV filter", string(opts.Op)); err != nil {
+		return err
+	}
+	if err := addTransformConfigString(&configStringBytes, "CSV filter", opts.Value); err != nil {
+		return err
+	}
+	if err := ValidateDelimiter(opts.Delimiter); err != nil {
+		return err
+	}
+	if opts.Column < 0 {
+		return fmt.Errorf("filter column %d is negative", opts.Column)
+	}
+	if _, err := normalizeLogicalRecordLimit(opts.MaxRecordBytes); err != nil {
+		return err
+	}
+	switch opts.Op {
+	case FilterEqual, FilterNotEqual, FilterContains, FilterGreater, FilterLess, FilterEmpty, FilterNonEmpty:
+		return nil
+	default:
+		return fmt.Errorf("invalid filter operation %q", opts.Op)
+	}
+}
+
+func rowMatches(cell string, op FilterOp, value string) bool {
 	switch op {
-	case "eq":
+	case FilterEqual:
 		return cell == value
-	case "ne":
+	case FilterNotEqual:
 		return cell != value
-	case "contains":
+	case FilterContains:
 		return strings.Contains(cell, value)
-	case "empty":
+	case FilterEmpty:
 		return strings.TrimSpace(cell) == ""
-	case "nonempty":
+	case FilterNonEmpty:
 		return strings.TrimSpace(cell) != ""
-	case "gt", "lt":
+	case FilterGreater, FilterLess:
 		cn, e1 := strconv.ParseFloat(strings.TrimSpace(cell), 64)
 		vn, e2 := strconv.ParseFloat(strings.TrimSpace(value), 64)
 		if e1 == nil && e2 == nil {
-			if op == "gt" {
+			if op == FilterGreater {
 				return cn > vn
 			}
 			return cn < vn
 		}
-		if op == "gt" {
+		if op == FilterGreater {
 			return cell > value
 		}
 		return cell < value
@@ -150,12 +165,15 @@ func rowMatches(cell, op, value string) bool {
 }
 
 // FilterRowsFile streams src to dst keeping only matching rows (header preserved).
-func FilterRowsFile(ctx context.Context, srcPath, dstPath string, opts FilterOptions) (TransformSummary, error) {
-	t, err := openRowTransform(srcPath, dstPath, opts.Delimiter)
+func FilterRowsFile(ctx context.Context, srcPath, dstPath string, opts FilterOptions) (_ TransformSummary, retErr error) {
+	if err := ValidateFilterOptions(opts); err != nil {
+		return TransformSummary{}, err
+	}
+	t, err := openRowTransform(ctx, srcPath, dstPath, opts.Delimiter, opts.MaxRecordBytes, opts.ExpectedSource)
 	if err != nil {
 		return TransformSummary{}, err
 	}
-	defer t.close()
+	defer func() { retErr = errors.Join(retErr, t.close()) }()
 	sum := TransformSummary{Delimiter: opts.Delimiter}
 	first := true
 	for {
@@ -195,48 +213,43 @@ func FilterRowsFile(ctx context.Context, srcPath, dstPath string, opts FilterOpt
 			sum.RecordsWritten++
 		}
 	}
-	if err := t.finish(); err != nil {
+	if err := t.finish(ctx); err != nil {
 		return sum, err
 	}
 	return sum, nil
 }
 
-// dedupeKey builds a collision-free seen-set key. A leading marker byte
-// distinguishes the three cases so they never alias each other:
-//   - keyColumn present  → 'k' + the cell
-//   - keyColumn missing  (row too short) → 'r' + the full NUL-joined row
-//   - whole-row dedupe   → 'w' + the full NUL-joined row
-// Without this, a short row (no key cell) and a row with an empty key cell would
-// share the same key and collapse together — silent data loss on ragged dumps.
-func dedupeKey(rec []string, keyColumn int) string {
-	if keyColumn >= 0 {
-		if keyColumn < len(rec) {
-			return "k\x00" + rec[keyColumn]
-		}
-		return "r\x00" + strings.Join(rec, "\x00")
-	}
-	return "w\x00" + strings.Join(rec, "\x00")
-}
-
 // DedupeOptions drops duplicate rows, by the whole row or by a key column.
 type DedupeOptions struct {
-	Delimiter rune
-	HasHeader bool
-	KeyColumn int // <0 = dedupe by whole row
-	Progress  func(records int64)
+	Delimiter       rune
+	HasHeader       bool
+	KeyColumn       int // <0 = dedupe by whole row
+	MaxRecordBytes  int64
+	MaxDistinctKeys int   // 0 uses DefaultDedupeMaxDistinctKeys
+	MaxMemoryBytes  int64 // retained exact-set budget; 0 uses DefaultDedupeMaxMemoryBytes
+	ExpectedSource  *SourceExpectation
+	Progress        func(records int64)
 }
 
-// DedupeRowsFile keeps the first occurrence of each row/key. The seen-set is
-// keyed on the exact key/row bytes (not a lossy hash), so distinct rows are
-// never collapsed by a collision; memory grows with the number of distinct keys.
-func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOptions) (TransformSummary, error) {
-	t, err := openRowTransform(srcPath, dstPath, opts.Delimiter)
+// DedupeRowsFile keeps the first occurrence of each row/key. It is exact within
+// validated in-memory key/cardinality budgets and fails without publishing the
+// destination when either budget would be exceeded.
+func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOptions) (_ TransformSummary, retErr error) {
+	normalized, err := normalizeDedupeOptions(opts)
 	if err != nil {
 		return TransformSummary{}, err
 	}
-	defer t.close()
+	opts = normalized
+	seen, err := newDedupeSet(opts.MaxDistinctKeys, opts.MaxMemoryBytes)
+	if err != nil {
+		return TransformSummary{}, err
+	}
+	t, err := openRowTransform(ctx, srcPath, dstPath, opts.Delimiter, opts.MaxRecordBytes, opts.ExpectedSource)
+	if err != nil {
+		return TransformSummary{}, err
+	}
+	defer func() { retErr = errors.Join(retErr, t.close()) }()
 	sum := TransformSummary{Delimiter: opts.Delimiter}
-	seen := map[string]struct{}{}
 	first := true
 	for {
 		if err := contextErr(ctx); err != nil {
@@ -251,6 +264,9 @@ func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOpt
 		}
 		sum.RecordsRead++
 		reportEvery(opts.Progress, sum.RecordsRead, 50000)
+		if err := contextErr(ctx); err != nil {
+			return sum, err
+		}
 		if first && opts.HasHeader {
 			first = false
 			if err := t.writer.Write(rec); err != nil {
@@ -260,17 +276,29 @@ func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOpt
 			continue
 		}
 		first = false
-		k := dedupeKey(rec, opts.KeyColumn)
-		if _, dup := seen[k]; dup {
+		key, err := dedupeKeyContext(ctx, rec, opts.KeyColumn)
+		if err != nil {
+			return sum, err
+		}
+		if err := contextErr(ctx); err != nil {
+			return sum, err
+		}
+		added, err := seen.add(key, sum.RecordsRead)
+		if err != nil {
+			return sum, err
+		}
+		if !added {
 			continue
 		}
-		seen[k] = struct{}{}
+		if err := contextErr(ctx); err != nil {
+			return sum, err
+		}
 		if err := t.writer.Write(rec); err != nil {
 			return sum, err
 		}
 		sum.RecordsWritten++
 	}
-	if err := t.finish(); err != nil {
+	if err := t.finish(ctx); err != nil {
 		return sum, err
 	}
 	return sum, nil
@@ -278,22 +306,24 @@ func DedupeRowsFile(ctx context.Context, srcPath, dstPath string, opts DedupeOpt
 
 // SampleOptions keeps every Nth data row.
 type SampleOptions struct {
-	Delimiter rune
-	HasHeader bool
-	EveryN    int
-	Progress  func(records int64)
+	Delimiter      rune
+	HasHeader      bool
+	EveryN         int
+	MaxRecordBytes int64
+	ExpectedSource *SourceExpectation
+	Progress       func(records int64)
 }
 
 // SampleRowsFile keeps every Nth data row (header preserved).
-func SampleRowsFile(ctx context.Context, srcPath, dstPath string, opts SampleOptions) (TransformSummary, error) {
+func SampleRowsFile(ctx context.Context, srcPath, dstPath string, opts SampleOptions) (_ TransformSummary, retErr error) {
 	if opts.EveryN <= 0 {
 		opts.EveryN = 10
 	}
-	t, err := openRowTransform(srcPath, dstPath, opts.Delimiter)
+	t, err := openRowTransform(ctx, srcPath, dstPath, opts.Delimiter, opts.MaxRecordBytes, opts.ExpectedSource)
 	if err != nil {
 		return TransformSummary{}, err
 	}
-	defer t.close()
+	defer func() { retErr = errors.Join(retErr, t.close()) }()
 	sum := TransformSummary{Delimiter: opts.Delimiter}
 	first := true
 	var dataIdx int64
@@ -327,7 +357,7 @@ func SampleRowsFile(ctx context.Context, srcPath, dstPath string, opts SampleOpt
 		}
 		dataIdx++
 	}
-	if err := t.finish(); err != nil {
+	if err := t.finish(ctx); err != nil {
 		return sum, err
 	}
 	return sum, nil

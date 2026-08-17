@@ -53,6 +53,72 @@ func TestSessionApplyUndoRedo(t *testing.T) {
 	}
 }
 
+func TestSessionRevisionTracksEverySuccessfulStateTransition(t *testing.T) {
+	session := NewSession(int64(len("abc")), DefaultMaxInsertedBytes)
+	if got := session.Revision(); got != 0 {
+		t.Fatalf("initial revision = %d, want 0", got)
+	}
+	if err := session.Undo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.Revision(); got != 0 {
+		t.Fatalf("no-op undo revision = %d, want 0", got)
+	}
+	if err := session.ApplyEdit(Edit{Start: 3, End: 3, Text: []byte("d")}); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.Revision(); got != 1 {
+		t.Fatalf("apply revision = %d, want 1", got)
+	}
+	if err := session.Undo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.Revision(); got != 2 {
+		t.Fatalf("undo revision = %d, want 2", got)
+	}
+	if err := session.Redo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.Revision(); got != 3 {
+		t.Fatalf("redo revision = %d, want 3", got)
+	}
+	if err := session.Redo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := session.Revision(); got != 3 {
+		t.Fatalf("no-op redo revision = %d, want 3", got)
+	}
+
+	session.revision = ^uint64(0)
+	if err := session.ApplyEdit(Edit{Start: 4, End: 4, Text: []byte("e")}); !errors.Is(err, ErrSessionRevisionExhausted) {
+		t.Fatalf("exhausted revision apply error = %v, want ErrSessionRevisionExhausted", err)
+	}
+	if session.EditCount() != 1 {
+		t.Fatalf("exhausted revision mutated edit count to %d", session.EditCount())
+	}
+}
+
+func TestSessionIdentityIsStableAndUnique(t *testing.T) {
+	first := NewSession(1, DefaultMaxInsertedBytes)
+	second := NewSession(1, DefaultMaxInsertedBytes)
+	if first.Identity() == 0 || second.Identity() == 0 {
+		t.Fatalf("session identities = %d, %d; want non-zero", first.Identity(), second.Identity())
+	}
+	if first.Identity() == second.Identity() {
+		t.Fatalf("distinct sessions share identity %d", first.Identity())
+	}
+	want := first.Identity()
+	if err := first.ApplyEdit(Edit{Start: 1, End: 1, Text: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Undo(); err != nil {
+		t.Fatal(err)
+	}
+	if got := first.Identity(); got != want {
+		t.Fatalf("session identity changed from %d to %d across mutations", want, got)
+	}
+}
+
 func TestSessionApplyAfterUndoDropsRedoHistory(t *testing.T) {
 	session := NewSession(int64(len("abc")), DefaultMaxInsertedBytes)
 	if err := session.ApplyEdit(Edit{Start: 3, End: 3, Text: []byte("d")}); err != nil {
@@ -248,6 +314,64 @@ func TestSourceRangeToTransformedRejectsReplacedSourceRange(t *testing.T) {
 	if _, ok := session.SourceRangeToTransformed(1, 3); ok {
 		t.Fatal("SourceRangeToTransformed returned ok for already replaced source range")
 	}
+}
+
+func TestTransformedRangeToSourceAccountsForLengthChangingEdits(t *testing.T) {
+	t.Run("insertion before range", func(t *testing.T) {
+		session := NewSession(int64(len("abcdef")), DefaultMaxInsertedBytes)
+		if err := session.ApplyEdit(Edit{Start: 2, End: 2, Text: []byte("XX")}); err != nil {
+			t.Fatal(err)
+		}
+
+		got, ok := session.TransformedRangeToSource(4, 6)
+		if !ok || got != (Range{Start: 2, End: 4}) {
+			t.Fatalf("mapped range = %#v, ok=%v, want source 2..4", got, ok)
+		}
+		inserted, ok := session.TransformedRangeToSource(2, 4)
+		if !ok || inserted != (Range{Start: 2, End: 2}) {
+			t.Fatalf("inserted range = %#v, ok=%v, want zero-width source anchor 2", inserted, ok)
+		}
+	})
+
+	t.Run("replacement-only range includes replaced source", func(t *testing.T) {
+		session := NewSession(int64(len("abcdef")), DefaultMaxInsertedBytes)
+		if err := session.ApplyEdit(Edit{Start: 2, End: 5, Text: []byte("WXYZ")}); err != nil {
+			t.Fatal(err)
+		}
+
+		got, ok := session.TransformedRangeToSource(3, 5)
+		if !ok || got != (Range{Start: 2, End: 5}) {
+			t.Fatalf("mapped range = %#v, ok=%v, want conservative replaced source 2..5", got, ok)
+		}
+	})
+
+	t.Run("deletion join and following range are distinct", func(t *testing.T) {
+		session := NewSession(int64(len("abcdef")), DefaultMaxInsertedBytes)
+		if err := session.ApplyEdit(Edit{Start: 2, End: 4, Text: nil}); err != nil {
+			t.Fatal(err)
+		}
+
+		deleted, ok := session.TransformedRangeToSource(2, 2)
+		if !ok || deleted != (Range{Start: 2, End: 4}) {
+			t.Fatalf("deleted join = %#v, ok=%v, want source 2..4", deleted, ok)
+		}
+		following, ok := session.TransformedRangeToSource(2, 4)
+		if !ok || following != (Range{Start: 4, End: 6}) {
+			t.Fatalf("following range = %#v, ok=%v, want source 4..6", following, ok)
+		}
+	})
+
+	t.Run("complete deletion maps empty edited view", func(t *testing.T) {
+		session := NewSession(int64(len("abcdef")), DefaultMaxInsertedBytes)
+		if err := session.ApplyEdit(Edit{Start: 0, End: 6, Text: nil}); err != nil {
+			t.Fatal(err)
+		}
+
+		got, ok := session.TransformedRangeToSource(0, 0)
+		if !ok || got != (Range{Start: 0, End: 6}) {
+			t.Fatalf("mapped empty view = %#v, ok=%v, want full source 0..6", got, ok)
+		}
+	})
 }
 
 func renderSessionForTest(t *testing.T, session *Session, source string) string {

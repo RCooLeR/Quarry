@@ -78,7 +78,7 @@ func FuzzPreviewBatchRegexpConsistentWithReplace(f *testing.F) {
 
 		previewOpts := RegexPreviewOptions{
 			ChunkSize:    chunkSize,
-			MaxHits:      0,
+			MaxHits:      MaxPreviewHits,
 			PreviewBytes: 16,
 		}
 		regexOpts := RegexOptions{
@@ -146,7 +146,7 @@ func runBatchRegexpForFuzz(t *testing.T, src []byte, rules []BatchRule, opts Reg
 	}()
 
 	dst := &fuzzSyncBuffer{}
-	matches, conflicts, err := ReplaceBatchRegexp(context.Background(), f, dst, rules, opts)
+	matches, conflicts, err := replaceBatchRegexp(context.Background(), f, dst, rules, opts)
 	if err != nil {
 		return nil, 0, 0, err
 	}

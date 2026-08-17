@@ -1,66 +1,76 @@
 package exportx
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/quarry/quarry-wails3/internal/document"
 	"github.com/quarry/quarry-wails3/internal/encodingx"
+	"github.com/quarry/quarry-wails3/internal/fileio"
 )
 
+// ExportByteRangeText exports only a character-aligned, valid text range. It
+// rejects unaligned byte endpoints instead of expanding them implicitly. Use
+// ExportByteRange when an exact arbitrary byte fragment is intended.
 func ExportByteRangeText(ctx context.Context, doc document.ReaderAtSize, sourcePath string, outputPath string, start int64, end int64, sourceEncoding string, targetEncoding string, opts Options) (Summary, error) {
-	return exportByteRangeTextCore(ctx, doc, sourcePath, outputPath, start, end, sourceEncoding, targetEncoding, "byte-range-text", 0, 0, false, opts)
+	return exportByteRangeTextCore(ctx, doc, sourcePath, outputPath, start, end, sourceEncoding, targetEncoding, "byte-range-text", 0, 0, false, opts, nil)
 }
 
+// ExportVisibleRangeText exports a decoded visible byte range. Like every text
+// range export, it rejects rather than expands endpoints that split an encoded
+// character. Call ExportVisibleRange for an intentionally byte-exact fragment.
 func ExportVisibleRangeText(ctx context.Context, doc document.ReaderAtSize, sourcePath string, outputPath string, start int64, end int64, sourceEncoding string, targetEncoding string, opts Options) (Summary, error) {
-	return exportByteRangeTextCore(ctx, doc, sourcePath, outputPath, start, end, sourceEncoding, targetEncoding, "visible-range-text", 0, 0, false, opts)
+	return exportByteRangeTextCore(ctx, doc, sourcePath, outputPath, start, end, sourceEncoding, targetEncoding, "visible-range-text", 0, 0, false, opts, nil)
 }
 
+// ExportLineRangeText validates the byte offsets produced by the line mapper
+// against source encoding boundaries before publishing text.
 func ExportLineRangeText(ctx context.Context, doc *document.FileDocument, sourcePath string, outputPath string, startLine int64, endLine int64, sourceEncoding string, targetEncoding string, opts Options) (Summary, error) {
 	if doc == nil {
 		return Summary{}, errors.New("document is required")
 	}
-	startOffset, endOffset, err := doc.LineRangeOffsets(startLine, endLine)
-	if err != nil {
-		return Summary{}, err
+	if startLine <= 0 || endLine <= 0 {
+		return Summary{}, errors.New("line numbers must be positive")
 	}
-	return exportByteRangeTextCore(ctx, doc, sourcePath, outputPath, startOffset, endOffset, sourceEncoding, targetEncoding, "line-range-text", startLine, endLine, true, opts)
+	if endLine < startLine {
+		return Summary{}, errors.New("end line must be greater than or equal to start line")
+	}
+	encoding := doc.Metadata().Encoding
+	resolve := func(resolveCtx context.Context, reader document.ReaderAtSize) (int64, int64, error) {
+		return exactLineRangeOffsets(resolveCtx, reader, encoding, startLine, endLine)
+	}
+	return exportByteRangeTextCore(ctx, doc, sourcePath, outputPath, 0, 0, sourceEncoding, targetEncoding, "line-range-text", startLine, endLine, true, opts, resolve)
 }
 
-func exportByteRangeTextCore(ctx context.Context, doc document.ReaderAtSize, sourcePath string, outputPath string, start int64, end int64, sourceEncoding string, targetEncoding string, mode string, startLine int64, endLine int64, usedLineRange bool, opts Options) (Summary, error) {
+func exportByteRangeTextCore(ctx context.Context, doc document.ReaderAtSize, sourcePath string, outputPath string, start int64, end int64, sourceEncoding string, targetEncoding string, mode string, startLine int64, endLine int64, usedLineRange bool, opts Options, resolve exportRangeResolver) (_ Summary, retErr error) {
 	if doc == nil {
 		return Summary{}, errors.New("document is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
 	}
 	if outputPath == "" {
 		return Summary{}, errors.New("output path is required")
 	}
-	if start < 0 {
-		start = 0
+	if err := fileio.ValidateExactOutputPath(outputPath); err != nil {
+		return Summary{}, err
 	}
 	size := doc.Size()
-	if end <= 0 || end > size {
-		end = size
+	if resolve == nil {
+		if start < 0 {
+			start = 0
+		}
+		if end <= 0 || end > size {
+			end = size
+		}
+		if end < start {
+			return Summary{}, errors.New("end offset must be greater than or equal to start offset")
+		}
 	}
-	if end < start {
-		return Summary{}, errors.New("end offset must be greater than or equal to start offset")
-	}
-	if same, err := samePath(sourcePath, outputPath); err != nil {
-		return Summary{}, err
-	} else if same {
-		return Summary{}, errors.New("output path must be different from source path")
-	}
-	if _, err := os.Stat(outputPath); err == nil {
-		return Summary{}, errors.New("output file already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return Summary{}, err
-	}
-
 	sourceEncoding = strings.TrimSpace(sourceEncoding)
 	if sourceEncoding == "" {
 		sourceEncoding = "UTF-8"
@@ -70,10 +80,15 @@ func exportByteRangeTextCore(ctx context.Context, doc document.ReaderAtSize, sou
 		targetEncoding = sourceEncoding
 	}
 
-	start, end = stripLeadingSourceBOM(doc, start, end, sourceEncoding)
-	total := end - start
-	if total < 0 {
-		total = 0
+	sourceKind, err := parseTextEncoding(sourceEncoding)
+	if err != nil {
+		return Summary{}, err
+	}
+	if _, err := parseTextEncoding(targetEncoding); err != nil {
+		return Summary{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return Summary{}, err
 	}
 	summary := Summary{
 		SourcePath:     sourcePath,
@@ -92,29 +107,54 @@ func exportByteRangeTextCore(ctx context.Context, doc document.ReaderAtSize, sou
 	}
 	if shouldWriteExportManifest(opts) {
 		summary.ManifestPath = exportManifestPathFor(outputPath, opts.ManifestPath)
-		if err := ensureExportManifestAvailable(summary.ManifestPath); err != nil {
+		if err := ensureExportManifestAvailable(summary.ManifestPath, sourcePath, outputPath); err != nil {
 			return summary, err
 		}
 	}
 
-	dst, err := openCreatedOutput(outputPath)
+	if err := ctx.Err(); err != nil {
+		return summary, err
+	}
+	dst, err := openCreatedOutput(outputPath, sourcePath)
 	if err != nil {
 		return summary, err
 	}
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = dst.Cleanup()
+	defer func() { retErr = errors.Join(retErr, dst.Cleanup()) }()
+	readSource, commitValidation, err := prepareExactExportSource(ctx, doc, opts.ValidateSource)
+	if err != nil {
+		return summary, err
+	}
+	if resolve != nil {
+		start, end, err = resolve(ctx, readSource)
+		if err != nil {
+			return summary, err
 		}
-	}()
+		if start < 0 || end < start || end > readSource.Size() {
+			return summary, errors.New("resolved export range is outside the source")
+		}
+	}
+	start, end, err = prepareTextRange(readSource, start, end, sourceKind)
+	if err != nil {
+		return summary, err
+	}
+	summary.StartOffset = start
+	summary.EndOffset = end
+	total := end - start
+	if total < 0 {
+		total = 0
+	}
+	if err := validateExportSource(ctx, doc, nil); err != nil {
+		return summary, err
+	}
 
-	reader := io.NewSectionReader(doc, start, total)
+	reader := io.NewSectionReader(readSource, start, total)
 	progressReader := &progressRangeReader{
 		reader: reader,
 		total:  total,
 		report: opts.Progress,
 	}
-	decodedReader, err := encodingx.NewDecoderReader(sourceEncoding, progressReader)
+	validatedReader := newValidatingTextReader(progressReader, sourceKind, start)
+	decodedReader, err := encodingx.NewDecoderReader(sourceEncoding, validatedReader)
 	if err != nil {
 		return summary, err
 	}
@@ -125,8 +165,10 @@ func exportByteRangeTextCore(ctx context.Context, doc document.ReaderAtSize, sou
 	}
 	countedDst := &countingWriter{w: dst, checksum: checksum}
 	if bom := targetBOM(targetEncoding); len(bom) > 0 {
-		if _, err := countedDst.Write(bom); err != nil {
+		if n, err := countedDst.Write(bom); err != nil {
 			return summary, err
+		} else if n != len(bom) {
+			return summary, io.ErrShortWrite
 		}
 	}
 	encodedWriter, err := encodingx.NewEncoderWriter(targetEncoding, countedDst)
@@ -137,26 +179,27 @@ func exportByteRangeTextCore(ctx context.Context, doc document.ReaderAtSize, sou
 	if err := copyTextRange(ctx, decodedReader, encodedWriter); err != nil {
 		return summary, err
 	}
+	if progressReader.done != total {
+		return summary, io.ErrUnexpectedEOF
+	}
 	if closer, ok := encodedWriter.(io.Closer); ok {
 		if err := closer.Close(); err != nil {
 			return summary, err
 		}
 	}
-	if err := dst.Sync(); err != nil {
-		return summary, err
-	}
-	if err := dst.Close(); err != nil {
-		return summary, err
-	}
-
-	cleanup = false
 	summary.BytesWritten = countedDst.written
 	if checksum != nil {
 		summary.SHA256 = hex.EncodeToString(checksum.Sum(nil))
 	}
+	if err := commitExportOutput(ctx, dst, doc, commitValidation); err != nil {
+		markUncertainPublication(&summary, err)
+		return summary, err
+	}
 	if shouldWriteExportManifest(opts) {
-		if err := writeExportManifest(summary); err != nil {
-			return summary, cleanupOutputAfterManifestFailure(outputPath, err)
+		if err := writeExportManifest(ctx, summary, func(validateCtx context.Context) error {
+			return validateExportSource(validateCtx, doc, commitValidation)
+		}); err != nil {
+			return summary, exportManifestPublicationError(summary, err)
 		}
 	}
 	return summary, nil
@@ -219,30 +262,10 @@ func copyTextRange(ctx context.Context, src io.Reader, dst io.Writer) error {
 		if readErr != nil {
 			return readErr
 		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
 	}
-}
-
-func stripLeadingSourceBOM(doc document.ReaderAtSize, start int64, end int64, sourceEncoding string) (int64, int64) {
-	if start != 0 || end <= 0 {
-		return start, end
-	}
-	bom := encodingx.BOMBytes(sourceEncoding)
-	if len(bom) == 0 {
-		return start, end
-	}
-	got := make([]byte, len(bom))
-	n, err := doc.ReadAt(got, 0)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return start, end
-	}
-	if n < len(bom) || !bytes.Equal(got[:n], bom[:n]) {
-		return start, end
-	}
-	shift := int64(len(bom))
-	if shift >= end {
-		return end, end
-	}
-	return start + shift, end
 }
 
 func targetBOM(encodingName string) []byte {

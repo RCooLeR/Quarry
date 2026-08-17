@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Quarry
+Comment=Streaming editor and data workbench for very large files.
+Exec=quarry
+Icon=quarry
+Categories=Development;Utility;
+Terminal=false
+Version=1.0
+StartupNotify=true
+StartupWMClass=quarry

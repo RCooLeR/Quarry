@@ -2,6 +2,7 @@ package csv
 
 import (
 	"context"
+	"fmt"
 	"io"
 
 	"github.com/quarry/quarry-wails3/internal/plugins"
@@ -21,6 +22,8 @@ type Runtime interface {
 	PreviewProjectedColumnsContext(context.Context, io.Reader, ProjectPreviewOptions) (ProjectPreviewReport, error)
 	ProjectColumns(context.Context, io.Reader, io.Writer, ProjectOptions) (ProjectSummary, error)
 	ProjectColumnsFile(context.Context, string, string, ProjectOptions) (ProjectSummary, error)
+	AddColumn(context.Context, io.Reader, io.Writer, AddColumnOptions) (AddColumnSummary, error)
+	AddColumnFile(context.Context, string, string, AddColumnOptions) (AddColumnSummary, error)
 	PreviewSQLConversion(io.Reader, SQLPreviewOptions) (SQLPreviewReport, error)
 	PreviewSQLConversionContext(context.Context, io.Reader, SQLPreviewOptions) (SQLPreviewReport, error)
 	ConvertToSQL(context.Context, io.Reader, io.Writer, SQLConvertOptions) (SQLConvertSummary, error)
@@ -85,6 +88,14 @@ func (BuiltIn) ProjectColumnsFile(ctx context.Context, inputPath string, outputP
 	return ProjectColumnsFile(ctx, inputPath, outputPath, opts)
 }
 
+func (BuiltIn) AddColumn(ctx context.Context, r io.Reader, w io.Writer, opts AddColumnOptions) (AddColumnSummary, error) {
+	return AddColumn(ctx, r, w, opts)
+}
+
+func (BuiltIn) AddColumnFile(ctx context.Context, inputPath string, outputPath string, opts AddColumnOptions) (AddColumnSummary, error) {
+	return AddColumnFile(ctx, inputPath, outputPath, opts)
+}
+
 func (BuiltIn) PreviewSQLConversion(r io.Reader, opts SQLPreviewOptions) (SQLPreviewReport, error) {
 	return PreviewSQLConversion(r, opts)
 }
@@ -102,19 +113,69 @@ func (BuiltIn) ConvertToSQLFile(ctx context.Context, inputPath string, outputPat
 }
 
 func Plugin() plugins.Descriptor {
+	recordLimitMiB := MaxLogicalRecordBytes / (1024 * 1024)
+	sampleLimitMiB := MaxSampleBytes / (1024 * 1024)
+	dedupeDefaultMemoryMiB := DefaultDedupeMaxMemoryBytes / (1024 * 1024)
+	dedupeMaxMemoryMiB := MaxDedupeMemoryBytes / (1024 * 1024)
 	return plugins.Descriptor{
 		ID:           "csv",
 		DisplayName:  "CSV / TSV",
 		Category:     "data",
 		Description:  "Delimited-file inspection, column removal/reordering, CSV/TSV cleanup, and CSV/TSV-to-SQL conversion workflows.",
-		FilePatterns: plugins.CSVFilePatterns,
+		FilePatterns: plugins.CSVPatterns(),
 		Capabilities: []plugins.Capability{
 			plugins.CapabilityAnalyze,
 			plugins.CapabilityTransform,
 			plugins.CapabilityConvert,
 			plugins.CapabilityValidate,
 		},
-		Modes:        []plugins.Mode{plugins.ModeInteractive, plugins.ModeStreaming},
-		HugeFileSafe: true,
+		Operations: []plugins.OperationCapability{
+			{
+				ID: "inspect-sample", Capability: plugins.CapabilityAnalyze,
+				Processing: plugins.ProcessingConfigurableSample, Memory: plugins.MemorySampleProportional,
+				MaxUnitBytes: MaxSampleBytes, Cancellable: true,
+				Notes: []string{fmt.Sprintf("Caller-selected samples are capped at %d MiB and %d rows; each logical CSV record has a %d MiB hard ceiling.", sampleLimitMiB, MaxSampleRows, recordLimitMiB)},
+			},
+			{
+				ID: "infer-schema-sample", Capability: plugins.CapabilityAnalyze,
+				Processing: plugins.ProcessingConfigurableSample, Memory: plugins.MemorySampleProportional,
+				MaxUnitBytes: MaxSampleBytes, Cancellable: true,
+				Notes: []string{fmt.Sprintf("Schema inference is capped at %d MiB and %d rows plus a %d MiB hard logical-record ceiling.", sampleLimitMiB, MaxSampleRows, recordLimitMiB)},
+			},
+			{
+				ID: "preview-rows", Capability: plugins.CapabilityValidate,
+				Processing: plugins.ProcessingConfigurableSample, Memory: plugins.MemorySampleProportional,
+				MaxUnitBytes: MaxSampleBytes, Cancellable: true,
+				Notes: []string{fmt.Sprintf("Preview samples are capped at %d MiB and %d rows; each logical CSV record has a %d MiB hard ceiling.", sampleLimitMiB, MaxSampleRows, recordLimitMiB)},
+			},
+			{
+				ID: "project-columns-file", Capability: plugins.CapabilityTransform,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryRecordProportional,
+				Cancellable: true, AtomicOutput: true,
+				Notes: []string{fmt.Sprintf("Streaming is record-at-a-time with a %d MiB hard logical-record ceiling.", recordLimitMiB)},
+			},
+			{
+				ID: "add-column-file", Capability: plugins.CapabilityTransform,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryRecordProportional,
+				Cancellable: true, AtomicOutput: true,
+				Notes: []string{fmt.Sprintf("Streaming is record-at-a-time with a %d MiB hard logical-record ceiling.", recordLimitMiB)},
+			},
+			{
+				ID: "deduplicate-rows", Capability: plugins.CapabilityTransform,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryBounded,
+				MaxUnitBytes: MaxLogicalRecordBytes, Cancellable: true, AtomicOutput: true,
+				Notes: []string{fmt.Sprintf(
+					"Exact in-memory deduplication defaults to %d distinct keys and %d MiB retained memory, refuses before growth beyond those limits, and cannot be configured above %d keys or %d MiB; disk-backed deduplication is unavailable.",
+					DefaultDedupeMaxDistinctKeys, dedupeDefaultMemoryMiB, MaxDedupeDistinctKeys, dedupeMaxMemoryMiB,
+				)},
+			},
+			{
+				ID: "convert-to-sql-file", Capability: plugins.CapabilityConvert,
+				Processing: plugins.ProcessingStreaming, Memory: plugins.MemoryRecordProportional,
+				Cancellable: true, AtomicOutput: true,
+				Notes: []string{fmt.Sprintf("CSV records have a %d MiB hard ceiling; the configured SQL insert batch can still amplify retained memory.", recordLimitMiB)},
+			},
+		},
+		Modes: []plugins.Mode{plugins.ModeInteractive, plugins.ModeStreaming},
 	}
 }

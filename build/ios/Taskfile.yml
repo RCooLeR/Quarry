@@ -3,27 +3,15 @@ version: '3'
 includes:
   common: ../Taskfile.yml
 
-# Platform selection:
-#   task ios:package                          -> simulator bundle (ad-hoc signed)
-#   task ios:package IOS_PLATFORM=device CODESIGN_IDENTITY="Apple Development: ..." \
-#        [PROVISIONING_PROFILE=path.mobileprovision]
-#                                             -> device bundle (real signing)
-#   task ios:package:ipa IOS_PLATFORM=device ... -> .ipa for distribution/install
-# For automatically managed signing & provisioning, use `task ios:xcode` and
-# build from the generated Xcode project instead.
+# iOS support is limited to local debug/simulator development. Production,
+# package, signing, and device-distribution tasks fail closed below because iOS
+# is not a supported Quarry release target.
 vars:
-  BUNDLE_ID: '{{.BUNDLE_ID | default "com.wails.app"}}'
   IOS_PLATFORM: '{{.IOS_PLATFORM | default "simulator"}}'
   MIN_IOS_VERSION: '{{.MIN_IOS_VERSION | default "15.0"}}'
   IOS_SDK: '{{if eq .IOS_PLATFORM "device"}}iphoneos{{else}}iphonesimulator{{end}}'
   IOS_TARGET: 'arm64-apple-ios{{.MIN_IOS_VERSION}}{{if ne .IOS_PLATFORM "device"}}-simulator{{end}}'
   IOS_VERSION_MIN_FLAG: '{{if eq .IOS_PLATFORM "device"}}-miphoneos-version-min={{.MIN_IOS_VERSION}}{{else}}-mios-simulator-version-min={{.MIN_IOS_VERSION}}{{end}}'
-  # "-" is ad-hoc signing: fine for the simulator, rejected by real devices.
-  CODESIGN_IDENTITY: '{{.CODESIGN_IDENTITY | default "-"}}'
-  # Optional path to a .mobileprovision embedded into device bundles
-  PROVISIONING_PROFILE: '{{.PROVISIONING_PROFILE | default ""}}'
-  # Optional entitlements applied at codesign time (generated default below)
-  ENTITLEMENTS_FILE: '{{.ENTITLEMENTS_FILE | default "build/ios/entitlements.plist"}}'
   # SDK_PATH is computed lazily at task-level to avoid errors on non-macOS systems
 
 tasks:
@@ -39,22 +27,29 @@ tasks:
   # These warnings are harmless and don't affect the generated bindings,
   # as the generator only needs to parse Go types, not C implementations.
   build:
-    summary: Creates a build of the application for iOS
+    summary: Creates a development-only debug build of the application for iOS
+    cmds:
+      - task: ensure:development-only
+      - task: build:debug
+        vars:
+          ARCH: '{{.ARCH | default "arm64"}}'
+          OUTPUT: '{{.OUTPUT | default ""}}'
+
+  build:debug:
+    internal: true
+    summary: Build the iOS debug archive after the public guard passes
     deps:
       - task: generate:ios:overlay
       - task: generate:ios:xcode
-      - task: common:go:mod:tidy
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:
             ref: .BUILD_FLAGS
-          PRODUCTION:
-            ref: .PRODUCTION
     cmds:
       - echo "Building iOS app {{.APP_NAME}} ({{.IOS_PLATFORM}})..."
       - go build -buildmode=c-archive -overlay build/ios/xcode/overlay.json {{.BUILD_FLAGS}} -o {{.OUTPUT}}.a
     vars:
-      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production,ios -trimpath -buildvcs=false -ldflags="-w -s"{{else}}-tags ios,debug -buildvcs=false -gcflags=all="-l"{{end}}'
+      BUILD_FLAGS: '-tags ios,debug -buildvcs=false -gcflags=all="-l"'
       DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
       OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
       SDK_PATH:
@@ -63,34 +58,38 @@ tasks:
       GOOS: ios
       CGO_ENABLED: 1
       GOARCH: '{{.ARCH | default "arm64"}}'
-      PRODUCTION: '{{.PRODUCTION | default "false"}}'
       CGO_CFLAGS: '-isysroot {{.SDK_PATH}} -target {{.IOS_TARGET}} {{.IOS_VERSION_MIN_FLAG}}'
       CGO_LDFLAGS: '-isysroot {{.SDK_PATH}} -target {{.IOS_TARGET}}'
 
   package:
-    summary: Packages a production build of the application into a `.app` bundle
-    deps:
-      - task: build
-        vars:
-          PRODUCTION: "true"
+    summary: Disabled because iOS is not a supported Quarry release target
     cmds:
-      - task: compile:ios:link
-      - task: create:app:bundle
+      - task: unsupported:production
 
   package:ipa:
-    summary: Packages a production build into an .ipa (requires IOS_PLATFORM=device and a real CODESIGN_IDENTITY)
-    deps:
-      - task: package
+    summary: Disabled because iOS is not a supported Quarry release target
     cmds:
-      - rm -rf "{{.BIN_DIR}}/Payload" "{{.BIN_DIR}}/{{.APP_NAME}}.ipa"
-      - mkdir -p "{{.BIN_DIR}}/Payload"
-      - cp -R "{{.BIN_DIR}}/{{.APP_NAME}}.app" "{{.BIN_DIR}}/Payload/"
-      - cd "{{.BIN_DIR}}" && zip -qry "{{.APP_NAME}}.ipa" Payload
-      - rm -rf "{{.BIN_DIR}}/Payload"
-      - echo "Created {{.BIN_DIR}}/{{.APP_NAME}}.ipa"
+      - task: unsupported:production
 
-  # Link the Go c-archive with main.m into the final executable.
-  # Used by both the dev `run` flow and `package`.
+  unsupported:production:
+    internal: true
+    summary: Reject unsupported iOS production and distribution work
+    cmds:
+      - echo "iOS production/package/release tasks are disabled because Quarry does not support mobile distribution."
+      - exit 1
+
+  ensure:development-only:
+    internal: true
+    summary: Reject production flags before starting iOS build dependencies
+    cmds:
+      - |
+        if [ "{{.PRODUCTION | default "false"}}" != "false" ]; then
+          echo "iOS production builds are unsupported and disabled; use the simulator debug workflow only."
+          exit 1
+        fi
+
+  # Link the Go c-archive with main.m into the development executable.
+  # Used only by the local debug/simulator flow.
   compile:ios:link:
     internal: true
     summary: Link the iOS executable from the Go archive and main.m
@@ -117,81 +116,19 @@ tasks:
           "$MAIN_M" -Wl,-force_load,"{{.BIN_DIR}}/{{.APP_NAME}}.a"
 
   create:app:bundle:
-    summary: Creates an iOS `.app` bundle
+    summary: Disabled because iOS is not a supported Quarry release target
     cmds:
-      - rm -rf "{{.BIN_DIR}}/{{.APP_NAME}}.app"
-      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.app"
-      - cp "{{.BIN_DIR}}/{{.APP_NAME | lower}}" "{{.BIN_DIR}}/{{.APP_NAME}}.app/"
-      - cp build/ios/Info.plist "{{.BIN_DIR}}/{{.APP_NAME}}.app/"
-      - |
-        # Embed the provisioning profile for device builds when provided
-        if [ "{{.IOS_PLATFORM}}" = "device" ] && [ -n "{{.PROVISIONING_PROFILE}}" ]; then
-          cp "{{.PROVISIONING_PROFILE}}" "{{.BIN_DIR}}/{{.APP_NAME}}.app/embedded.mobileprovision"
-        fi
-      - |
-        # Compile asset catalog and embed icons in the app bundle
-        APP_BUNDLE="{{.BIN_DIR}}/{{.APP_NAME}}.app"
-        AC_IN="build/ios/xcode/main/Assets.xcassets"
-        if [ -d "$AC_IN" ]; then
-          TMP_AC=$(mktemp -d)
-          xcrun actool \
-            --compile "$TMP_AC" \
-            --app-icon AppIcon \
-            --platform {{.IOS_SDK}} \
-            --minimum-deployment-target {{.MIN_IOS_VERSION}} \
-            --product-type com.apple.product-type.application \
-            --target-device iphone \
-            --target-device ipad \
-            --output-partial-info-plist "$APP_BUNDLE/assetcatalog_generated_info.plist" \
-            "$AC_IN"
-          if [ -f "$TMP_AC/Assets.car" ]; then
-            cp -f "$TMP_AC/Assets.car" "$APP_BUNDLE/Assets.car"
-          fi
-          rm -rf "$TMP_AC"
-          if [ -f "$APP_BUNDLE/assetcatalog_generated_info.plist" ]; then
-            /usr/libexec/PlistBuddy -c "Merge $APP_BUNDLE/assetcatalog_generated_info.plist" "$APP_BUNDLE/Info.plist" || true
-          fi
-        fi
-      - |
-        # Sign the bundle. Ad-hoc ("-") works on the simulator only; device
-        # builds need a real identity (and usually entitlements + profile).
-        # Entitlements are only applied to device builds - simulator bundles
-        # must not carry them (SpringBoard refuses to launch the app).
-        if [ "{{.IOS_PLATFORM}}" = "device" ] && [ -f "{{.ENTITLEMENTS_FILE}}" ]; then
-          codesign --force --sign "{{.CODESIGN_IDENTITY}}" --entitlements "{{.ENTITLEMENTS_FILE}}" "{{.BIN_DIR}}/{{.APP_NAME}}.app"
-        else
-          codesign --force --sign "{{.CODESIGN_IDENTITY}}" "{{.BIN_DIR}}/{{.APP_NAME}}.app"
-        fi
+      - task: unsupported:production
 
   deploy-simulator:
-    summary: Deploy to iOS Simulator
-    deps: [package]
+    summary: Disabled packaged-app deployment; use the debug-only run task
     cmds:
-      - |
-        # Read the real bundle id from the built bundle (it comes from
-        # build/config.yml, not the BUNDLE_ID var, so it varies per project).
-        APP="{{.BIN_DIR}}/{{.APP_NAME}}.app"
-        BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist")
-        xcrun simctl terminate booted "$BUNDLE_ID" 2>/dev/null || true
-        xcrun simctl uninstall booted "$BUNDLE_ID" 2>/dev/null || true
-        xcrun simctl install booted "$APP"
-        xcrun simctl launch booted "$BUNDLE_ID"
+      - task: unsupported:production
 
   deploy-device:
-    summary: Install and launch on a connected device (requires IOS_PLATFORM=device build and real signing)
+    summary: Disabled because iOS device distribution is unsupported
     cmds:
-      - |
-        DEVICE="{{.DEVICE_ID}}"
-        if [ -z "$DEVICE" ]; then
-          DEVICE=$(xcrun devicectl list devices --hide-headers 2>/dev/null | awk 'NR==1 {print $3}')
-        fi
-        if [ -z "$DEVICE" ]; then
-          echo "No connected device found. Pass DEVICE_ID=<identifier> (see: xcrun devicectl list devices)"
-          exit 1
-        fi
-        xcrun devicectl device install app --device "$DEVICE" "{{.BIN_DIR}}/{{.APP_NAME}}.app"
-        BUNDLE_ID=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "{{.BIN_DIR}}/{{.APP_NAME}}.app/Info.plist")
-        xcrun devicectl device process launch --device "$DEVICE" "$BUNDLE_ID"
+      - task: unsupported:production
 
   compile:ios:
     summary: Compile the iOS executable from Go archive and main.m

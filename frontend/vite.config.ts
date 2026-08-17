@@ -8,6 +8,9 @@ export default defineConfig({
     host: "127.0.0.1",
     port: Number(process.env.WAILS_VITE_PORT) || 9245,
     strictPort: true,
+    // React Fast Refresh injects an inline module preamble. Keep it disabled so
+    // development exercises the same no-inline-script CSP as production.
+    hmr: false,
   },
   plugins: [react(), wails("./bindings")],
 });

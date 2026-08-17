@@ -46,8 +46,14 @@ type Metadata struct {
 	Size               int64
 	Encoding           string
 	EncodingConfidence float64
-	LineEnding         string
-	FileType           string
-	Binary             bool
-	BinaryConfidence   float64
+	// EncodingRequiresConfirmation is true when detection found plausible text
+	// but could not safely choose an exact codec (for example ambiguous BOM-less
+	// UTF-16 endianness). Decoded operations must fail closed until an explicit
+	// user-selected encoding is bound to the session.
+	EncodingRequiresConfirmation bool
+	HasBOM                       bool
+	LineEnding                   string
+	FileType                     string
+	Binary                       bool
+	BinaryConfidence             float64
 }

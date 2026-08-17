@@ -1,9 +1,12 @@
-// Package reshape rewrites the row layout of SQL INSERT statements without
-// touching the data: an extended (multi-row) INSERT can be exploded into one
-// INSERT per row (so a line diff between two dumps is meaningful), or a run of
-// single-row INSERTs can be batched back into extended INSERTs (so a dump
-// re-imports faster). Everything that is not an INSERT…VALUES statement —
-// comments, CREATE TABLE, SET, locks — is copied through byte-for-byte.
+// Package reshape rewrites the statement layout of a conservative subset of
+// SQL INSERT ... VALUES statements. Tuple payload bytes are preserved exactly:
+// an extended INSERT can be exploded into one statement per row, or compatible
+// single-row INSERTs can be batched. Statement grouping itself is not claimed
+// to be semantically equivalent because database-side triggers, atomicity, and
+// rollback behavior may depend on it. Accepted non-target SQL is copied through
+// byte-for-byte; ambiguous client commands, procedural bodies, raw-data modes,
+// and unsupported dialect constructs make the operation fail without publishing
+// an output file.
 package reshape
 
 import (
@@ -13,8 +16,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
+
+	"github.com/quarry/quarry-wails3/internal/fileio"
+	sqldelimiter "github.com/quarry/quarry-wails3/internal/plugins/sql/delimiter"
+	"github.com/quarry/quarry-wails3/internal/sourceio"
 )
 
 // Mode selects the reshape direction.
@@ -29,8 +35,10 @@ const (
 
 // Options configures a reshape run.
 type Options struct {
-	Mode      Mode
-	BatchSize int // ModeMultiRow: max rows per output INSERT (default 100)
+	Mode           Mode
+	BatchSize      int // ModeMultiRow: max rows per output INSERT (default 100)
+	ExpectedSource *sourceio.Expectation
+	Progress       func(Summary)
 }
 
 // Summary reports what a reshape produced.
@@ -46,50 +54,68 @@ type Summary struct {
 // well under this; the cap only guards against a pathological single statement.
 const maxStatementBytes = 64 << 20
 
+const (
+	MaxBatchRows  = 10_000
+	maxBatchBytes = 8 << 20
+)
+
+var (
+	ErrUnsupportedInsert = errors.New("INSERT form is not safe to reshape")
+	// ErrUnsupportedDelimiter is returned for mysql-client DELIMITER scripts,
+	// whose statement boundaries cannot be inferred from ordinary semicolons.
+	ErrUnsupportedDelimiter = sqldelimiter.ErrUnsupported
+	// ErrUnsupportedCompoundStatement prevents routine bodies and client-owned
+	// raw-data sections from being mistaken for top-level INSERT statements.
+	ErrUnsupportedCompoundStatement = errors.New("compound SQL body or client-managed raw-data payload is not safe to reshape")
+	// ErrUnsupportedLexicalConstruct rejects dialect quoting/comment syntax the
+	// intentionally small reshape lexer cannot prove safe.
+	ErrUnsupportedLexicalConstruct = errors.New("unsupported SQL dialect quoting or comment construct")
+)
+
 // ReshapeInsertsFile streams src to dst, reshaping INSERT row layout per opts.
 // The source is never modified.
-func ReshapeInsertsFile(ctx context.Context, srcPath, dstPath string, opts Options) (Summary, error) {
-	if same, err := sameFile(srcPath, dstPath); err != nil {
-		return Summary{}, err
-	} else if same {
-		return Summary{}, errors.New("output path must be different from input path")
+func ReshapeInsertsFile(ctx context.Context, srcPath, dstPath string, opts Options) (summary Summary, retErr error) {
+	if opts.Mode != ModeSingleRow && opts.Mode != ModeMultiRow {
+		return Summary{}, fmt.Errorf("unsupported reshape mode %q", opts.Mode)
 	}
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 100
 	}
-	in, err := os.Open(srcPath)
+	if opts.BatchSize > MaxBatchRows {
+		return Summary{}, fmt.Errorf("reshape batch size %d exceeds limit %d", opts.BatchSize, MaxBatchRows)
+	}
+	in, err := sourceio.OpenContext(ctx, srcPath, opts.ExpectedSource)
 	if err != nil {
 		return Summary{}, err
 	}
-	defer in.Close()
-	out, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+	defer func() {
+		retErr = errors.Join(retErr, in.Close())
+	}()
+	out, err := fileio.OpenAtomicOutput(dstPath, []string{srcPath}, 0o600)
 	if err != nil {
 		return Summary{}, err
 	}
 	bw := bufio.NewWriterSize(out, 1<<20)
-	cleanup := true
 	defer func() {
-		if cleanup {
-			_ = out.Close()
-			_ = os.Remove(dstPath)
+		if err := out.Cleanup(); err != nil {
+			retErr = errors.Join(retErr, err)
 		}
 	}()
 
-	sum, err := reshapeStream(ctx, bufio.NewReaderSize(in, 1<<20), bw, opts)
+	summary, err = reshapeStream(ctx, bufio.NewReaderSize(in, 1<<20), bw, opts)
 	if err != nil {
-		return sum, err
+		return summary, err
 	}
 	if err := bw.Flush(); err != nil {
-		return sum, err
+		return summary, err
 	}
-	if err := out.Sync(); err != nil {
-		return sum, err
+	if err := ctxErr(ctx); err != nil {
+		return summary, err
 	}
-	if err := out.Close(); err != nil {
-		return sum, err
+	if err := out.CommitContextValidated(ctx, in.ValidateContext); err != nil {
+		return summary, err
 	}
-	cleanup = false
-	return sum, nil
+	return summary, nil
 }
 
 // out is a write sink that remembers the last byte written, so a reshaped
@@ -135,6 +161,7 @@ type batcher struct {
 	batchSize int
 	prefix    string
 	tuples    []string
+	bytes     int
 	sum       *Summary
 }
 
@@ -158,18 +185,30 @@ func (b *batcher) flush() error {
 	b.sum.InsertsRewritten++
 	b.tuples = b.tuples[:0]
 	b.prefix = ""
+	b.bytes = 0
 	return nil
 }
 
 func (b *batcher) add(prefix string, tuples []string) error {
 	for _, t := range tuples {
-		if b.prefix != "" && (b.prefix != prefix || len(b.tuples) >= b.batchSize) {
+		if len(prefix)+len(t) > maxBatchBytes {
+			return fmt.Errorf("one reshaped INSERT row exceeds %d-byte batch memory limit", maxBatchBytes)
+		}
+		needed := len(t)
+		if b.prefix == "" {
+			needed += len(prefix)
+		} else {
+			needed++ // tuple separator
+		}
+		if b.prefix != "" && (b.prefix != prefix || len(b.tuples) >= b.batchSize || b.bytes+needed > maxBatchBytes) {
 			if err := b.flush(); err != nil {
 				return err
 			}
+			needed = len(prefix) + len(t)
 		}
 		b.prefix = prefix
 		b.tuples = append(b.tuples, t)
+		b.bytes += needed
 	}
 	return nil
 }
@@ -181,6 +220,7 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 	var stmt bytes.Buffer
 	lex := lexer{}
 	overflow := false // current statement exceeded the buffer cap; pass through
+	safety := reshapeSafetyGuard{}
 
 	emitVerbatim := func(p []byte) error {
 		if opts.Mode == ModeMultiRow {
@@ -197,20 +237,39 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 			return nil
 		}
 		sum.StatementsRead++
-		prefix, tuples, ok := parseInsert(stmt.Bytes())
-		if !ok {
+		defer func() {
+			if opts.Progress != nil {
+				opts.Progress(sum)
+			}
+		}()
+		parsed, isInsert, err := parseInsert(stmt.Bytes())
+		if err != nil {
+			return fmt.Errorf("statement %d: %w", sum.StatementsRead, err)
+		}
+		if !isInsert {
 			return emitVerbatim(stmt.Bytes())
 		}
-		sum.RowsSeen += int64(len(tuples))
+		sum.RowsSeen += int64(len(parsed.tuples))
 		switch opts.Mode {
 		case ModeMultiRow:
-			return bat.add(prefix, tuples)
+			if len(bytes.TrimSpace(parsed.leading)) > 0 {
+				if err := bat.flush(); err != nil {
+					return err
+				}
+				if err := o.bytes(parsed.leading); err != nil {
+					return err
+				}
+			}
+			return bat.add(parsed.prefix, parsed.tuples)
 		default: // ModeSingleRow
-			for _, t := range tuples {
+			if err := o.bytes(parsed.leading); err != nil {
+				return err
+			}
+			for _, t := range parsed.tuples {
 				if err := o.ensureNL(); err != nil {
 					return err
 				}
-				if err := o.str(prefix); err != nil {
+				if err := o.str(parsed.prefix); err != nil {
 					return err
 				}
 				if err := o.str(t); err != nil {
@@ -234,6 +293,9 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 		n, err := r.Read(buf)
 		for i := 0; i < n; i++ {
 			c := buf[i]
+			if guardErr := safety.Step(c); guardErr != nil {
+				return sum, guardErr
+			}
 			atTop := lex.step(c)
 			if overflow {
 				if err := o.bytes(buf[i : i+1]); err != nil {
@@ -251,7 +313,18 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 					return sum, ferr
 				}
 			} else if stmt.Len() >= maxStatementBytes {
-				// Too large to reshape safely — stream it through verbatim.
+				// A non-INSERT statement may be passed through verbatim. A target
+				// INSERT that exceeds the parser budget must fail the operation;
+				// silently skipping it would produce a partially reshaped dump. If
+				// the first live token is not resolved yet (for example, the cap is
+				// reached inside a leading comment), fail closed as well: later bytes
+				// could reveal an INSERT that we would otherwise stream past.
+				switch classifyStatementPrefix(stmt.Bytes()) {
+				case statementPrefixInsert:
+					return sum, fmt.Errorf("%w: statement exceeds %d-byte parser limit", ErrUnsupportedInsert, maxStatementBytes)
+				case statementPrefixUnknown:
+					return sum, fmt.Errorf("%w: statement prefix is unresolved at the %d-byte parser limit", ErrUnsupportedInsert, maxStatementBytes)
+				}
 				if werr := emitVerbatim(stmt.Bytes()); werr != nil {
 					return sum, werr
 				}
@@ -260,6 +333,9 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 			}
 		}
 		if err == io.EOF {
+			if guardErr := safety.Finish(); guardErr != nil {
+				return sum, guardErr
+			}
 			break
 		}
 		if err != nil {
@@ -280,20 +356,58 @@ func reshapeStream(ctx context.Context, r *bufio.Reader, w *bufio.Writer, opts O
 	return sum, nil
 }
 
+type statementPrefixClass uint8
+
+const (
+	statementPrefixUnknown statementPrefixClass = iota
+	statementPrefixInsert
+	statementPrefixOther
+)
+
+// classifyStatementPrefix determines whether the first live SQL token is
+// INSERT without reading beyond the bounded statement prefix. Unknown is
+// intentionally distinct from non-INSERT: a prefix ending in whitespace, a
+// line comment, an unterminated block comment, or a partial trivia opener may
+// still reveal INSERT when more bytes arrive.
+func classifyStatementPrefix(statement []byte) statementPrefixClass {
+	index, resolved := scanLeadingTrivia(statement)
+	if !resolved {
+		return statementPrefixUnknown
+	}
+	rest := statement[index:]
+	const keyword = "insert"
+	limit := len(rest)
+	if limit > len(keyword) {
+		limit = len(keyword)
+	}
+	for offset := 0; offset < limit; offset++ {
+		if lower(rest[offset]) != keyword[offset] {
+			return statementPrefixOther
+		}
+	}
+	if len(rest) < len(keyword) {
+		return statementPrefixUnknown
+	}
+	if len(rest) == len(keyword) || !isWordByte(rest[len(keyword)]) {
+		return statementPrefixInsert
+	}
+	return statementPrefixOther
+}
+
 // lexer tracks SQL string/comment/identifier state so statement and tuple
 // boundaries are only recognized at the top level. step returns true when, after
 // consuming c, the lexer is back at normal (non-string, non-comment) state — i.e.
 // c was a structural byte that counts toward statement/tuple parsing.
 type lexer struct {
-	inSingle  bool
-	inDouble  bool
+	inSingle   bool
+	inDouble   bool
 	inBacktick bool
-	inLine    bool
-	inBlock   bool
-	esc       bool
-	prevStar  bool
-	prevDash  bool
-	prevSlash bool
+	inLine     bool
+	inBlock    bool
+	esc        bool
+	prevStar   bool
+	prevDash   bool
+	prevSlash  bool
 }
 
 func (l *lexer) inLiteral() bool {
@@ -303,7 +417,7 @@ func (l *lexer) inLiteral() bool {
 func (l *lexer) step(c byte) bool {
 	switch {
 	case l.inLine:
-		if c == '\n' {
+		if c == '\n' || c == '\r' {
 			l.inLine = false
 		}
 		return false
@@ -398,77 +512,117 @@ func ctxErr(ctx context.Context) error {
 	}
 }
 
-func sameFile(a, b string) (bool, error) {
-	if a == b {
-		return true, nil
-	}
-	ai, err := os.Stat(a)
-	if err != nil {
-		return false, nil // a must exist; let the open fail later if not
-	}
-	bi, err := os.Stat(b)
-	if err != nil {
-		return false, nil
-	}
-	return os.SameFile(ai, bi), nil
+type parsedInsert struct {
+	leading []byte
+	prefix  string
+	tuples  []string
 }
 
-// parseInsert splits a single SQL statement into the INSERT prefix (everything
-// up to and including "VALUES ") and the list of value tuples ("(...)"). It
-// returns ok=false for anything that is not an INSERT…VALUES statement, which
-// the caller then copies through unchanged.
-func parseInsert(stmt []byte) (prefix string, tuples []string, ok bool) {
+// parseInsert accepts only the grammar this transform can preserve exactly:
+// INSERT ... VALUES <tuple>(,<tuple>)*;. Non-INSERT statements are returned as
+// isInsert=false. Every unsupported or malformed INSERT fails the whole
+// operation so no semantically incomplete final output can be published.
+func parseInsert(stmt []byte) (parsed parsedInsert, isInsert bool, err error) {
 	// Skip leading whitespace AND comments. mysqldump prefixes each table's data
 	// with a "-- Dumping data for table `x`" comment block that gets buffered
-	// together with the following INSERT (comments have no ';' terminator), so
-	// without skipping them the keyword test below would fail and the INSERT —
-	// usually the largest one — would be copied through unreshaped.
-	rest := stmt[skipLeadingTrivia(stmt):]
-	if !hasFold(rest, "insert") {
-		return "", nil, false
+	// together with the following INSERT. Ordinary provenance comments are
+	// preserved once before the rewritten rows; executable/optimizer comments
+	// in this position are rejected because duplicating or moving them is not
+	// proven semantics-preserving.
+	triviaEnd := skipLeadingTrivia(stmt)
+	rest := stmt[triviaEnd:]
+	if !matchKeyword(rest, 0, "insert") {
+		return parsedInsert{}, false, nil
+	}
+	if containsExecutableSQLComment(stmt) {
+		return parsedInsert{}, true, fmt.Errorf("%w: executable or optimizer comment in target INSERT", ErrUnsupportedInsert)
 	}
 	// Locate the VALUES keyword at top level.
 	vi := findValues(rest)
 	if vi < 0 {
-		return "", nil, false
+		return parsedInsert{}, true, fmt.Errorf("%w: expected a top-level VALUES tuple list", ErrUnsupportedInsert)
+	}
+	if containsTopLevelKeyword(rest[:vi], "overwrite") {
+		return parsedInsert{}, true, fmt.Errorf("%w: INSERT OVERWRITE is not row-additive", ErrUnsupportedInsert)
 	}
 	// prefix = "INSERT ... VALUES " with a single normalized trailing space.
-	// Leading whitespace from the source is dropped; each rewritten statement is
-	// newline-terminated, so rows stay one-per-line.
 	pre := string(rest[:vi])
 	pre = strings.TrimRight(pre, " \t\r\n")
-	prefix = pre + " "
+	parsed.prefix = pre + " "
+	parsed.leading = append([]byte(nil), stmt[:triviaEnd]...)
 
-	// Parse tuples from after VALUES.
-	body := rest[vi:]
-	tuples = splitTuples(body)
-	if len(tuples) == 0 {
-		return "", nil, false
+	parsed.tuples, err = splitTuplesStrict(rest[vi:])
+	if err != nil {
+		return parsedInsert{}, true, fmt.Errorf("%w: %v", ErrUnsupportedInsert, err)
 	}
-	return prefix, tuples, true
+	return parsed, true, nil
+}
+
+// containsExecutableSQLComment recognizes MySQL executable comments and
+// optimizer hints only when their opener is live SQL. Bytes inside quoted
+// values or identifiers are payload and must not be mistaken for directives.
+func containsExecutableSQLComment(statement []byte) bool {
+	lex := lexer{}
+	for index := 0; index+2 < len(statement); index++ {
+		if !lex.inLiteral() && statement[index] == '/' && statement[index+1] == '*' {
+			marker := statement[index+2]
+			if marker == '!' || marker == '+' ||
+				((marker == 'm' || marker == 'M') && index+3 < len(statement) && statement[index+3] == '!') {
+				return true
+			}
+		}
+		lex.step(statement[index])
+	}
+	return false
+}
+
+func containsTopLevelKeyword(statement []byte, keyword string) bool {
+	lex := lexer{}
+	for index := 0; index < len(statement); index++ {
+		top := lex.step(statement[index])
+		if top && !lex.inLiteral() && matchKeyword(statement, index, keyword) {
+			return true
+		}
+	}
+	return false
 }
 
 func isSpace(c byte) bool {
 	return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\f' || c == '\v'
 }
 
-// skipLeadingTrivia returns the index of the first byte that is not leading
-// whitespace, a '--' or '#' line comment, or a '/* */' block comment.
-func skipLeadingTrivia(b []byte) int {
+// scanLeadingTrivia returns the index of the first byte that is not leading
+// whitespace, a '--' or '#' line comment, or a '/* */' block comment. resolved
+// is false when the bounded input ends before a first live token is known.
+func scanLeadingTrivia(b []byte) (index int, resolved bool) {
 	i := 0
+	if len(b) < 3 && len(b) > 0 && b[0] == 0xef {
+		if len(b) == 1 || b[1] == 0xbb {
+			return len(b), false
+		}
+	}
+	if len(b) >= 3 && b[0] == 0xef && b[1] == 0xbb && b[2] == 0xbf {
+		i = 3
+	}
 	for i < len(b) {
 		c := b[i]
 		switch {
 		case isSpace(c):
 			i++
 		case c == '#':
-			for i < len(b) && b[i] != '\n' {
+			for i < len(b) && b[i] != '\n' && b[i] != '\r' {
 				i++
+			}
+			if i == len(b) {
+				return i, false
 			}
 		case c == '-' && i+1 < len(b) && b[i+1] == '-':
 			i += 2
-			for i < len(b) && b[i] != '\n' {
+			for i < len(b) && b[i] != '\n' && b[i] != '\r' {
 				i++
+			}
+			if i == len(b) {
+				return i, false
 			}
 		case c == '/' && i+1 < len(b) && b[i+1] == '*':
 			i += 2
@@ -478,13 +632,23 @@ func skipLeadingTrivia(b []byte) int {
 			if i+1 < len(b) {
 				i += 2 // consume the closing */
 			} else {
-				i = len(b)
+				return len(b), false
 			}
+		case (c == '-' || c == '/') && i+1 == len(b):
+			return i, false
 		default:
-			return i
+			return i, true
 		}
 	}
-	return i
+	return i, false
+}
+
+// skipLeadingTrivia is the complete-input form used by statement parsing.
+// Input containing only trivia has no live token, so its full length is
+// returned whether the final line/block comment is terminated or not.
+func skipLeadingTrivia(b []byte) int {
+	index, _ := scanLeadingTrivia(b)
+	return index
 }
 
 func lower(c byte) byte {
@@ -492,20 +656,6 @@ func lower(c byte) byte {
 		return c + 32
 	}
 	return c
-}
-
-// hasFold reports whether b begins with word (case-insensitive), allowing
-// leading whitespace already stripped by the caller.
-func hasFold(b []byte, word string) bool {
-	if len(b) < len(word) {
-		return false
-	}
-	for j := 0; j < len(word); j++ {
-		if lower(b[j]) != word[j] {
-			return false
-		}
-	}
-	return true
 }
 
 // findValues returns the index just AFTER the top-level VALUES (or VALUE)
@@ -551,39 +701,76 @@ func matchKeyword(b []byte, i int, word string) bool {
 }
 
 func isWordByte(c byte) bool {
-	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_'
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+		c == '_' || c == '$' || c >= 0x80
 }
 
-// splitTuples returns each top-level "(...)" group from the VALUES body, with a
-// trailing ";" stripped. Quote/escape/comment-aware via the lexer.
-func splitTuples(b []byte) []string {
-	var tuples []string
-	lex := lexer{}
-	depth := 0
-	start := -1
-	for i := 0; i < len(b); i++ {
-		top := lex.step(b[i])
-		if !top || lex.inLiteral() {
-			continue
+// splitTuplesStrict accepts only whitespace-separated tuples joined by commas,
+// followed by a semicolon and optional whitespace. It rejects every trailing
+// clause rather than guessing whether that clause may be duplicated safely.
+func splitTuplesStrict(b []byte) ([]string, error) {
+	skipSpace := func(i int) int {
+		for i < len(b) && isSpace(b[i]) {
+			i++
 		}
-		c := b[i]
-		switch c {
-		case '(':
-			if depth == 0 {
-				start = i
-			}
-			depth++
-		case ')':
-			if depth > 0 {
-				depth--
-				if depth == 0 && start >= 0 {
-					tuples = append(tuples, string(b[start:i+1]))
-					start = -1
+		return i
+	}
+
+	var tuples []string
+	i := skipSpace(0)
+	for {
+		if i >= len(b) || b[i] != '(' {
+			return nil, fmt.Errorf("expected value tuple at byte %d", i)
+		}
+		start := i
+		depth := 0
+		lex := lexer{}
+		closed := false
+		for i < len(b) {
+			top := lex.step(b[i])
+			if top && !lex.inLiteral() {
+				switch b[i] {
+				case '(':
+					depth++
+				case ')':
+					if depth == 0 {
+						return nil, fmt.Errorf("unexpected closing parenthesis at byte %d", i)
+					}
+					depth--
+					if depth == 0 {
+						i++
+						tuples = append(tuples, string(b[start:i]))
+						closed = true
+					}
 				}
 			}
+			if closed {
+				break
+			}
+			i++
+		}
+		if !closed || lex.inLiteral() {
+			return nil, errors.New("unterminated value tuple")
+		}
+
+		i = skipSpace(i)
+		if i >= len(b) {
+			return nil, errors.New("missing statement terminator")
+		}
+		switch b[i] {
+		case ',':
+			i = skipSpace(i + 1)
+			continue
+		case ';':
+			i = skipSpace(i + 1)
+			if i != len(b) {
+				return nil, fmt.Errorf("unsupported trailing tokens at byte %d", i)
+			}
+			return tuples, nil
+		default:
+			return nil, fmt.Errorf("unsupported trailing clause or malformed tuple separator at byte %d", i)
 		}
 	}
-	return tuples
 }
 
 // FormatNote returns a short human description of a reshape result.

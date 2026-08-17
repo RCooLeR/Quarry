@@ -1,6 +1,7 @@
 package replace
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestReplacePlainFileWritesOutputAndManifest(t *testing.T) {
@@ -20,7 +20,7 @@ func TestReplacePlainFileWritesOutputAndManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 5})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestReplacePlainFileDoesNotOverwriteOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{}); err == nil {
+	if _, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{}); err == nil {
 		t.Fatal("expected overwrite error")
 	}
 	got, err := os.ReadFile(outPath)
@@ -89,7 +89,7 @@ func TestReplacePlainFileRejectsSourceOutputMatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ReplacePlainFile(context.Background(), srcPath, srcPath, []byte("hello"), []byte("bye"), FileOptions{}); err == nil {
+	if _, err := replacePlainFile(context.Background(), srcPath, srcPath, []byte("hello"), []byte("bye"), FileOptions{}); err == nil {
 		t.Fatal("expected same-path error")
 	}
 	got, err := os.ReadFile(srcPath)
@@ -113,7 +113,7 @@ func TestReplacePlainFileDoesNotOverwriteManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{})
 	if err == nil {
 		t.Fatal("expected manifest exists error")
 	}
@@ -142,7 +142,7 @@ func TestReplacePlainFileCancelDeletesPartialWhenRequested(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplacePlainFile(ctx, srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
+	summary, err := replacePlainFile(ctx, srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
 		ChunkSize:             32,
 		DeletePartialOnCancel: true,
 		Progress: func(Progress) {
@@ -178,7 +178,7 @@ func TestReplacePlainFileCancelKeepsPartialWhenConfigured(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplacePlainFile(ctx, srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
+	summary, err := replacePlainFile(ctx, srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
 		ChunkSize:             32,
 		DeletePartialOnCancel: false,
 		Progress: func(Progress) {
@@ -207,54 +207,34 @@ func TestReplacePlainFileCancelKeepsPartialWhenConfigured(t *testing.T) {
 	}
 }
 
-func TestReplacePlainFileSwapOriginalCreatesBackup(t *testing.T) {
+func TestReplacePlainFileSwapOriginalFailsClosedWithoutArtifacts(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	outPath := filepath.Join(dir, "output.txt")
 	backupPath := filepath.Join(dir, "source.txt.bak")
-	if err := os.WriteFile(srcPath, []byte("hello world hello"), 0o600); err != nil {
+	original := []byte("hello world hello")
+	if err := os.WriteFile(srcPath, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
 		ChunkSize:    5,
 		SwapOriginal: true,
 		BackupPath:   backupPath,
 	})
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrSwapOriginalDisabled) {
+		t.Fatalf("error = %v, want ErrSwapOriginalDisabled", err)
 	}
-	if !summary.Swapped {
-		t.Fatal("expected swapped summary")
+	if summary != (FileSummary{}) {
+		t.Fatalf("summary = %+v, want zero summary", summary)
 	}
-	if summary.BackupPath != backupPath {
-		t.Fatalf("backup path = %q, want %q", summary.BackupPath, backupPath)
+	if got, readErr := os.ReadFile(srcPath); readErr != nil || !bytes.Equal(got, original) {
+		t.Fatalf("source = %q, %v; want unchanged", got, readErr)
 	}
-	if _, err := os.Stat(outPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("intermediate output should be moved to source, stat err = %v", err)
-	}
-
-	got, err := os.ReadFile(srcPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != "bye world bye" {
-		t.Fatalf("source after swap = %q", string(got))
-	}
-	backup, err := os.ReadFile(backupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(backup) != "hello world hello" {
-		t.Fatalf("backup = %q", string(backup))
-	}
-
-	manifest := readManifest(t, summary.ManifestPath)
-	if !manifest.Swapped {
-		t.Fatal("expected swapped manifest")
-	}
-	if manifest.Backup != backupPath {
-		t.Fatalf("manifest backup = %q, want %q", manifest.Backup, backupPath)
+	for _, path := range []string{outPath, backupPath, outPath + ".quarry.tmp", outPath + ".quarry.manifest.json"} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("disabled swap created %q: %v", path, statErr)
+		}
 	}
 }
 
@@ -270,11 +250,11 @@ func TestReplacePlainFileSwapOriginalDoesNotOverwriteBackup(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
+	if _, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
 		SwapOriginal: true,
 		BackupPath:   backupPath,
-	}); err == nil {
-		t.Fatal("expected backup overwrite error")
+	}); !errors.Is(err, ErrSwapOriginalDisabled) {
+		t.Fatalf("error = %v, want ErrSwapOriginalDisabled", err)
 	}
 
 	got, err := os.ReadFile(srcPath)
@@ -312,7 +292,7 @@ func TestReplacePlainFileReportsPermissionDeniedWhenTempCreateFails(t *testing.T
 		openExclusive = restoreOpenExclusive
 	})
 
-	_, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{})
+	_, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{})
 	if !errors.Is(err, fs.ErrPermission) {
 		t.Fatalf("err = %v, want permission denied", err)
 	}
@@ -342,7 +322,7 @@ func TestReplacePlainFileReportsDiskFullAndPersistsFailedManifest(t *testing.T) 
 		openExclusive = restoreOpenExclusive
 	})
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 8})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{ChunkSize: 8})
 	if !errors.Is(err, diskFullErr) {
 		t.Fatalf("err = %v, want disk full", err)
 	}
@@ -362,51 +342,38 @@ func TestReplacePlainFileReportsDiskFullAndPersistsFailedManifest(t *testing.T) 
 	}
 }
 
-func TestReplacePlainFileFailsIfSourceChangesBeforeSwap(t *testing.T) {
+func TestReplacePlainFileSwapOriginalFailsBeforeProgress(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	outPath := filepath.Join(dir, "output.txt")
 	backupPath := filepath.Join(dir, "source.txt.bak")
-	if err := os.WriteFile(srcPath, []byte(strings.Repeat("hello world ", 32)), 0o600); err != nil {
+	original := []byte(strings.Repeat("hello world ", 32))
+	if err := os.WriteFile(srcPath, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	changed := false
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
+	progressCalled := false
+	_, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
 		ChunkSize:    16,
 		SwapOriginal: true,
 		BackupPath:   backupPath,
 		Progress: func(Progress) {
-			if changed {
-				return
-			}
-			changed = true
-			time.Sleep(10 * time.Millisecond)
-			if err := os.WriteFile(srcPath, []byte("source changed externally"), 0o600); err != nil {
-				t.Fatalf("mutate source: %v", err)
-			}
+			progressCalled = true
 		},
 	})
-	if !errors.Is(err, ErrSourceModifiedDuringOperation) {
-		t.Fatalf("err = %v, want %v", err, ErrSourceModifiedDuringOperation)
+	if !errors.Is(err, ErrSwapOriginalDisabled) {
+		t.Fatalf("error = %v, want ErrSwapOriginalDisabled", err)
 	}
-	if _, err := os.Stat(backupPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("backup should not exist, stat err = %v", err)
+	if progressCalled {
+		t.Fatal("disabled swap invoked progress callback")
 	}
-	got, readErr := os.ReadFile(srcPath)
-	if readErr != nil {
-		t.Fatal(readErr)
+	if got, readErr := os.ReadFile(srcPath); readErr != nil || !bytes.Equal(got, original) {
+		t.Fatalf("source = %q, %v; want unchanged", got, readErr)
 	}
-	if string(got) != "source changed externally" {
-		t.Fatalf("source = %q", string(got))
-	}
-
-	manifest := readManifest(t, summary.ManifestPath)
-	if manifest.Status != "failed" {
-		t.Fatalf("manifest status = %q", manifest.Status)
-	}
-	if manifest.Error != ErrSourceModifiedDuringOperation.Error() {
-		t.Fatalf("manifest error = %q", manifest.Error)
+	for _, path := range []string{outPath, backupPath, outPath + ".quarry.tmp", outPath + ".quarry.manifest.json"} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("disabled swap created %q: %v", path, statErr)
+		}
 	}
 }
 
@@ -430,7 +397,7 @@ func TestReplacePlainFileReportsLockedOutputDuringFinalize(t *testing.T) {
 		renamePath = restoreRenamePath
 	})
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{})
 	if !errors.Is(err, lockedErr) {
 		t.Fatalf("err = %v, want locked output error", err)
 	}
@@ -450,69 +417,39 @@ func TestReplacePlainFileReportsLockedOutputDuringFinalize(t *testing.T) {
 	}
 }
 
-func TestReplacePlainFileSwapOriginalRollbackFailureReportsBothErrors(t *testing.T) {
+func TestReplacePlainFileSwapOriginalDoesNotReachRenameSeam(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	outPath := filepath.Join(dir, "output.txt")
 	backupPath := filepath.Join(dir, "source.txt.bak")
-	if err := os.WriteFile(srcPath, []byte("hello world hello"), 0o600); err != nil {
+	original := []byte("hello world hello")
+	if err := os.WriteFile(srcPath, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	swapErr := errors.New("destination is locked")
-	rollbackErr := errors.New("rollback failed")
+	renameCalled := false
 	restoreRenamePath := renamePath
 	renamePath = func(oldPath string, newPath string) error {
-		cleanOld := filepath.Clean(oldPath)
-		cleanNew := filepath.Clean(newPath)
-		if cleanOld == filepath.Clean(outPath) && cleanNew == filepath.Clean(srcPath) {
-			return swapErr
-		}
-		if cleanOld == filepath.Clean(backupPath) && cleanNew == filepath.Clean(srcPath) {
-			return rollbackErr
-		}
-		return os.Rename(oldPath, newPath)
+		renameCalled = true
+		return errors.New("rename must not be reached")
 	}
 	t.Cleanup(func() {
 		renamePath = restoreRenamePath
 	})
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
+	_, err := replacePlainFile(context.Background(), srcPath, outPath, []byte("hello"), []byte("bye"), FileOptions{
 		ChunkSize:    5,
 		SwapOriginal: true,
 		BackupPath:   backupPath,
 	})
-	if err == nil {
-		t.Fatal("expected swap finalize failure")
+	if !errors.Is(err, ErrSwapOriginalDisabled) {
+		t.Fatalf("error = %v, want ErrSwapOriginalDisabled", err)
 	}
-	if !strings.Contains(err.Error(), swapErr.Error()) || !strings.Contains(err.Error(), rollbackErr.Error()) {
-		t.Fatalf("err = %v", err)
+	if renameCalled {
+		t.Fatal("disabled swap reached rename seam")
 	}
-
-	manifest := readManifest(t, summary.ManifestPath)
-	if manifest.Status != "failed" {
-		t.Fatalf("manifest status = %q", manifest.Status)
-	}
-	if !strings.Contains(manifest.Error, swapErr.Error()) || !strings.Contains(manifest.Error, rollbackErr.Error()) {
-		t.Fatalf("manifest error = %q", manifest.Error)
-	}
-
-	if _, statErr := os.Stat(srcPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("source should be missing after rollback failure, stat err = %v", statErr)
-	}
-	backup, err := os.ReadFile(backupPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(backup) != "hello world hello" {
-		t.Fatalf("backup = %q", string(backup))
-	}
-	out, err := os.ReadFile(outPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(out) != "bye world bye" {
-		t.Fatalf("output = %q", string(out))
+	if got, readErr := os.ReadFile(srcPath); readErr != nil || !bytes.Equal(got, original) {
+		t.Fatalf("source = %q, %v; want unchanged", got, readErr)
 	}
 }
 

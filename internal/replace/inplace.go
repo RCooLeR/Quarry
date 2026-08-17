@@ -3,7 +3,6 @@ package replace
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"time"
 )
 
@@ -26,10 +25,10 @@ type InPlaceSummary struct {
 
 var ErrInPlacePatchDisabled = errors.New("in-place patching is disabled because it can partially mutate the source; use safe output replace instead")
 
-// ReplacePlainFileInPlace used to patch sourcePath directly for same-length replacements.
+// replacePlainFileInPlace used to patch sourcePath directly for same-length replacements.
 // Quarry now refuses that public path because it can leave the original partially mutated
 // after a crash or cancellation. Use the safe output/manifest replacement pipeline instead.
-func ReplacePlainFileInPlace(ctx context.Context, sourcePath string, pattern []byte, repl []byte, opts InPlaceOptions) (InPlaceSummary, error) {
+func replacePlainFileInPlace(ctx context.Context, sourcePath string, pattern []byte, repl []byte, opts InPlaceOptions) (InPlaceSummary, error) {
 	_ = ctx
 	_ = opts
 	manifestPath := inplaceManifestPath(sourcePath)
@@ -48,5 +47,5 @@ func ReplacePlainFileInPlace(ctx context.Context, sourcePath string, pattern []b
 
 func inplaceManifestPath(sourcePath string) string {
 	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
-	return filepath.Clean(sourcePath) + ".quarry.inplace." + stamp + ".manifest.json"
+	return sourcePath + ".quarry.inplace." + stamp + ".manifest.json"
 }

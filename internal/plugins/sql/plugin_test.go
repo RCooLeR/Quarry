@@ -7,7 +7,34 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/quarry/quarry-wails3/internal/plugins"
 )
+
+func TestSQLDescriptorUsesTruthfulPerOperationCapabilities(t *testing.T) {
+	descriptor := Plugin()
+	if err := descriptor.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	operations := make(map[string]plugins.OperationCapability, len(descriptor.Operations))
+	for _, operation := range descriptor.Operations {
+		operations[operation.ID] = operation
+	}
+	if got := operations["highlight-visible"]; got.Processing != plugins.ProcessingBoundedWindow || got.MaxInputBytes <= 0 || got.Memory != plugins.MemoryBounded {
+		t.Fatalf("highlight metadata = %+v", got)
+	}
+	if got := operations["analyze-dump"]; got.Processing != plugins.ProcessingStreaming || got.Memory != plugins.MemoryMetadataProportional {
+		t.Fatalf("analysis metadata = %+v", got)
+	}
+	if got := operations["fixture-sample"]; got.Processing != plugins.ProcessingMaterialized || got.Memory != plugins.MemoryInputProportional {
+		t.Fatalf("fixture metadata = %+v", got)
+	}
+
+	descriptor.FilePatterns[0] = "*.changed"
+	if got := Plugin().FilePatterns[0]; got != "*.sql" {
+		t.Fatalf("mutating returned descriptor changed SQL patterns: %q", got)
+	}
+}
 
 type memReader struct {
 	data []byte
@@ -55,34 +82,6 @@ func TestSQLRuntimePluginRoutesAnalyzer(t *testing.T) {
 	}
 	if len(summary.Tables) != 1 || summary.Tables[0].Name != "users" {
 		t.Fatalf("tables = %#v", summary.Tables)
-	}
-}
-
-func TestSQLPluginRoutesPresetBuilder(t *testing.T) {
-	cfg, err := BuildPreset(ChangeDatabasePreset, "old_db", "new_db", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Mode != PresetModeBatch {
-		t.Fatalf("mode = %q, want %q", cfg.Mode, PresetModeBatch)
-	}
-	rules := BatchRules(cfg)
-	if len(rules) != 3 {
-		t.Fatalf("rules = %d, want 3", len(rules))
-	}
-	if string(rules[0].Find) != "`old_db`" || string(rules[0].Replace) != "`new_db`" {
-		t.Fatalf("first rule = %q => %q", rules[0].Find, rules[0].Replace)
-	}
-}
-
-func TestSQLRuntimePluginRoutesPresetBuilder(t *testing.T) {
-	var runtime Runtime = RuntimePlugin()
-	cfg, err := runtime.BuildPreset(ChangeDatabasePreset, "old_db", "new_db", "", "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rules := runtime.BatchRules(cfg); len(rules) != 3 {
-		t.Fatalf("rules = %d, want 3", len(rules))
 	}
 }
 

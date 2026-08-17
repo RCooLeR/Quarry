@@ -12,7 +12,7 @@ import (
 func TestPreviewRegexp(t *testing.T) {
 	r := memReaderAt{data: []byte("alpha abc-123 bravo\ncharlie def-456 delta")}
 
-	previews, err := PreviewRegexp(context.Background(), r, []byte(`([a-z]+)-([0-9]+)`), []byte(`${2}:${1}`), RegexPreviewOptions{
+	previews, err := PreviewRegexp(context.Background(), r, []byte(`([a-z]{3})-([0-9]{3})`), []byte(`${2}:${1}`), RegexPreviewOptions{
 		ChunkSize:    8,
 		MaxHits:      2,
 		PreviewBytes: 6,
@@ -53,7 +53,7 @@ func TestReplaceRegexpBoundaryAndCaptures(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	matches, err := ReplaceRegexp(context.Background(), src, dst, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), RegexOptions{
+	matches, err := replaceRegexp(context.Background(), src, dst, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), RegexOptions{
 		ChunkSize:      5,
 		MaxMatchWindow: 5,
 	})
@@ -95,7 +95,7 @@ func TestReplaceRegexpRejectsEmptyMatchPatterns(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ReplaceRegexp(context.Background(), src, dst, []byte(`a*`), []byte(``), RegexOptions{}); err == nil {
+	if _, err := replaceRegexp(context.Background(), src, dst, []byte(`a*`), []byte(``), RegexOptions{}); err == nil {
 		t.Fatal("expected empty-match regex rejection")
 	}
 }
@@ -115,7 +115,7 @@ func TestReplaceRegexpFileWritesOutputAndManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ReplaceRegexpFile(context.Background(), srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{
+	summary, err := replaceRegexpFile(context.Background(), srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{
 		ChunkSize: 4,
 	}, RegexOptions{
 		ChunkSize:      4,
@@ -155,7 +155,7 @@ func TestReplaceRegexpFileCancelDeletesPartialWhenRequested(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{
+	summary, err := replaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{
 		ChunkSize:             8,
 		DeletePartialOnCancel: true,
 	}, RegexOptions{
@@ -194,7 +194,7 @@ func TestReplaceRegexpFileCancelKeepsPartialWhenConfigured(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ReplaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{
+	summary, err := replaceRegexpFile(ctx, srcPath, outPath, []byte(`([a-z]{2})([0-9]{2})`), []byte(`${2}-${1}`), FileOptions{
 		ChunkSize:             8,
 		DeletePartialOnCancel: false,
 	}, RegexOptions{

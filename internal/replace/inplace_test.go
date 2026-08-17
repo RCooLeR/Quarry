@@ -15,7 +15,7 @@ func TestReplacePlainFileInPlaceDisabledPreservesSource(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ReplacePlainFileInPlace(context.Background(), srcPath, []byte("alpha"), []byte("omega"), InPlaceOptions{ChunkSize: 4})
+	summary, err := replacePlainFileInPlace(context.Background(), srcPath, []byte("alpha"), []byte("omega"), InPlaceOptions{ChunkSize: 4})
 	if !errors.Is(err, ErrInPlacePatchDisabled) {
 		t.Fatalf("err = %v, want ErrInPlacePatchDisabled", err)
 	}
@@ -45,7 +45,7 @@ func TestReplacePlainFileInPlaceRejectsDifferentLength(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ReplacePlainFileInPlace(context.Background(), srcPath, []byte("hello"), []byte("bye"), InPlaceOptions{}); err == nil {
+	if _, err := replacePlainFileInPlace(context.Background(), srcPath, []byte("hello"), []byte("bye"), InPlaceOptions{}); err == nil {
 		t.Fatal("expected same-length guard")
 	}
 
@@ -67,7 +67,7 @@ func TestReplacePlainFileInPlaceCanceledContextStillPreservesSource(t *testing.T
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	summary, err := ReplacePlainFileInPlace(ctx, srcPath, []byte("hello"), []byte("hullo"), InPlaceOptions{
+	summary, err := replacePlainFileInPlace(ctx, srcPath, []byte("hello"), []byte("hullo"), InPlaceOptions{
 		ChunkSize: 32,
 	})
 	if !errors.Is(err, ErrInPlacePatchDisabled) {

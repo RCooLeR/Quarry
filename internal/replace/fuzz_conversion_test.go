@@ -60,10 +60,10 @@ func TestConvertEncodingFileUTF8ToUTF16ToUTF8Roundtrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ConvertEncodingFile(context.Background(), srcPath, midPath, "UTF-16LE", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), srcPath, midPath, "UTF-16LE", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ConvertEncodingFile(context.Background(), midPath, outPath, "UTF-8", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), midPath, outPath, "UTF-8", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 

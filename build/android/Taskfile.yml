@@ -4,7 +4,7 @@ includes:
   common: ../Taskfile.yml
 
 vars:
-  APP_ID: '{{.APP_ID | default "com.wails.app"}}'
+  APP_ID: '{{.APP_ID | default "com.rcooler.quarry"}}'
   MIN_SDK: '21'
   TARGET_SDK: '34'
   # The emulator runs the host architecture; physical devices are arm64
@@ -32,28 +32,35 @@ tasks:
     prompt: This will check and install Android development dependencies. Continue?
 
   build:
-    summary: Creates a debug build of the application for Android
+    summary: Creates a development-only debug build of the application for Android
+    cmds:
+      - task: ensure:development-only
+      - task: build:debug
+        vars:
+          ARCH: '{{.ARCH | default .HOST_ARCH}}'
+
+  build:debug:
+    internal: true
+    summary: Build the Android debug application after the public guard passes
     deps:
-      - task: common:go:mod:tidy
       - task: generate:android:overlay
       - task: common:build:frontend
         vars:
           BUILD_FLAGS:
             ref: .BUILD_FLAGS
-          PRODUCTION:
-            ref: .PRODUCTION
     cmds:
       - echo "Building Android app {{.APP_NAME}}..."
       - task: compile:go:shared
         vars:
           ARCH: '{{.ARCH | default .HOST_ARCH}}'
     vars:
-      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production,android -trimpath -buildvcs=false -ldflags="-w -s"{{else}}-tags android,debug -buildvcs=false -gcflags=all="-l"{{end}}'
-    env:
-      PRODUCTION: '{{.PRODUCTION | default "false"}}'
+      BUILD_FLAGS: '-tags android,debug -buildvcs=false -gcflags=all="-l"'
 
   compile:go:shared:
-    summary: Compile Go code to shared library (.so)
+    summary: Compile the development-only Go shared library (.so)
+    preconditions:
+      - sh: '[ "{{.PRODUCTION | default "false"}}" = "false" ]'
+        msg: "Android production compilation is unsupported and disabled."
     cmds:
       - |
         # Locate the NDK: $ANDROID_NDK_HOME, or the newest installed NDK
@@ -106,7 +113,7 @@ tasks:
         go build -buildmode=c-shared -overlay build/android/overlay.json {{.BUILD_FLAGS}} \
           -o build/android/app/src/main/jniLibs/$JNI_DIR/libwails.so
     vars:
-      BUILD_FLAGS: '{{if eq .PRODUCTION "true"}}-tags production,android -trimpath -buildvcs=false -ldflags="-w -s"{{else}}-tags android,debug -buildvcs=false -gcflags=all="-l"{{end}}'
+      BUILD_FLAGS: '-tags android,debug -buildvcs=false -gcflags=all="-l"'
 
   compile:go:all-archs:
     summary: Compile Go code for all Android architectures (fat APK)
@@ -119,28 +126,14 @@ tasks:
           ARCH: amd64
 
   package:
-    summary: Packages a production build of the application into a signed release APK
-    deps:
-      - task: build
-        vars:
-          PRODUCTION: "true"
-          ARCH: '{{.ARCH | default .HOST_ARCH}}'
+    summary: Disabled because Android is not a supported Quarry release target
     cmds:
-      - task: assemble:apk:release
+      - task: unsupported:production
 
   package:fat:
-    summary: Packages a production build for all architectures (fat APK)
-    deps:
-      - task: build
-        vars:
-          PRODUCTION: "true"
-          ARCH: arm64
+    summary: Disabled because Android is not a supported Quarry release target
     cmds:
-      - task: compile:go:shared
-        vars:
-          ARCH: amd64
-          PRODUCTION: "true"
-      - task: assemble:apk:release
+      - task: unsupported:production
 
   assemble:apk:
     summary: Assembles a debug APK using Gradle
@@ -158,19 +151,26 @@ tasks:
         echo "APK created: {{.BIN_DIR}}/{{.APP_NAME}}.apk"
 
   assemble:apk:release:
-    summary: Assembles a release APK using Gradle (signed with the debug keystore unless ANDROID_KEYSTORE_FILE is set)
-    preconditions:
-      - sh: 'command -v java >/dev/null || [ -n "$JAVA_HOME" ]'
-        msg: "Java not found. Install a JDK (e.g. brew install openjdk@21) and/or set JAVA_HOME"
+    summary: Disabled because Android is not a supported Quarry release target
+    cmds:
+      - task: unsupported:production
+
+  unsupported:production:
+    internal: true
+    summary: Reject unsupported Android production and distribution work
+    cmds:
+      - echo "Android production/package/release tasks are disabled because Quarry does not support mobile distribution."
+      - exit 1
+
+  ensure:development-only:
+    internal: true
+    summary: Reject production flags before starting Android build dependencies
     cmds:
       - |
-        cd build/android
-        # The exec bit is lost when gradlew is extracted from the embedded
-        # build assets, so restore it before invoking the wrapper.
-        chmod +x ./gradlew
-        ./gradlew assembleRelease
-        cp app/build/outputs/apk/release/app-release.apk "../../{{.BIN_DIR}}/{{.APP_NAME}}.apk"
-        echo "Release APK created: {{.BIN_DIR}}/{{.APP_NAME}}.apk"
+        if [ "{{.PRODUCTION | default "false"}}" != "false" ]; then
+          echo "Android production builds are unsupported and disabled; use the debug emulator workflow only."
+          exit 1
+        fi
 
   generate:android:overlay:
     internal: true
@@ -252,13 +252,9 @@ tasks:
         msg: "emulator not found. Install the Android SDK emulator package (or set ANDROID_HOME)"
 
   deploy-emulator:
-    summary: Deploy the packaged release APK to the Android Emulator
-    deps: [package]
+    summary: Disabled release-APK deployment; use the debug-only run task
     cmds:
-      - task: ensure-emulator
-      - '"{{.ADB}}" uninstall {{.APP_ID}} 2>/dev/null || true'
-      - '"{{.ADB}}" install "{{.BIN_DIR}}/{{.APP_NAME}}.apk"'
-      - '"{{.ADB}}" shell am start -n {{.APP_ID}}/com.wails.app.MainActivity'
+      - task: unsupported:production
 
   run:
     summary: Build, install and launch a debug build in the Android Emulator

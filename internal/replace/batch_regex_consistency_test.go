@@ -23,7 +23,7 @@ func TestPreviewBatchRegexpConsistentWithCollectedMatches(t *testing.T) {
 		PreviewBytes: 12,
 	}
 
-	compiled, err := compileRegexBatchRules(rules, false)
+	compiled, err := compileRegexBatchRules(rules, false, defaultRegexMatchWindow)
 	if err != nil {
 		t.Fatal(err)
 	}

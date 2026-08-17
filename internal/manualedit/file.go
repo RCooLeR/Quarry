@@ -2,87 +2,102 @@ package manualedit
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"time"
 
+	"github.com/quarry/quarry-wails3/internal/document"
 	"github.com/quarry/quarry-wails3/internal/fileio"
+	"github.com/quarry/quarry-wails3/internal/regularfile"
+	"github.com/quarry/quarry-wails3/internal/sourceio"
 )
 
 var (
-	openSourceFile = os.Open
-	openExclusive  = func(path string) (syncWriteCloser, error) {
-		return fileio.OpenExclusiveOutput(path, 0o600)
-	}
-	renamePath      = fileio.Rename
-	removePath      = fileio.Remove
-	statPath        = fileio.Stat
-	openManifestOut = func(path string, exclusive bool) (io.WriteCloser, error) {
-		flag := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
-		if exclusive {
-			flag |= os.O_EXCL
-		}
-		return os.OpenFile(path, flag, 0o600)
-	}
+	ErrSourceModifiedDuringOperation = errors.New("source file modified during operation")
+	ErrSwapOriginalDisabled          = errors.New("manual-edit source replacement is disabled; save a copy instead")
+	ErrIncompleteManualEditOutput    = errors.New("manual-edit output is incomplete")
 )
 
-var ErrSourceModifiedDuringOperation = errors.New("source file modified during operation")
+// atomicOutput is the minimal handle-owned publication contract needed by the
+// manual-edit path. Keeping the interface here also lets tests inject failures
+// without weakening fileio.AtomicOutput's production implementation.
+type atomicOutput interface {
+	io.Writer
+	CommitContextValidated(context.Context, func(context.Context) error) error
+	Cleanup() error
+}
 
-const (
-	manifestProgressFlushBytes    int64 = 16 * 1024 * 1024
-	manifestProgressFlushInterval       = 2 * time.Second
+var (
+	openSourceFile   = regularfile.Open
+	statSourcePath   = os.Stat
+	openAtomicOutput = func(path string, sourcePaths []string, mode os.FileMode) (atomicOutput, error) {
+		return fileio.OpenAtomicOutput(path, sourcePaths, mode)
+	}
 )
 
 type FileOptions struct {
+	// DeletePartialOnCancel is retained for API compatibility. Manual-edit copy
+	// saves now always discard their operation-owned, unpublished scratch object;
+	// they never preserve a pathname that could later be mistaken for an output.
 	DeletePartialOnCancel bool
-	SwapOriginal          bool
-	BackupPath            string
-	MaxInsertedBytes      int64
-	Progress              func(Progress)
+	// SwapOriginal is fail-disabled before any filesystem access. Source mutation
+	// requires a separate, explicitly designed recovery transaction.
+	SwapOriginal     bool
+	BackupPath       string
+	MaxInsertedBytes int64
+	// SourceGeneration must match the immutable registry generation captured
+	// when a source-bound Session was created. It is required for session saves.
+	SourceGeneration uint64
+	Progress         func(Progress)
 }
 
+// FileSummary distinguishes a fully streamed result from publication. On an
+// ordinary error, Complete and Published are false and this operation created
+// no final output (the pathname may still be owned by a racing creator). A
+// fileio.PublicationError is the exceptional state in which both are true but
+// publication finalization/durability returned an error.
 type FileSummary struct {
-	OutputPath    string
-	TempPath      string
-	ManifestPath  string
-	BackupPath    string
-	Swapped       bool
-	BytesWritten  int64
-	ModifiedRange Range
-}
+	OutputPath string
 
-type Manifest struct {
-	Operation      string     `json:"operation"`
-	Source         string     `json:"source"`
-	Output         string     `json:"output"`
-	TempOutput     string     `json:"tempOutput"`
-	StartedAt      time.Time  `json:"startedAt"`
-	CompletedAt    *time.Time `json:"completedAt,omitempty"`
-	SourceSize     int64      `json:"sourceSize"`
-	BytesProcessed int64      `json:"bytesProcessed"`
-	Backup         string     `json:"backup,omitempty"`
-	Swapped        bool       `json:"swapped,omitempty"`
-	Status         string     `json:"status"`
-	Error          string     `json:"error,omitempty"`
-	EditStart      int64      `json:"editStart"`
-	EditEnd        int64      `json:"editEnd"`
-	InsertedBytes  int64      `json:"insertedBytes"`
+	// TempPath and ManifestPath are retained for RPC/source compatibility. The
+	// secure copy-only path deliberately exposes neither and leaves both empty.
+	TempPath     string
+	ManifestPath string
+
+	// BackupPath and Swapped remain empty/false because SwapOriginal is disabled.
+	BackupPath string
+	Swapped    bool
+
+	BytesWritten         int64
+	ModifiedRange        Range
+	Complete             bool
+	Published            bool
+	PublicationUncertain bool
 }
 
 type sourceSnapshot struct {
+	info    os.FileInfo
 	size    int64
 	modTime time.Time
 }
 
-func ApplyFileEdit(ctx context.Context, sourcePath string, outputPath string, edit Edit, opts FileOptions) (FileSummary, error) {
-	summary, backupPath, err := prepareManualEditOutput(sourcePath, outputPath, opts, Range{
-		Start: edit.Start,
-		End:   max64(edit.End, edit.Start+int64(len(edit.Text))),
-	})
-	if err != nil {
+func ApplyFileEdit(ctx context.Context, sourcePath string, outputPath string, edit Edit, opts FileOptions) (summary FileSummary, retErr error) {
+	summary = FileSummary{
+		OutputPath: outputPath,
+		ModifiedRange: Range{
+			Start: edit.Start,
+			End:   max64(edit.End, edit.Start+int64(len(edit.Text))),
+		},
+	}
+	if opts.SwapOriginal {
+		return summary, ErrSwapOriginalDisabled
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
 		return summary, err
 	}
 
@@ -90,10 +105,10 @@ func ApplyFileEdit(ctx context.Context, sourcePath string, outputPath string, ed
 	if err != nil {
 		return summary, err
 	}
-	srcClosed := false
+	sourceOwned := true
 	defer func() {
-		if !srcClosed {
-			_ = src.Close()
+		if sourceOwned {
+			retErr = errors.Join(retErr, src.Close())
 		}
 	}()
 
@@ -102,7 +117,6 @@ func ApplyFileEdit(ctx context.Context, sourcePath string, outputPath string, ed
 		return summary, err
 	}
 	sourceState := snapshotSource(st)
-
 	table := NewPieceTable(st.Size())
 	if opts.MaxInsertedBytes > 0 {
 		table.SetMaxInsertedBytes(opts.MaxInsertedBytes)
@@ -111,235 +125,87 @@ func ApplyFileEdit(ctx context.Context, sourcePath string, outputPath string, ed
 		return summary, err
 	}
 
-	dst, err := openExclusive(summary.TempPath)
+	sourceDocument, err := document.OpenFile(sourcePath)
 	if err != nil {
 		return summary, err
 	}
-
-	manifest := Manifest{
-		Operation:     "manual-range-edit",
-		Source:        sourcePath,
-		Output:        outputPath,
-		TempOutput:    summary.TempPath,
-		StartedAt:     time.Now().UTC(),
-		SourceSize:    st.Size(),
-		Status:        "running",
-		EditStart:     edit.Start,
-		EditEnd:       edit.End,
-		InsertedBytes: int64(len(edit.Text)),
-	}
-	if err := writeManifest(summary.ManifestPath, manifest, true); err != nil {
-		_ = dst.Close()
-		_ = removePath(summary.TempPath)
-		return summary, err
-	}
-
-	progress := manifestProgressFlusher(summary.ManifestPath, &manifest, opts.Progress)
-	bytesWritten, writeErr := table.WriteTo(ctx, fileReaderAtSize{file: src, size: st.Size()}, dst, WriteOptions{Progress: progress})
-	closeErr := dst.Close()
-	summary.BytesWritten = bytesWritten
-
-	if writeErr != nil {
-		failManualEditWrite(summary, &manifest, opts, writeErr)
-		return summary, writeErr
-	}
-	if closeErr != nil {
-		writeFailedManifest(summary.ManifestPath, &manifest, closeErr)
-		return summary, closeErr
-	}
-
-	summary, closed, err := finalizeManualEditOutput(sourcePath, outputPath, backupPath, src, sourceState, summary, &manifest, opts)
-	if closed {
-		srcClosed = true
-	}
+	sourceDocumentOwned := true
+	defer func() {
+		if sourceDocumentOwned {
+			retErr = errors.Join(retErr, sourceDocument.Close())
+		}
+	}()
+	expectedSource, err := sourceio.ExpectDocumentContext(ctx, sourceDocument)
 	if err != nil {
+		return summary, classifyDirectSourceError("capture exact manual-edit source", err)
+	}
+	documentInfo, err := sourceDocument.OpenedFileInfo()
+	if err != nil || !os.SameFile(st, documentInfo) || !sameFileState(st, documentInfo) {
+		return summary, fmt.Errorf("%w: transform handles do not identify one source generation", ErrSourceModifiedDuringOperation)
+	}
+	verifiedSource, err := sourceio.NewVerifiedDocumentReader(ctx, expectedSource, sourceDocument)
+	if err != nil {
+		return summary, classifyDirectSourceError("open exact manual-edit source reader", err)
+	}
+	if err := verifySourceUnchanged(sourcePath, src, sourceState); err != nil {
 		return summary, err
 	}
 
-	return summary, nil
+	summary, sourceOwned, retErr = writeOpenTableToFile(
+		ctx,
+		sourcePath,
+		outputPath,
+		src,
+		verifiedSource,
+		ErrSourceModifiedDuringOperation,
+		sourceState,
+		table,
+		summary,
+		opts,
+		func(validateCtx context.Context, file *os.File) error {
+			if err := expectedSource.ValidateDocumentContext(validateCtx, sourceDocument); err != nil {
+				return classifyDirectSourceError("revalidate exact manual-edit source", err)
+			}
+			closeErr := sourceDocument.Close()
+			sourceDocumentOwned = false
+			return closeErr
+		},
+	)
+	return summary, retErr
 }
 
 func WriteSessionToFile(ctx context.Context, sourcePath string, outputPath string, session *Session, opts FileOptions) (FileSummary, error) {
+	summary := FileSummary{OutputPath: outputPath}
+	if opts.SwapOriginal {
+		return summary, ErrSwapOriginalDisabled
+	}
 	if session == nil || !session.HasEdits() {
-		return FileSummary{}, errors.New("session has no staged edits")
+		return summary, errors.New("session has no staged edits")
 	}
-	return writeTableToFile(ctx, sourcePath, outputPath, session.table, session.SourceMappedModifiedRanges(), opts, "manual-edit-session")
+	summary.ModifiedRange = combinedRange(session.SourceMappedModifiedRanges())
+	return writeSessionToFile(ctx, sourcePath, outputPath, session, summary, opts)
 }
 
-func prepareManualEditOutput(sourcePath string, outputPath string, opts FileOptions, modified Range) (FileSummary, string, error) {
-	same, err := samePath(sourcePath, outputPath)
-	if err != nil {
-		return FileSummary{}, "", err
-	}
-	if same {
-		return FileSummary{}, "", errors.New("output path must be different from source path")
-	}
-
-	summary := FileSummary{
-		OutputPath:    outputPath,
-		TempPath:      outputPath + ".quarry.tmp",
-		ManifestPath:  outputPath + ".quarry.manifest.json",
-		ModifiedRange: modified,
-	}
-
-	if _, err := statPath(outputPath); err == nil {
-		return summary, "", errors.New("output file already exists")
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return summary, "", err
-	}
-
-	backupPath := opts.BackupPath
+func writeSessionToFile(ctx context.Context, sourcePath string, outputPath string, session *Session, summary FileSummary, opts FileOptions) (result FileSummary, retErr error) {
 	if opts.SwapOriginal {
-		if backupPath == "" {
-			backupPath = sourcePath + ".quarry.bak"
-		}
-		sameBackup, err := samePath(sourcePath, backupPath)
-		if err != nil {
-			return summary, "", err
-		}
-		if sameBackup {
-			return summary, "", errors.New("backup path must be different from source path")
-		}
-		if _, err := statPath(backupPath); err == nil {
-			return summary, "", errors.New("backup file already exists")
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return summary, "", err
-		}
-		summary.BackupPath = backupPath
+		return summary, ErrSwapOriginalDisabled
 	}
-
-	return summary, backupPath, nil
-}
-
-func writeManifest(path string, manifest Manifest, exclusive bool) error {
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return err
+	if session == nil || session.table == nil {
+		return summary, errors.New("session is required")
 	}
-	data = append(data, '\n')
-
-	f, err := openManifestOut(path, exclusive)
-	if err != nil {
-		return err
+	if session.binding == nil {
+		return summary, ErrSessionSourceUnbound
 	}
-	_, writeErr := f.Write(data)
-	closeErr := f.Close()
-	if writeErr != nil {
-		return writeErr
+	if opts.SourceGeneration == 0 || opts.SourceGeneration != session.binding.generation {
+		return summary, ErrSessionGenerationChanged
 	}
-	return closeErr
-}
-
-func manifestProgressFlusher(path string, manifest *Manifest, progress func(Progress)) func(Progress) {
-	var lastBytes int64
-	lastFlush := time.Now()
-	return func(p Progress) {
-		if manifest != nil {
-			manifest.BytesProcessed = p.BytesWritten
-			now := time.Now()
-			if shouldFlushManifestProgress(p.BytesWritten, lastBytes, lastFlush, now) {
-				if writeManifest(path, *manifest, false) == nil {
-					lastBytes = p.BytesWritten
-					lastFlush = now
-				}
-			}
-		}
-		if progress != nil {
-			progress(p)
-		}
+	if sourcePath != session.binding.path {
+		return summary, ErrSessionSourceChanged
 	}
-}
-
-func shouldFlushManifestProgress(bytesWritten int64, lastBytes int64, lastFlush time.Time, now time.Time) bool {
-	if bytesWritten <= 0 {
-		return false
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	if bytesWritten-lastBytes >= manifestProgressFlushBytes {
-		return true
-	}
-	return now.Sub(lastFlush) >= manifestProgressFlushInterval
-}
-
-func writeFailedManifest(path string, manifest *Manifest, err error) {
-	if manifest == nil || err == nil {
-		return
-	}
-	manifest.Status = "failed"
-	if errors.Is(err, context.Canceled) {
-		manifest.Status = "canceled"
-	}
-	manifest.Error = err.Error()
-	_ = writeManifest(path, *manifest, false)
-}
-
-func writeCompletedManifest(path string, manifest *Manifest, bytesWritten int64) error {
-	if manifest == nil {
-		return errors.New("manifest is required")
-	}
-	now := time.Now().UTC()
-	manifest.Status = "complete"
-	manifest.CompletedAt = &now
-	manifest.BytesProcessed = bytesWritten
-	return writeManifest(path, *manifest, false)
-}
-
-func writeCompletedManifestOrFail(path string, manifest *Manifest, bytesWritten int64) error {
-	if err := writeCompletedManifest(path, manifest, bytesWritten); err != nil {
-		writeFailedManifest(path, manifest, err)
-		return err
-	}
-	return nil
-}
-
-func failManualEditWrite(summary FileSummary, manifest *Manifest, opts FileOptions, err error) {
-	writeFailedManifest(summary.ManifestPath, manifest, err)
-	if manifest != nil && manifest.Status == "canceled" && opts.DeletePartialOnCancel {
-		_ = removePath(summary.TempPath)
-	}
-}
-
-func finalizeManualEditOutput(sourcePath string, outputPath string, backupPath string, src io.Closer, sourceState sourceSnapshot, summary FileSummary, manifest *Manifest, opts FileOptions) (FileSummary, bool, error) {
-	if err := renamePath(summary.TempPath, outputPath); err != nil {
-		writeFailedManifest(summary.ManifestPath, manifest, err)
-		return summary, false, err
-	}
-
-	sourceClosed := false
-	if opts.SwapOriginal {
-		if err := verifySourceUnchanged(sourcePath, sourceState); err != nil {
-			writeFailedManifest(summary.ManifestPath, manifest, err)
-			return summary, sourceClosed, err
-		}
-		if err := src.Close(); err != nil {
-			sourceClosed = true
-			writeFailedManifest(summary.ManifestPath, manifest, err)
-			return summary, sourceClosed, err
-		}
-		sourceClosed = true
-		if err := swapOutputIntoSource(sourcePath, outputPath, backupPath); err != nil {
-			writeFailedManifest(summary.ManifestPath, manifest, err)
-			return summary, sourceClosed, err
-		}
-		manifest.Backup = backupPath
-		manifest.Swapped = true
-		summary.BackupPath = backupPath
-		summary.Swapped = true
-	}
-
-	if err := writeCompletedManifestOrFail(summary.ManifestPath, manifest, summary.BytesWritten); err != nil {
-		return summary, sourceClosed, err
-	}
-	return summary, sourceClosed, nil
-}
-
-func writeTableToFile(ctx context.Context, sourcePath string, outputPath string, table *PieceTable, modified []Range, opts FileOptions, operation string) (FileSummary, error) {
-	modifiedRange := Range{}
-	if len(modified) > 0 {
-		modifiedRange = modified[0]
-	}
-
-	summary, backupPath, err := prepareManualEditOutput(sourcePath, outputPath, opts, modifiedRange)
-	if err != nil {
+	if err := ctx.Err(); err != nil {
 		return summary, err
 	}
 
@@ -347,10 +213,10 @@ func writeTableToFile(ctx context.Context, sourcePath string, outputPath string,
 	if err != nil {
 		return summary, err
 	}
-	srcClosed := false
+	sourceOwned := true
 	defer func() {
-		if !srcClosed {
-			_ = src.Close()
+		if sourceOwned {
+			retErr = errors.Join(retErr, src.Close())
 		}
 	}()
 
@@ -358,139 +224,186 @@ func writeTableToFile(ctx context.Context, sourcePath string, outputPath string,
 	if err != nil {
 		return summary, err
 	}
-	// The piece table's offsets are relative to the source size captured when
-	// staging began. If the source changed size since then (e.g. a still-growing
-	// or re-exported dump), those offsets are stale — abort before writing rather
-	// than streaming a truncated/misaligned copy and reporting it as a success.
-	if st.Size() != table.OriginalSize() {
+	// Piece offsets are relative to the source size captured when staging began.
+	// Reject stale offsets before allocating any output object.
+	if st.Size() != session.table.OriginalSize() {
 		return summary, fmt.Errorf("source size changed from %d to %d since staging: %w",
-			table.OriginalSize(), st.Size(), ErrSourceModifiedDuringOperation)
+			session.table.OriginalSize(), st.Size(), ErrSourceModifiedDuringOperation)
 	}
-	sourceState := snapshotSource(st)
-
-	dst, err := openExclusive(summary.TempPath)
+	if err := session.validateOpenedSource(ctx, sourcePath, opts.SourceGeneration, src); err != nil {
+		return summary, err
+	}
+	verifiedSource, err := session.verifiedSourceReader(ctx)
 	if err != nil {
 		return summary, err
 	}
+	if err := session.verifyExpectedSource(verifiedSource); err != nil {
+		if errors.Is(err, sourceio.ErrSourceChanged) {
+			return summary, fmt.Errorf("%w: verify staged source bytes: %w", ErrSessionSourceChanged, err)
+		}
+		return summary, err
+	}
 
-	editStart := int64(0)
-	editEnd := int64(0)
-	if len(modified) > 0 {
-		editStart = modified[0].Start
-		editEnd = modified[0].End
-		for _, r := range modified[1:] {
-			if r.Start < editStart {
-				editStart = r.Start
-			}
-			if r.End > editEnd {
-				editEnd = r.End
+	result, sourceOwned, retErr = writeOpenTableToFile(
+		ctx,
+		sourcePath,
+		outputPath,
+		src,
+		verifiedSource,
+		ErrSessionSourceChanged,
+		snapshotSource(st),
+		session.table,
+		summary,
+		opts,
+		func(validateCtx context.Context, file *os.File) error {
+			return session.validateOpenedSource(validateCtx, sourcePath, opts.SourceGeneration, file)
+		},
+	)
+	return result, retErr
+}
+
+// writeOpenTableToFile owns src on entry and returns sourceOwned=false once it
+// has closed it. It never publishes until the exact expected byte count is
+// written and the opened source plus its pathname still match the snapshot.
+func writeOpenTableToFile(
+	ctx context.Context,
+	sourcePath string,
+	outputPath string,
+	src *os.File,
+	sourceReader document.ReaderAtSize,
+	sourceReadChangedError error,
+	sourceState sourceSnapshot,
+	table *PieceTable,
+	summary FileSummary,
+	opts FileOptions,
+	postSourceVerify func(context.Context, *os.File) error,
+) (result FileSummary, sourceOwned bool, retErr error) {
+	result = summary
+	sourceOwned = true
+	if sourceReader == nil || sourceReader.Size() != sourceState.size {
+		return result, sourceOwned, fmt.Errorf("%w: exact source reader size does not match the opened source", sourceReadChangedError)
+	}
+
+	out, err := openAtomicOutput(outputPath, []string{sourcePath}, 0o600)
+	if err != nil {
+		return result, sourceOwned, err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, out.Cleanup())
+	}()
+
+	written, err := table.WriteTo(
+		ctx,
+		sourceReader,
+		atomicSyncWriter{atomicOutput: out},
+		WriteOptions{Progress: opts.Progress},
+	)
+	result.BytesWritten = written
+	if err != nil {
+		if sourceReadChangedError != nil && errors.Is(err, sourceio.ErrSourceChanged) {
+			return result, sourceOwned, fmt.Errorf("%w: exact source-span read failed: %w", sourceReadChangedError, err)
+		}
+		return result, sourceOwned, err
+	}
+	if written != table.Size() {
+		return result, sourceOwned, fmt.Errorf("%w: wrote %d of %d bytes", ErrIncompleteManualEditOutput, written, table.Size())
+	}
+	if err := verifySourceUnchanged(sourcePath, src, sourceState); err != nil {
+		return result, sourceOwned, err
+	}
+
+	// Sync the complete output first, then repeat every source check while the
+	// exact source descriptor remains open. Closing inside the validator keeps
+	// source-close failures pre-publication and leaves only the unavoidable
+	// cross-object validator-to-rename interval.
+	if err := out.CommitContextValidated(ctx, func(validateCtx context.Context) error {
+		if err := verifySourceUnchanged(sourcePath, src, sourceState); err != nil {
+			return err
+		}
+		if postSourceVerify != nil {
+			if err := postSourceVerify(validateCtx, src); err != nil {
+				return err
 			}
 		}
+		closeErr := src.Close()
+		sourceOwned = false
+		return closeErr
+	}); err != nil {
+		var publicationErr *fileio.PublicationError
+		if errors.As(err, &publicationErr) {
+			result.Complete = true
+			result.Published = true
+			result.PublicationUncertain = publicationErr.LocationUncertain
+		}
+		return result, sourceOwned, err
 	}
-	manifest := Manifest{
-		Operation:     operation,
-		Source:        sourcePath,
-		Output:        outputPath,
-		TempOutput:    summary.TempPath,
-		StartedAt:     time.Now().UTC(),
-		SourceSize:    st.Size(),
-		Status:        "running",
-		EditStart:     editStart,
-		EditEnd:       editEnd,
-		InsertedBytes: int64(len(table.added)),
-	}
-	if err := writeManifest(summary.ManifestPath, manifest, true); err != nil {
-		_ = dst.Close()
-		_ = removePath(summary.TempPath)
-		return summary, err
-	}
-
-	progress := manifestProgressFlusher(summary.ManifestPath, &manifest, opts.Progress)
-	bytesWritten, writeErr := table.WriteTo(ctx, fileReaderAtSize{file: src, size: st.Size()}, dst, WriteOptions{Progress: progress})
-	closeErr := dst.Close()
-	summary.BytesWritten = bytesWritten
-
-	if writeErr != nil {
-		failManualEditWrite(summary, &manifest, opts, writeErr)
-		return summary, writeErr
-	}
-	if closeErr != nil {
-		writeFailedManifest(summary.ManifestPath, &manifest, closeErr)
-		return summary, closeErr
-	}
-
-	summary, closed, err := finalizeManualEditOutput(sourcePath, outputPath, backupPath, src, sourceState, summary, &manifest, opts)
-	if closed {
-		srcClosed = true
-	}
-	if err != nil {
-		return summary, err
-	}
-	return summary, nil
+	result.Complete = true
+	result.Published = true
+	return result, sourceOwned, nil
 }
+
+// atomicSyncWriter defers the real data sync to AtomicOutput.CommitContext.
+// PieceTable's final Sync call is intentionally a no-op here: publication owns
+// the one authoritative sync/close/error-propagation sequence.
+type atomicSyncWriter struct {
+	atomicOutput
+}
+
+func (atomicSyncWriter) Sync() error { return nil }
 
 func snapshotSource(info os.FileInfo) sourceSnapshot {
 	return sourceSnapshot{
+		info:    info,
 		size:    info.Size(),
 		modTime: info.ModTime(),
 	}
 }
 
-func verifySourceUnchanged(path string, before sourceSnapshot) error {
-	info, err := statPath(path)
-	if err != nil {
-		return err
+func verifySourceUnchanged(path string, src *os.File, before sourceSnapshot) error {
+	if src == nil || before.info == nil {
+		return ErrSourceModifiedDuringOperation
 	}
-	after := snapshotSource(info)
-	if after.size != before.size || !after.modTime.Equal(before.modTime) {
+	handleInfo, err := src.Stat()
+	if err != nil {
+		return errors.Join(ErrSourceModifiedDuringOperation, err)
+	}
+	if !os.SameFile(before.info, handleInfo) || !sameSourceMetadata(before, handleInfo) {
+		return ErrSourceModifiedDuringOperation
+	}
+
+	pathInfo, err := statSourcePath(path)
+	if err != nil {
+		return errors.Join(ErrSourceModifiedDuringOperation, err)
+	}
+	if !os.SameFile(handleInfo, pathInfo) || !sameSourceMetadata(before, pathInfo) {
 		return ErrSourceModifiedDuringOperation
 	}
 	return nil
 }
 
-func samePath(a string, b string) (bool, error) {
-	return fileio.SamePath(a, b)
+func sameSourceMetadata(before sourceSnapshot, after os.FileInfo) bool {
+	return after.Size() == before.size && after.ModTime().Equal(before.modTime)
 }
 
-type fileReaderAtSize struct {
-	file *os.File
-	size int64
-}
-
-func (r fileReaderAtSize) ReadAt(p []byte, off int64) (int, error) {
-	return r.file.ReadAt(p, off)
-}
-
-func (r fileReaderAtSize) Size() int64 {
-	return r.size
-}
-
-type syncWriteCloser interface {
-	syncWriter
-	io.Closer
-}
-
-func swapOutputIntoSource(sourcePath string, outputPath string, backupPath string) error {
-	sourceInfo, err := statPath(sourcePath)
-	if err != nil {
-		return err
+func classifyDirectSourceError(operation string, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("%s: %w", operation, err)
 	}
-	if err := renamePath(sourcePath, backupPath); err != nil {
-		return err
+	return fmt.Errorf("%w: %s: %w", ErrSourceModifiedDuringOperation, operation, err)
+}
+
+func combinedRange(ranges []Range) Range {
+	if len(ranges) == 0 {
+		return Range{}
 	}
-	if err := fileio.ApplyMode(outputPath, sourceInfo.Mode()); err != nil {
-		rollbackErr := renamePath(backupPath, sourcePath)
-		if rollbackErr != nil {
-			return fmt.Errorf("prepare swapped output metadata failed: %w (rollback failed: %v)", err, rollbackErr)
+	combined := ranges[0]
+	for _, current := range ranges[1:] {
+		if current.Start < combined.Start {
+			combined.Start = current.Start
 		}
-		return err
-	}
-	if err := renamePath(outputPath, sourcePath); err != nil {
-		rollbackErr := renamePath(backupPath, sourcePath)
-		if rollbackErr != nil {
-			return fmt.Errorf("swap finalize failed: %w (rollback failed: %v)", err, rollbackErr)
+		if current.End > combined.End {
+			combined.End = current.End
 		}
-		return err
 	}
-	return nil
+	return combined
 }

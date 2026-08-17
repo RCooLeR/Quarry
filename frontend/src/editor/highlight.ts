@@ -10,6 +10,7 @@
 
 import { RangeSetBuilder } from "@codemirror/state";
 import { Decoration, DecorationSet, EditorView, ViewPlugin, ViewUpdate } from "@codemirror/view";
+import { MAX_EDITOR_HIGHLIGHT_RANGES } from "./highlightLimits";
 import { sqlHighlight } from "./sqlHighlight";
 
 // ---------------------------------------------------------------------------
@@ -115,7 +116,8 @@ function genericPlugin(profile: LangProfile) {
   const re = buildRegex(profile);
   const build = (view: EditorView): DecorationSet => {
     const b = new RangeSetBuilder<Decoration>();
-    for (const { from, to } of view.visibleRanges) {
+    let remaining = MAX_EDITOR_HIGHLIGHT_RANGES;
+    visible: for (const { from, to } of view.visibleRanges) {
       let pos = from;
       while (pos <= to) {
         const line = view.state.doc.lineAt(pos);
@@ -135,6 +137,8 @@ function genericPlugin(profile: LangProfile) {
           if (deco) {
             const start = line.from + m.index;
             b.add(start, start + m[0].length, deco);
+            remaining--;
+            if (remaining === 0) break visible;
           }
           if (m[0].length === 0) re.lastIndex++;
         }
@@ -157,38 +161,103 @@ function genericPlugin(profile: LangProfile) {
   );
 }
 
-const genericTheme = EditorView.theme({
-  ".q-hl-comment": { color: "#6a9955", fontStyle: "italic" },
-  ".q-hl-string": { color: "#ce9178" },
-  ".q-hl-number": { color: "#b5cea8" },
-  ".q-hl-keyword": { color: "#569cd6" },
-  ".q-hl-key": { color: "#4ec9b0" },
-});
+export type EditorColorTheme = "dark" | "light";
+
+// These backgrounds are shared with QuarryEditor so the contrast contract is
+// explicit and testable. Every light-theme foreground below is at least 4.5:1
+// against #fbfcfe; color is never the only indication of an editor selection.
+export const EDITOR_SYNTAX_BACKGROUNDS = {
+  dark: "#12161c",
+  light: "#fbfcfe",
+} as const;
+
+export const EDITOR_SYNTAX_PALETTES = {
+  dark: {
+    generic: {
+      comment: "#6a9955",
+      string: "#ce9178",
+      number: "#b5cea8",
+      keyword: "#569cd6",
+      key: "#4ec9b0",
+    },
+    sql: {
+      comment: "#6a9955",
+      string: "#ce9178",
+      ident: "#4ec9b0",
+      number: "#b5cea8",
+      keyword: "#569cd6",
+    },
+    csv: ["#e06c75", "#d19a66", "#e5c07b", "#98c379", "#56b6c2", "#61afef", "#c678dd", "#b48ead"],
+  },
+  light: {
+    generic: {
+      comment: "#52606d",
+      string: "#8a2c0d",
+      number: "#4e5d00",
+      keyword: "#174ea6",
+      key: "#00695c",
+    },
+    sql: {
+      comment: "#52606d",
+      string: "#8a2c0d",
+      ident: "#00695c",
+      number: "#4e5d00",
+      keyword: "#174ea6",
+    },
+    csv: ["#9f1239", "#9a3412", "#854d0e", "#3f6212", "#0f6b61", "#075985", "#6b21a8", "#7e2855"],
+  },
+} as const;
 
 // ---------------------------------------------------------------------------
 // Rainbow CSV
 // ---------------------------------------------------------------------------
 
 const CSV_COLORS = 8;
+export const MAX_CSV_DELIMITER_DETECTION_CODE_UNITS = 64 * 1024;
 
-function detectDelimiter(text: string): string {
-  let best = ",";
-  let bestN = -1;
-  for (const d of [",", "\t", ";", "|"]) {
-    const n = text.split(d).length;
-    if (n > bestN) {
-      bestN = n;
-      best = d;
+export function detectCsvDelimiter(text: string): string {
+  let commas = 0;
+  let tabs = 0;
+  let semicolons = 0;
+  let pipes = 0;
+  const scanLength = Math.min(text.length, MAX_CSV_DELIMITER_DETECTION_CODE_UNITS);
+  for (let index = 0; index < scanLength; index++) {
+    switch (text[index]) {
+      case ",": commas++; break;
+      case "\t": tabs++; break;
+      case ";": semicolons++; break;
+      case "|": pipes++; break;
     }
   }
+  let best = ",";
+  let bestCount = commas;
+  if (tabs > bestCount) { best = "\t"; bestCount = tabs; }
+  if (semicolons > bestCount) { best = ";"; bestCount = semicolons; }
+  if (pipes > bestCount) best = "|";
   return best;
 }
 
-// Split a CSV line into field byte ranges, respecting double-quoted fields.
-function csvFieldRanges(text: string, delim: string): Array<[number, number]> {
-  const ranges: Array<[number, number]> = [];
+// Rainbow coloring is cosmetic and must never amplify one bounded editor
+// window into hundreds of thousands of decorations. Normal CSV rows retain
+// their full highlighting; only pathological, ultra-wide rows hit this cap.
+export const MAX_CSV_HIGHLIGHT_RANGES = MAX_EDITOR_HIGHLIGHT_RANGES;
+
+function visitCsvFieldRanges(
+  text: string,
+  delim: string,
+  limit: number,
+  visit: (start: number, end: number) => void,
+): number {
+  const boundedLimit = Math.max(0, Math.min(MAX_CSV_HIGHLIGHT_RANGES, Math.floor(limit)));
+  if (boundedLimit === 0) return 0;
   let start = 0;
   let inQuotes = false;
+  let visited = 0;
+  const emit = (end: number): boolean => {
+    visit(start, end);
+    visited++;
+    return visited >= boundedLimit;
+  };
   for (let i = 0; i < text.length; i++) {
     const ch = text[i];
     if (ch === '"') {
@@ -198,31 +267,49 @@ function csvFieldRanges(text: string, delim: string): Array<[number, number]> {
       }
       inQuotes = !inQuotes;
     } else if (ch === delim && !inQuotes) {
-      ranges.push([start, i]);
+      if (emit(i)) return visited;
       start = i + 1;
     }
   }
-  ranges.push([start, text.length]);
+  emit(text.length);
+  return visited;
+}
+
+// Split a CSV line into field ranges, respecting double-quoted fields. The
+// returned collection is capped for callers outside the editor plugin too.
+export function csvFieldRanges(
+  text: string,
+  delim: string,
+  limit = MAX_CSV_HIGHLIGHT_RANGES,
+): Array<[number, number]> {
+  const ranges: Array<[number, number]> = [];
+  visitCsvFieldRanges(text, delim, limit, (start, end) => ranges.push([start, end]));
   return ranges;
 }
 
 const CSV_MARKS = Array.from({ length: CSV_COLORS }, (_, i) => Decoration.mark({ class: "q-csv-col-" + i }));
 
-function rainbowPlugin() {
-  let delim = "";
+function rainbowPlugin(configuredDelimiter: string) {
+  // This closure belongs to one editor/file configuration. When no confirmed
+  // dialect is available yet, detection is local to this extension instance;
+  // it can never retain a separator from a previously attached file.
+  let delim = configuredDelimiter;
   const build = (view: EditorView): DecorationSet => {
     const b = new RangeSetBuilder<Decoration>();
-    for (const { from, to } of view.visibleRanges) {
+    let remaining = MAX_CSV_HIGHLIGHT_RANGES;
+    visible: for (const { from, to } of view.visibleRanges) {
       let pos = from;
       while (pos <= to) {
         const line = view.state.doc.lineAt(pos);
         if (line.text.length > 0) {
-          if (!delim) delim = detectDelimiter(line.text);
+          if (!delim) delim = detectCsvDelimiter(line.text);
           let col = 0;
-          for (const [s, e] of csvFieldRanges(line.text, delim)) {
-            if (e > s) b.add(line.from + s, line.from + e, CSV_MARKS[col % CSV_COLORS]);
+          const visited = visitCsvFieldRanges(line.text, delim, remaining, (start, end) => {
+            if (end > start) b.add(line.from + start, line.from + end, CSV_MARKS[col % CSV_COLORS]);
             col++;
-          }
+          });
+          remaining -= visited;
+          if (remaining === 0) break visible;
         }
         pos = line.to + 1;
       }
@@ -243,13 +330,36 @@ function rainbowPlugin() {
   );
 }
 
-// One Dark-ish palette, cycled across columns.
-const CSV_PALETTE = ["#e06c75", "#d19a66", "#e5c07b", "#98c379", "#56b6c2", "#61afef", "#c678dd", "#b48ead"];
-const rainbowTheme = EditorView.theme(
-  Object.fromEntries(CSV_PALETTE.map((c, i) => [".q-csv-col-" + i, { color: c }])),
-);
+function rainbowCsv(delimiter: string) {
+  return [rainbowPlugin(delimiter)];
+}
 
-const rainbowCsv = [rainbowPlugin(), rainbowTheme];
+function createSyntaxTheme(theme: EditorColorTheme) {
+  const colors = EDITOR_SYNTAX_PALETTES[theme];
+  return EditorView.theme({
+    ".q-hl-comment": { color: colors.generic.comment, fontStyle: "italic" },
+    ".q-hl-string": { color: colors.generic.string },
+    ".q-hl-number": { color: colors.generic.number },
+    ".q-hl-keyword": { color: colors.generic.keyword },
+    ".q-hl-key": { color: colors.generic.key },
+    ".q-sql-comment": { color: colors.sql.comment, fontStyle: "italic" },
+    ".q-sql-string": { color: colors.sql.string },
+    ".q-sql-ident": { color: colors.sql.ident },
+    ".q-sql-number": { color: colors.sql.number },
+    ".q-sql-keyword": { color: colors.sql.keyword },
+    ...Object.fromEntries(colors.csv.map((color, index) => [`.q-csv-col-${index}`, { color }])),
+  });
+}
+
+const syntaxThemes = {
+  dark: createSyntaxTheme("dark"),
+  light: createSyntaxTheme("light"),
+};
+
+/** Token colors live in the editor theme compartment, not the language one. */
+export function syntaxThemeFor(theme: string) {
+  return theme === "light" ? syntaxThemes.light : syntaxThemes.dark;
+}
 
 // ---------------------------------------------------------------------------
 // Dispatch
@@ -262,13 +372,18 @@ function extOf(path: string): string {
   return dot > slash ? base.slice(dot + 1).toLowerCase() : "";
 }
 
-/** Returns the highlight extension(s) for a file by detected type and path. */
-export function highlightFor(detected: string, path: string) {
+/** Returns fresh highlight extension(s) for one file and its confirmed dialect. */
+export function highlightFor(detected: string, path: string, csvDelimiter = "") {
   const d = (detected || "").toLowerCase();
   const ext = extOf(path);
-  if (d === "csv" || d === "tsv" || ext === "csv" || ext === "tsv") return rainbowCsv;
+  if (d === "csv" || d === "tsv" || ext === "csv" || ext === "tsv") {
+    const delimiter = Array.from(csvDelimiter).length === 1
+      ? csvDelimiter
+      : (d === "tsv" || ext === "tsv" ? "\t" : "");
+    return rainbowCsv(delimiter);
+  }
   if (d === "sql" || ext === "sql") return sqlHighlight;
   const key = EXT_TO_PROFILE[ext];
-  if (key && PROFILES[key]) return [genericPlugin(PROFILES[key]), genericTheme];
+  if (key && PROFILES[key]) return [genericPlugin(PROFILES[key])];
   return [];
 }

@@ -4,25 +4,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 
 	"github.com/quarry/quarry-wails3/internal/fileio"
+	"github.com/quarry/quarry-wails3/internal/regularfile"
 	"github.com/quarry/quarry-wails3/internal/units"
 )
 
 const (
 	keyCacheMaxBytes         = "settings.cache_max_bytes"
 	keySmallAutoLoadBytes    = "settings.small_auto_load_bytes"
-	keyEditableWindowBytes   = "settings.editable_window_bytes"
 	keySearchChunkSize       = "settings.search_chunk_size"
 	keyReplaceChunkSize      = "settings.replace_chunk_size"
 	keyRegexMatchWindow      = "settings.regex_match_window"
 	keyPersistIndexCache     = "settings.persist_index_cache"
 	keyDeletePartialOnCancel = "settings.delete_partial_on_cancel"
-	keySwapOriginalByDefault = "settings.swap_original_by_default"
 	keyMaxVisualLineBytes    = "settings.max_visual_line_bytes"
 	keyEditorFontSize        = "settings.editor_font_size"
 	keyShowLineNumbers       = "settings.show_line_numbers"
@@ -65,6 +64,26 @@ const (
 	ConfigDirName    = ".quarry"
 	SettingsFileName = "settings.json"
 	MaxRecentFiles   = 12
+	maxSettingsBytes = 256 * 1024
+)
+
+type byteSettingLimit struct {
+	minimum int64
+	maximum int64
+}
+
+var (
+	cacheMaxLimit      = byteSettingLimit{minimum: 1 * 1024 * 1024, maximum: 512 * 1024 * 1024}
+	smallAutoLoadLimit = byteSettingLimit{minimum: 64 * 1024, maximum: 64 * 1024 * 1024}
+	searchChunkLimit   = byteSettingLimit{minimum: 64 * 1024, maximum: 64 * 1024 * 1024}
+	replaceChunkLimit  = byteSettingLimit{minimum: 64 * 1024, maximum: 64 * 1024 * 1024}
+	regexWindowLimit   = byteSettingLimit{minimum: 4 * 1024, maximum: 16 * 1024 * 1024}
+	visualLineLimit    = byteSettingLimit{minimum: 256, maximum: 1 * 1024 * 1024}
+)
+
+const (
+	minEditorFontSize = 8
+	maxEditorFontSize = 72
 )
 
 type Store interface {
@@ -77,13 +96,11 @@ type Store interface {
 type AppSettings struct {
 	CacheMaxBytes         string   `json:"cacheMaxBytes"`
 	SmallAutoLoadBytes    string   `json:"smallAutoLoadBytes"`
-	EditableWindowBytes   string   `json:"editableWindowBytes"`
 	SearchChunkSize       string   `json:"searchChunkSize"`
 	ReplaceChunkSize      string   `json:"replaceChunkSize"`
 	RegexMatchWindow      string   `json:"regexMatchWindow"`
 	PersistIndexCache     bool     `json:"persistIndexCache"`
 	DeletePartialOnCancel bool     `json:"deletePartialOnCancel"`
-	SwapOriginalByDefault bool     `json:"swapOriginalByDefault"`
 	MaxVisualLineBytes    string   `json:"maxVisualLineBytes"`
 	EditorFontSize        string   `json:"editorFontSize"`
 	ShowLineNumbers       bool     `json:"showLineNumbers"`
@@ -115,13 +132,11 @@ func Defaults() AppSettings {
 	return AppSettings{
 		CacheMaxBytes:         "8 MiB",
 		SmallAutoLoadBytes:    "8 MiB",
-		EditableWindowBytes:   "500 MiB",
 		SearchChunkSize:       "4 MiB",
 		ReplaceChunkSize:      "16 MiB",
 		RegexMatchWindow:      "1 MiB",
 		PersistIndexCache:     true,
 		DeletePartialOnCancel: true,
-		SwapOriginalByDefault: false,
 		MaxVisualLineBytes:    "4 KiB",
 		EditorFontSize:        "13",
 		ShowLineNumbers:       true,
@@ -157,13 +172,11 @@ func Load(store Store) AppSettings {
 	loaded := AppSettings{
 		CacheMaxBytes:         store.StringWithFallback(keyCacheMaxBytes, def.CacheMaxBytes),
 		SmallAutoLoadBytes:    store.StringWithFallback(keySmallAutoLoadBytes, def.SmallAutoLoadBytes),
-		EditableWindowBytes:   store.StringWithFallback(keyEditableWindowBytes, def.EditableWindowBytes),
 		SearchChunkSize:       store.StringWithFallback(keySearchChunkSize, def.SearchChunkSize),
 		ReplaceChunkSize:      store.StringWithFallback(keyReplaceChunkSize, def.ReplaceChunkSize),
 		RegexMatchWindow:      store.StringWithFallback(keyRegexMatchWindow, def.RegexMatchWindow),
 		PersistIndexCache:     store.BoolWithFallback(keyPersistIndexCache, def.PersistIndexCache),
 		DeletePartialOnCancel: store.BoolWithFallback(keyDeletePartialOnCancel, def.DeletePartialOnCancel),
-		SwapOriginalByDefault: store.BoolWithFallback(keySwapOriginalByDefault, def.SwapOriginalByDefault),
 		MaxVisualLineBytes:    store.StringWithFallback(keyMaxVisualLineBytes, def.MaxVisualLineBytes),
 		EditorFontSize:        store.StringWithFallback(keyEditorFontSize, def.EditorFontSize),
 		ShowLineNumbers:       store.BoolWithFallback(keyShowLineNumbers, def.ShowLineNumbers),
@@ -215,17 +228,20 @@ func NormalizeShowBottomPanel(value bool) bool {
 }
 
 func ConfigDir() (string, error) {
-	if override := strings.TrimSpace(os.Getenv(ConfigDirEnv)); override != "" {
-		return filepath.Clean(override), nil
+	if override := os.Getenv(ConfigDirEnv); override != "" {
+		if err := fileio.ValidateExactDirectoryPath(override); err != nil {
+			return "", fmt.Errorf("invalid %s: %w", ConfigDirEnv, err)
+		}
+		return override, nil
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	if strings.TrimSpace(home) == "" {
+	if home == "" {
 		return "", errors.New("user home directory is empty")
 	}
-	return filepath.Join(home, ConfigDirName), nil
+	return fileio.ExactChildPath(home, ConfigDirName)
 }
 
 func SettingsPath() (string, error) {
@@ -233,16 +249,27 @@ func SettingsPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, SettingsFileName), nil
+	return fileio.ExactChildPath(dir, SettingsFileName)
 }
 
 func LoadFile(path string) (AppSettings, error) {
-	if strings.TrimSpace(path) == "" {
+	if path == "" {
 		return AppSettings{}, errors.New("settings path is empty")
 	}
-	data, err := os.ReadFile(path)
+	if err := fileio.RequireAtomicWriteReadReady(path); err != nil {
+		return AppSettings{}, fmt.Errorf("prepare settings for read: %w", err)
+	}
+	file, err := regularfile.Open(path)
 	if err != nil {
 		return AppSettings{}, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(file, maxSettingsBytes+1))
+	closeErr := file.Close()
+	if readErr != nil || closeErr != nil {
+		return AppSettings{}, errors.Join(readErr, closeErr)
+	}
+	if len(data) > maxSettingsBytes {
+		return AppSettings{}, fmt.Errorf("settings file exceeds the %d-byte limit", maxSettingsBytes)
 	}
 	cfg := Defaults()
 	if err := json.Unmarshal(data, &cfg); err != nil {
@@ -265,6 +292,12 @@ func LoadPersistent(store Store) (AppSettings, error) {
 	if errors.Is(err, os.ErrNotExist) {
 		return Load(store), nil
 	}
+	if errors.Is(err, fileio.ErrAtomicReadRecoveryPending) {
+		// A journal means "missing" may be only an interrupted namespace
+		// transition. Do not substitute legacy preferences for a recoverable or
+		// ambiguous settings generation.
+		return AppSettings{}, err
+	}
 	return Load(store), err
 }
 
@@ -278,13 +311,11 @@ func (s AppSettings) Save(store Store) error {
 	}
 	store.SetString(keyCacheMaxBytes, s.CacheMaxBytes)
 	store.SetString(keySmallAutoLoadBytes, s.SmallAutoLoadBytes)
-	store.SetString(keyEditableWindowBytes, s.EditableWindowBytes)
 	store.SetString(keySearchChunkSize, s.SearchChunkSize)
 	store.SetString(keyReplaceChunkSize, s.ReplaceChunkSize)
 	store.SetString(keyRegexMatchWindow, s.RegexMatchWindow)
 	store.SetBool(keyPersistIndexCache, s.PersistIndexCache)
 	store.SetBool(keyDeletePartialOnCancel, s.DeletePartialOnCancel)
-	store.SetBool(keySwapOriginalByDefault, s.SwapOriginalByDefault)
 	store.SetString(keyMaxVisualLineBytes, s.MaxVisualLineBytes)
 	store.SetString(keyEditorFontSize, s.EditorFontSize)
 	store.SetBool(keyShowLineNumbers, s.ShowLineNumbers)
@@ -313,8 +344,11 @@ func (s AppSettings) Save(store Store) error {
 }
 
 func (s AppSettings) SaveFile(path string) error {
-	if strings.TrimSpace(path) == "" {
+	if path == "" {
 		return errors.New("settings path is empty")
+	}
+	if err := fileio.ValidateExactOutputPath(path); err != nil {
+		return err
 	}
 	s = s.withSupportedWorkspaceFeatures()
 	if err := s.Validate(); err != nil {
@@ -325,7 +359,11 @@ func (s AppSettings) SaveFile(path string) error {
 		return err
 	}
 	data = append(data, '\n')
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir, _ := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	_, err = fileio.WriteFileAtomic(path, data, fileio.AtomicWriteOptions{
@@ -357,24 +395,21 @@ func (s AppSettings) SavePersistent(store Store) error {
 }
 
 func (s AppSettings) Validate() error {
-	if _, err := units.ParseByteSize(s.CacheMaxBytes); err != nil {
+	if _, err := parseBoundedByteSize(s.CacheMaxBytes, cacheMaxLimit, architectureMaxInt()); err != nil {
 		return fmt.Errorf("invalid cache memory setting: %w", err)
 	}
-	if _, err := units.ParseByteSize(s.SmallAutoLoadBytes); err != nil {
+	if _, err := parseBoundedByteSize(s.SmallAutoLoadBytes, smallAutoLoadLimit, architectureMaxInt()); err != nil {
 		return fmt.Errorf("invalid small auto-load size: %w", err)
 	}
-	if _, err := units.ParseByteSize(s.EditableWindowBytes); err != nil {
-		return fmt.Errorf("invalid editable window size: %w", err)
-	}
-	searchBytes, err := units.ParseByteSize(s.SearchChunkSize)
+	searchBytes, err := parseBoundedByteSize(s.SearchChunkSize, searchChunkLimit, architectureMaxInt())
 	if err != nil {
 		return fmt.Errorf("invalid search chunk size: %w", err)
 	}
-	replaceBytes, err := units.ParseByteSize(s.ReplaceChunkSize)
+	replaceBytes, err := parseBoundedByteSize(s.ReplaceChunkSize, replaceChunkLimit, architectureMaxInt())
 	if err != nil {
 		return fmt.Errorf("invalid replace chunk size: %w", err)
 	}
-	regexBytes, err := units.ParseByteSize(s.RegexMatchWindow)
+	regexBytes, err := parseBoundedByteSize(s.RegexMatchWindow, regexWindowLimit, architectureMaxInt())
 	if err != nil {
 		return fmt.Errorf("invalid regex match window: %w", err)
 	}
@@ -384,11 +419,14 @@ func (s AppSettings) Validate() error {
 	if regexBytes > searchBytes {
 		return fmt.Errorf("regex match window must be less than or equal to search chunk size")
 	}
-	if _, err := units.ParseByteSize(s.MaxVisualLineBytes); err != nil {
+	if !checkedWindowAllocation(searchBytes, regexBytes, architectureMaxInt()) || !checkedWindowAllocation(replaceBytes, regexBytes, architectureMaxInt()) {
+		return fmt.Errorf("chunk and regex window combination exceeds the supported address space")
+	}
+	if _, err := parseBoundedByteSize(s.MaxVisualLineBytes, visualLineLimit, architectureMaxInt()); err != nil {
 		return fmt.Errorf("invalid max visual line size: %w", err)
 	}
 	fontSize, err := strconv.Atoi(s.EditorFontSize)
-	if err != nil || fontSize <= 0 {
+	if err != nil || fontSize < minEditorFontSize || fontSize > maxEditorFontSize {
 		return fmt.Errorf("invalid editor font size")
 	}
 	switch s.ActiveBottomPanel {
@@ -410,17 +448,12 @@ func (s AppSettings) Validate() error {
 }
 
 func (s AppSettings) WithRecentFile(path string) AppSettings {
-	clean := strings.TrimSpace(path)
-	if clean == "" {
+	if path == "" {
 		return s
 	}
-	if absPath, err := filepath.Abs(clean); err == nil {
-		clean = absPath
-	}
-	clean = filepath.Clean(clean)
 
 	next := s
-	next.RecentFiles = prependRecentFile(clean, next.RecentFiles)
+	next.RecentFiles = prependRecentFile(path, next.RecentFiles)
 	return next
 }
 
@@ -432,43 +465,38 @@ func (s AppSettings) WithoutRecentFiles() AppSettings {
 
 func (s AppSettings) MustCacheMaxBytes() int {
 	def := Defaults()
-	return parseSizeOrDefault(s.CacheMaxBytes, def.CacheMaxBytes)
-}
-
-func (s AppSettings) MustEditableWindowBytes() int {
-	def := Defaults()
-	return parseSizeOrDefault(s.EditableWindowBytes, def.EditableWindowBytes)
+	return parseSizeOrDefault(s.CacheMaxBytes, def.CacheMaxBytes, cacheMaxLimit)
 }
 
 func (s AppSettings) MustSmallAutoLoadBytes() int {
 	def := Defaults()
-	return parseSizeOrDefault(s.SmallAutoLoadBytes, def.SmallAutoLoadBytes)
+	return parseSizeOrDefault(s.SmallAutoLoadBytes, def.SmallAutoLoadBytes, smallAutoLoadLimit)
 }
 
 func (s AppSettings) MustSearchChunkBytes() int {
 	def := Defaults()
-	return parseSizeOrDefault(s.SearchChunkSize, def.SearchChunkSize)
+	return parseSizeOrDefault(s.SearchChunkSize, def.SearchChunkSize, searchChunkLimit)
 }
 
 func (s AppSettings) MustReplaceChunkBytes() int {
 	def := Defaults()
-	return parseSizeOrDefault(s.ReplaceChunkSize, def.ReplaceChunkSize)
+	return parseSizeOrDefault(s.ReplaceChunkSize, def.ReplaceChunkSize, replaceChunkLimit)
 }
 
 func (s AppSettings) MustRegexMatchWindowBytes() int {
 	def := Defaults()
-	return parseSizeOrDefault(s.RegexMatchWindow, def.RegexMatchWindow)
+	return parseSizeOrDefault(s.RegexMatchWindow, def.RegexMatchWindow, regexWindowLimit)
 }
 
 func (s AppSettings) MustMaxVisualLineBytes() int {
 	def := Defaults()
-	return parseSizeOrDefault(s.MaxVisualLineBytes, def.MaxVisualLineBytes)
+	return parseSizeOrDefault(s.MaxVisualLineBytes, def.MaxVisualLineBytes, visualLineLimit)
 }
 
 func (s AppSettings) MustEditorFontSize() int {
 	def := Defaults()
 	size, err := strconv.Atoi(s.EditorFontSize)
-	if err != nil || size <= 0 {
+	if err != nil || size < minEditorFontSize || size > maxEditorFontSize {
 		fallback, fallbackErr := strconv.Atoi(def.EditorFontSize)
 		if fallbackErr != nil || fallback <= 0 {
 			return 13
@@ -478,30 +506,29 @@ func (s AppSettings) MustEditorFontSize() int {
 	return size
 }
 
-func parseSizeOrDefault(input string, fallback string) int {
-	size, err := units.ParseByteSize(input)
-	if err != nil || size <= 0 {
-		fallbackSize, fallbackErr := units.ParseByteSize(fallback)
-		if fallbackErr != nil || fallbackSize <= 0 {
-			return 1
-		}
-		return int(fallbackSize)
+func parseSizeOrDefault(input string, fallback string, limit byteSettingLimit) int {
+	size, err := parseBoundedByteSize(input, limit, architectureMaxInt())
+	if err == nil {
+		return int(size)
 	}
-	return int(size)
+	fallbackSize, fallbackErr := parseBoundedByteSize(fallback, limit, architectureMaxInt())
+	if fallbackErr != nil {
+		return int(limit.minimum)
+	}
+	return int(fallbackSize)
 }
 
 func (s AppSettings) sanitized() AppSettings {
 	def := Defaults()
 	clean := s
 	clean = clean.withSupportedWorkspaceFeatures()
-	clean.CacheMaxBytes = sanitizeByteSize(clean.CacheMaxBytes, def.CacheMaxBytes)
-	clean.SmallAutoLoadBytes = sanitizeByteSize(clean.SmallAutoLoadBytes, def.SmallAutoLoadBytes)
-	clean.EditableWindowBytes = sanitizeByteSize(clean.EditableWindowBytes, def.EditableWindowBytes)
-	clean.SearchChunkSize = sanitizeByteSize(clean.SearchChunkSize, def.SearchChunkSize)
-	clean.ReplaceChunkSize = sanitizeByteSize(clean.ReplaceChunkSize, def.ReplaceChunkSize)
-	clean.RegexMatchWindow = sanitizeByteSize(clean.RegexMatchWindow, def.RegexMatchWindow)
-	clean.MaxVisualLineBytes = sanitizeByteSize(clean.MaxVisualLineBytes, def.MaxVisualLineBytes)
-	clean.EditorFontSize = sanitizePositiveInt(clean.EditorFontSize, def.EditorFontSize)
+	clean.CacheMaxBytes = sanitizeByteSize(clean.CacheMaxBytes, def.CacheMaxBytes, cacheMaxLimit)
+	clean.SmallAutoLoadBytes = sanitizeByteSize(clean.SmallAutoLoadBytes, def.SmallAutoLoadBytes, smallAutoLoadLimit)
+	clean.SearchChunkSize = sanitizeByteSize(clean.SearchChunkSize, def.SearchChunkSize, searchChunkLimit)
+	clean.ReplaceChunkSize = sanitizeByteSize(clean.ReplaceChunkSize, def.ReplaceChunkSize, replaceChunkLimit)
+	clean.RegexMatchWindow = sanitizeByteSize(clean.RegexMatchWindow, def.RegexMatchWindow, regexWindowLimit)
+	clean.MaxVisualLineBytes = sanitizeByteSize(clean.MaxVisualLineBytes, def.MaxVisualLineBytes, visualLineLimit)
+	clean.EditorFontSize = sanitizeBoundedInt(clean.EditorFontSize, def.EditorFontSize, minEditorFontSize, maxEditorFontSize)
 	if !isAllowedValue(clean.ActiveBottomPanel, "", "Results", "Bookmarks", "SQL", "Activity") {
 		clean.ActiveBottomPanel = def.ActiveBottomPanel
 	}
@@ -517,9 +544,20 @@ func (s AppSettings) sanitized() AppSettings {
 	replaceBytes := clean.MustReplaceChunkBytes()
 	regexBytes := clean.MustRegexMatchWindowBytes()
 	if regexBytes > searchBytes || regexBytes > replaceBytes {
-		clean.RegexMatchWindow = def.RegexMatchWindow
+		allowed := minInt(searchBytes, replaceBytes)
+		defaultRegex := def.MustRegexMatchWindowBytes()
+		if allowed >= defaultRegex {
+			clean.RegexMatchWindow = def.RegexMatchWindow
+		} else {
+			clean.RegexMatchWindow = strconv.FormatInt(int64(allowed), 10) + " B"
+		}
 	}
 
+	if err := clean.Validate(); err != nil {
+		safe := def.withSupportedWorkspaceFeatures()
+		safe.RecentFiles = clean.RecentFiles
+		return safe
+	}
 	return clean
 }
 
@@ -532,14 +570,9 @@ func (s AppSettings) withSupportedWorkspaceFeatures() AppSettings {
 func sanitizeRecentFiles(paths []string) []string {
 	out := make([]string, 0, len(paths))
 	for _, path := range paths {
-		path = strings.TrimSpace(path)
 		if path == "" {
 			continue
 		}
-		if absPath, err := filepath.Abs(path); err == nil {
-			path = absPath
-		}
-		path = filepath.Clean(path)
 		if containsPath(out, path) {
 			continue
 		}
@@ -571,26 +604,62 @@ func prependRecentFile(path string, existing []string) []string {
 
 func containsPath(paths []string, candidate string) bool {
 	for _, path := range paths {
-		if strings.EqualFold(filepath.Clean(path), filepath.Clean(candidate)) {
+		if path == candidate {
+			return true
+		}
+		same, err := fileio.SamePath(path, candidate)
+		if err == nil && same {
 			return true
 		}
 	}
 	return false
 }
 
-func sanitizeByteSize(value string, fallback string) string {
-	if size, err := units.ParseByteSize(value); err == nil && size > 0 {
+func sanitizeByteSize(value string, fallback string, limit byteSettingLimit) string {
+	if _, err := parseBoundedByteSize(value, limit, architectureMaxInt()); err == nil {
 		return value
 	}
 	return fallback
 }
 
-func sanitizePositiveInt(value string, fallback string) string {
+func sanitizeBoundedInt(value string, fallback string, minimum int, maximum int) string {
 	size, err := strconv.Atoi(value)
-	if err == nil && size > 0 {
+	if err == nil && size >= minimum && size <= maximum {
 		return value
 	}
 	return fallback
+}
+
+func parseBoundedByteSize(value string, limit byteSettingLimit, maxInt int64) (int64, error) {
+	size, err := units.ParseByteSize(value)
+	if err != nil {
+		return 0, err
+	}
+	if size < limit.minimum || size > limit.maximum {
+		return 0, fmt.Errorf("value must be between %d and %d bytes", limit.minimum, limit.maximum)
+	}
+	if size > maxInt {
+		return 0, errors.New("value exceeds the supported architecture's integer range")
+	}
+	return size, nil
+}
+
+func checkedWindowAllocation(chunk int64, overlap int64, maxInt int64) bool {
+	if chunk < 0 || overlap < 0 || chunk > maxInt {
+		return false
+	}
+	return overlap <= (maxInt-chunk)/2
+}
+
+func architectureMaxInt() int64 {
+	return int64(^uint(0) >> 1)
+}
+
+func minInt(a int, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func isAllowedValue(value string, allowed ...string) bool {

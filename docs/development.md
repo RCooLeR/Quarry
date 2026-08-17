@@ -8,13 +8,13 @@
 ├── fileservice.go           # FileService: open/close, windows, search
 ├── fileservice_csv.go       # CSV tools (inspect/schema/convert/transform/export)
 ├── fileservice_sql.go       # SQL tools (analyze/extract/reshape/schemadiff/…)
-├── fileservice_edit.go      # staging, patch-in-place, save-copy
+├── fileservice_edit.go      # staging, save-copy, in-place containment boundary
 ├── fileservice_hex.go       # hex window
 ├── jobs.go                  # cancellable background-job manager
 ├── build/                   # Wails build config + per-OS Taskfiles + icons
 ├── internal/                # the streaming engine (no UI deps)
 │   ├── document/ lineindex/ # windowed reads, chunk cache, sparse line index
-│   ├── editwindow/ manualedit/ inplace/   # staged edits + in-place patching
+│   ├── editwindow/ manualedit/ inplace/   # staged edits + dormant transaction primitive
 │   ├── search/ replace/ regexutil/        # streaming, encoding-aware matching
 │   ├── exportx/ fileio/                    # byte-range export, atomic writes
 │   ├── encodingx/ asciifold/               # encodings, BOM, case-folding
@@ -31,56 +31,133 @@
         └── editor/          # QuarryEditor.ts + highlight profiles
 ```
 
-Module: `github.com/quarry/quarry-wails3` (Go 1.26). Stack: Wails v3 (alpha2),
-React + TypeScript + Vite, CodeMirror 6. The frontend package is
-`quarry-frontend`.
+Module: `github.com/quarry/quarry-wails3` (Go 1.26.6). Stack: Wails v3
+`v3.0.0-alpha2.106` with its matching published frontend runtime
+`3.0.0-alpha.94`, React + TypeScript + Vite, and CodeMirror 6. The frontend
+package is `quarry-frontend`.
 
 ## Build & test
 
 ```sh
 task dev            # hot-reload dev (or: wails3 dev)
-task build          # production build → bin/quarry.exe
-go test ./...       # engine + plugin + binding tests
-cd frontend && npm run build   # type-check + bundle the UI
+task build                    # optimized local build; not release-qualified
+wails3 task frontend:check    # bindings + locked UI tests/type-check/build
+go test ./...                 # full module; requires the generated dist above
+go test ./internal/...        # engine/plugin tests; no frontend prerequisite
 ```
 
-The root Taskfile also exposes server and Docker targets for non-GUI builds:
+For the full local merge gate, run:
 
 ```sh
-task build:server   # server-mode binary, no native GUI
-task run:server
-task setup:docker   # build the cross-compilation image
-task build:docker   # container image for server mode
-task run:docker
+task verify
+task verify:race
 ```
 
-Set `PACKAGE_MANAGER` to use `npm`, `pnpm`, `yarn`, or `bun` for frontend tasks.
-Set `WAILS_VITE_PORT` when the default dev port (`9245`) is already occupied.
+The first command creates the ignored frontend bundle before whole-module Go
+commands, then verifies module and lockfile immutability, default and
+production-tag Go tests, frontend tests/type-check/bundle budgets, vet,
+staticcheck `v0.7.0`, govulncheck `v1.7.0`, npm audit, actionlint `v1.7.12`, and
+GoReleaser `v2.17.1` containment. The second command is separate because the
+race suite is materially slower. Scanner versions are pinned in `Taskfile.yml`;
+CI additionally fixes Go 1.26.6, Node 24.19.0, npm 11.17.0, Wails CLI
+`v3.0.0-alpha2.106`, runner generations, and every GitHub Action to a full
+commit SHA.
+
+To prove clean-checkout behavior, use a new clone rather than deleting files
+from a working tree. Install only the documented toolchain, then run
+`task verify`, `task verify:race`, and `task build`. The final
+`git status --porcelain --untracked-files=all` must be empty; generated
+bindings, bundles, platform resources, and binaries must remain ignored build
+outputs. CI performs this check independently on the Windows and Linux
+candidate targets.
+
+Quarry does not ship a network server or server container. The registered
+`FileService` is a desktop-local capability surface and is not authenticated or
+confined for remote use. Builds made manually with the Wails `server` tag exit
+before starting the runtime. `task setup:docker` remains available only for the
+desktop cross-OS image. Linux builds through that image are same-architecture
+only: native GTK/WebKit libraries and GCC cannot safely serve another `GOARCH`.
+
+The desktop bridge uses Quarry's bounded HTTP guard ahead of Wails. Keep the Go
+and npm Wails versions paired: the frontend runtime's 512 KiB chunk protocol is
+part of this contract. The guard owns chunk storage/assembly, caps ordinary and
+chunked input plus aggregate pending/concurrent state, and admits only generated
+service calls and cancellation. Do not bypass it by installing Wails'
+`HTTPTransport` directly in `main.go`; any new runtime object must be reviewed
+and added to the guard's frontend-surface contract test.
+
+The frontend dependency graph is intentionally npm-only and pinned by
+`package-lock.json` and npm `11.17.0`; alternate package managers are not supported. Set
+`WAILS_VITE_PORT` when the default dev port (`9245`) is already occupied.
+
+The production frontend build enforces the startup and total JavaScript budgets
+in `frontend/scripts/check-bundle-budget.mjs`. Optional workbench views must
+remain lazy-loaded: the module entry is capped at 280 KiB uncompressed and
+90 KiB gzip; the complete initial module graph, including module preloads, is
+capped at 320 KiB uncompressed and 110 KiB gzip. The initial stylesheet is
+capped at 64 KiB, every JavaScript chunk at 320 KiB, and all JavaScript chunks
+together at 700 KiB. Change a budget only with a reviewed bundle analysis and
+an explanation of the startup impact.
+
+Android and iOS are not supported release targets and are intentionally absent
+from the root task inventory. Their generated platform Taskfiles support only
+local debug/emulator development: explicit production requests are rejected,
+package/release/deploy tasks exit before dependencies or output work, and the
+Android Gradle release variant is disabled so a direct `assembleRelease` or
+`bundleRelease` invocation cannot fall back to debug signing. The remaining
+mobile scaffolding is not approved for distribution.
 
 ## CI & releases
 
-GitHub Actions runs the desktop build on Windows, macOS, and Linux. Linux uses
-Ubuntu 24.04 plus GTK/WebKit development packages so the native Wails build has
-the same libraries that the Linux package metadata declares.
+GitHub Actions runs the desktop build on Windows and Linux. Linux uses Ubuntu
+24.04 plus GTK/WebKit development packages so the native Wails build has the
+same libraries that the Linux package metadata declares. macOS is excluded from
+the verification and candidate matrices because `fileio.OpenAtomicOutput`
+currently fails closed there; a compiled app would not support Quarry's
+artifact-producing workflows.
 
-Releases are tag-driven:
+Both branch CI and release-candidate validation call the same reusable
+verification workflow. The caller supplies one full commit ID; every candidate
+platform checks out that ID, verifies it did not change, runs the test/build
+gates, and emits a verification record containing the commit, tree, commit
+date, exact tool versions, and dependency-input hashes.
+
+Release-candidate validation is tag-driven:
 
 ```sh
 git tag -a v0.0.1 -m "Quarry v0.0.1"
 git push origin v0.0.1
 ```
 
-The release workflow builds native Wails artifacts on each OS runner, downloads
-them into `release-artifacts/`, writes `SHA256SUMS.txt`, and then uses
-GoReleaser to create the GitHub release and upload the artifacts. The
-GoReleaser config intentionally skips its own Go build step because Wails
-desktop artifacts need platform-native packaging rather than a plain
-cross-compiled binary.
+The release helper accepts only a canonical, annotated `v` semantic-version
+tag in a clean checkout. It dereferences and records the tag object, commit,
+tree, commit timestamp, version, and numeric workflow build number, and fails
+if the tag does not point at checked-out `HEAD`. Candidate jobs start only after
+the reusable verification succeeds for that exact commit, then check out the
+recorded commit rather than a moving ref.
 
-`bin/`, `frontend/dist/`, `frontend/node_modules/`, and `frontend/bindings/` are
-gitignored, as are GoReleaser's local `dist/` and `release-artifacts/` scratch
-directories. `wails_windows_amd64.syso` (the Windows icon resource) **is**
-committed so `go build` embeds the icon without a separate generate step.
+The workflow builds native Wails artifacts on the Windows and Linux runners and
+retains them for seven days as unqualified, non-release CI evidence. Sidecar
+SHA-256 files are useful for transfer-integrity diagnosis but are not
+authenticated publisher proof.
+Separate provenance and verification JSON records are retained for 30 days.
+The workflow deliberately cannot create a public GitHub release. Publication
+remains disabled until the repository has an approved license, candidate
+signing and platform verification, authenticated checksums or attestations, and
+packaged-app data-safety tests on clean supported machines.
+
+Linux candidate archives normalize ordering, ownership, timestamps, and gzip
+headers from the tagged commit timestamp. Native OS toolchains and the current
+unsigned Windows and Linux candidates are not yet claimed to be bit-for-bit
+reproducible. The digest-pinned cross-OS container is developer infrastructure,
+not a substitute for native signed release qualification. Its Linux path
+requires the requested CPU architecture to match the host/image architecture.
+
+`bin/`, `.task/`, `frontend/dist/`, `frontend/node_modules/`, generated Windows
+`.syso` resources, and `frontend/bindings/` are gitignored, as are GoReleaser's
+local `dist/` and `release-artifacts/` scratch directories. Platform tasks
+generate versioned resources from tracked templates without rewriting those
+templates.
 
 ## Regenerating bindings
 
@@ -89,12 +166,14 @@ The TypeScript client in `frontend/bindings/` is generated from the Go
 it returns:
 
 ```sh
-wails3 generate bindings
+wails3 generate bindings -ts -i
 ```
 
 Then import the regenerated client from the frontend (e.g.
 `FileService.SqlSchemaDiff(...)`). Because the directory is gitignored, anyone
-building from a clean checkout runs this once before the first frontend build.
+building from a clean checkout runs this once before a direct frontend build.
+Standard Wails/Task builds generate bindings automatically before frontend tests
+and bundling.
 
 ## Updating build metadata
 
@@ -114,32 +193,45 @@ A tool is usually four small steps:
 
 1. **Engine** — add the streaming function to the right plugin package
    (`internal/plugins/csv` or `internal/plugins/sql/...`). Read with
-   `document`/`os`, honor the passed `context` for cancellation, and write to a
-   **new** file via a temp path + atomic rename (see `tempOutputPath` and
-   `rowTransform` in `internal/plugins/csv/transform.go` for the pattern). Add a
-   unit test.
+   `document`/`os`, honor the passed `context` for cancellation, reject aliases
+   of every open source before prompting, and publish a **new**, no-clobber file
+   with `fileio.OpenAtomicOutput` plus `CommitContext` and an explicit
+   confidentiality-preserving mode (default `0600` unless deliberately
+   preserving source access). Join cleanup errors instead of
+   deleting a pathname by name. Add no-clobber, cancellation, short-read, mode,
+   alias, and publication-race tests. Never replace the service job context with
+   `context.Background()` before commit: its context-carried publication
+   boundary linearizes the final filesystem publication with cancellation.
+   Multi-output engines must return an explicit partial-publication summary if
+   any later output fails after an earlier one became visible.
 2. **Binding** — add a `FileService` method in the relevant `fileservice_*.go`.
-   For a long-running transform, wrap the work in `s.withJob(title, fn)` so it
-   gets cancellation + a progress toast; prompt for the output path with
-   `saveDialog` before starting the job.
-3. **Bindings** — run `wails3 generate bindings`.
+   Run long work through `runServiceJob` (or the `s.withFileJob` transform
+   adapter), acquire document leases inside its callback with the passed
+   context, and propagate that context through the engine and atomic commit.
+   Prompt for the output path with `saveDialog` before registering the job, so a
+   cancelled dialog never occupies the global job slot. Once any atomic output
+   is published, user/lifecycle cancellation is intentionally stale; allow the
+   callback to finish and preserve its success or partial-failure evidence.
+3. **Bindings** — run `wails3 generate bindings -ts -i`.
 4. **UI** — add a control in `Tools.tsx` (CSV or SQL branch) that calls the new
    method through the generated client and reports the result.
 
 ## Testing conventions
 
 - Pure engine logic (parsers, transforms, the analyzer, exporters) is covered by
-  Go unit tests next to the code (`*_test.go`). Exporters round-trip their output
-  (re-query the SQLite DB, re-open the xlsx) rather than asserting on bytes.
+  Go unit tests next to the code (`*_test.go`). Exporters verify complete output,
+  no-clobber publication, cancellation, and cleanup rather than only asserting on
+  byte fragments.
 - Prefer table/streaming tests with small fixtures written to `t.TempDir()`.
-- The frontend is validated by `tsc` (no emit) and the Vite production build;
-  there is no browser test harness.
+- The frontend is validated by Vitest, `tsc` (no emit), the Vite production
+  build, and focused in-browser smoke checks.
 
 ## Notes & gotchas
 
-- **Source is never silently modified.** Every transform/export writes a new
-  file. Only *patch in place* touches the original, only for length-preserving
-  edits, and only after writing a backup.
+- **Source is never silently modified** is a required invariant. In-place save
+  remains disabled until it has a durable, verified user-restorable backup and
+  explicit recovery workflow; remaining writers must migrate to the shared
+  output transaction tracked in `col-review/` before release.
 - **Windowed everything.** When adding a feature, reach for `ReadRange` /
   sampling / streaming — never read `Size()` bytes into memory.
 - **Encoding.** Search and replace operate on raw bytes; the query is encoded
@@ -150,7 +242,6 @@ A tool is usually four small steps:
 - **Always build the GUI exe with `task build` / `wails3 build`**, not a bare
   `go build`. The production task links with `-ldflags="-H windowsgui"`, which
   sets the Windows GUI subsystem; a plain `go build` produces a *console*
-  subsystem binary that pops an extra terminal window next to the app. (`task
-  build` regenerates `wails_windows_amd64.syso` for the icon and deletes it
-  afterward; the committed copy is what lets a bare `go build` still embed the
-  icon — don't commit its deletion.)
+  subsystem binary that pops an extra terminal window next to the app. The task
+  generates an ignored, versioned `.syso` resource from the tracked icon,
+  manifest, and metadata templates and removes only that exact generated file.

@@ -3,9 +3,11 @@ package document
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -14,23 +16,38 @@ import (
 	"unicode/utf8"
 
 	"github.com/quarry/quarry-wails3/internal/encodingx"
+	"github.com/quarry/quarry-wails3/internal/fileio"
 	"github.com/quarry/quarry-wails3/internal/lineindex"
+	"github.com/quarry/quarry-wails3/internal/newlines"
 )
 
 const openSampleSize = 1024 * 1024
 const priorityIndexWindowSize = 4 * 1024 * 1024
-const synchronousIndexCacheMaxSourceSize = 1 << 30
+const synchronousIndexCacheMaxSourceSize = 16 << 20
 const defaultReadRangeMaxBytes = 64 * 1024 * 1024
 const exactScanChunkSize = 1024 * 1024
 
 var errDocumentClosed = errors.New("document is closed")
 var ErrReadRangeTooLarge = errors.New("document read range exceeds maximum bounded read")
+var ErrSourceChanged = errors.New("opened source changed during the operation")
+var ErrVisiblePageLimit = errors.New("visible page request exceeds the bounded viewport limits")
+
+const (
+	maxVisiblePageLines   = 10_000
+	maxVisiblePageBytes   = 16 * 1024 * 1024
+	maxVisibleLineBytes   = 1 * 1024 * 1024
+	maxLongLineProbeBytes = 16 * 1024 * 1024
+)
 
 var exactScanBufferPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, exactScanChunkSize)
 		return &buf
 	},
+}
+
+var buildDocumentLineIndex = func(idx *lineindex.Index, ctx context.Context, reader io.Reader, encodingName string) error {
+	return idx.BuildWithEncoding(ctx, reader, encodingName)
 }
 
 type OpenStage string
@@ -60,13 +77,15 @@ type OpenProgress struct {
 
 // FileDocument exposes a huge file through bounded reads.
 type FileDocument struct {
-	path  string
-	file  *os.File
-	size  int64
-	mtime time.Time
-	meta  Metadata
-	idx   *lineindex.Index
-	cache *chunkCache
+	path    string
+	file    *os.File
+	size    int64
+	mtime   time.Time
+	change  sourceChangeToken
+	meta    Metadata
+	idx     *lineindex.Index
+	indexMu sync.Mutex
+	cache   *chunkCache
 
 	indexSampleHashMu sync.Mutex
 	indexSampleHash   string
@@ -133,11 +152,14 @@ func OpenFileContextWithOptions(ctx context.Context, path string, options OpenOp
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := fileio.RequireAtomicWriteReadReady(path); err != nil {
+		return nil, err
+	}
 	report(OpenProgress{Stage: OpenStageOpening})
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	f, err := os.Open(path)
+	f, err := openRegularSource(path)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +177,17 @@ func OpenFileContextWithOptions(ctx context.Context, path string, options OpenOp
 	if err != nil {
 		return closeOnError(err)
 	}
+	// This check deliberately occurs on the final retained handle after any
+	// platform read-hint handling and before sampling or indexing. A pathname
+	// preflight alone cannot protect against a regular-file-to-FIFO/device race.
+	if !st.Mode().IsRegular() {
+		return closeOnError(&os.PathError{Op: "open", Path: path, Err: ErrNonRegularSource})
+	}
 	if err := ctx.Err(); err != nil {
+		return closeOnError(err)
+	}
+	change, err := sourceChangeTokenForFile(f)
+	if err != nil {
 		return closeOnError(err)
 	}
 
@@ -173,24 +205,43 @@ func OpenFileContextWithOptions(ctx context.Context, path string, options OpenOp
 
 	sampleHash := ""
 	idx := lineindex.New(lineindex.EveryLinesForSize(st.Size()))
-	if shouldLoadIndexCacheSynchronously(st.Size()) {
+	if change.available && shouldLoadIndexCacheSynchronously(st.Size()) {
 		report(OpenProgress{Stage: OpenStageIndexCacheCheck, Size: st.Size(), SampleBytes: len(sample)})
 		if err := ctx.Err(); err != nil {
 			return closeOnError(err)
 		}
-		sampleHash = computeIndexSampleHash(f, st.Size(), sample)
+		sampleHash, err = computeIndexSourceHash(ctx, f, st.Size())
+		if err != nil {
+			return closeOnError(err)
+		}
 		if err := ctx.Err(); err != nil {
 			return closeOnError(err)
 		}
-		if cached, ok := loadIndexCache(path, st.Size(), st.ModTime(), sampleHash); ok {
-			idx = cached
-			report(OpenProgress{Stage: OpenStageIndexCacheLoaded, Size: st.Size(), SampleBytes: len(sample), CacheLoaded: true})
+		if cached, ok := loadIndexCacheSnapshot(path, st.Size(), st.ModTime(), sampleHash, idx.EveryLines); ok {
+			if err := idx.RestoreSnapshotOwned(cached); err == nil {
+				report(OpenProgress{Stage: OpenStageIndexCacheLoaded, Size: st.Size(), SampleBytes: len(sample), CacheLoaded: true})
+			}
 		}
 	} else {
 		report(OpenProgress{Stage: OpenStageIndexCacheDeferred, Size: st.Size(), SampleBytes: len(sample)})
 	}
 	if err := ctx.Err(); err != nil {
 		return closeOnError(err)
+	}
+	finalInfo, err := f.Stat()
+	if err != nil {
+		return closeOnError(err)
+	}
+	finalChange, err := sourceChangeTokenForFile(f)
+	if err != nil {
+		return closeOnError(err)
+	}
+	pathInfo, err := os.Stat(path)
+	if err != nil {
+		return closeOnError(err)
+	}
+	if !os.SameFile(st, finalInfo) || !os.SameFile(st, pathInfo) || finalInfo.Size() != st.Size() || !finalInfo.ModTime().Equal(st.ModTime()) || pathInfo.Size() != st.Size() || !pathInfo.ModTime().Equal(st.ModTime()) || (change.available && (!finalChange.available || finalChange != change)) {
+		return closeOnError(fmt.Errorf("%w: source changed while it was opened", ErrSourceChanged))
 	}
 
 	report(OpenProgress{Stage: OpenStageMetadataDetected, Size: st.Size(), SampleBytes: len(sample)})
@@ -202,6 +253,7 @@ func OpenFileContextWithOptions(ctx context.Context, path string, options OpenOp
 		file:             f,
 		size:             st.Size(),
 		mtime:            st.ModTime(),
+		change:           change,
 		meta:             detectMetadata(path, st.Size(), sample),
 		idx:              idx,
 		indexSampleHash:  sampleHash,
@@ -221,22 +273,31 @@ func shouldLoadIndexCacheSynchronously(sourceSize int64) bool {
 	return sourceSize <= synchronousIndexCacheMaxSourceSize
 }
 
-func (d *FileDocument) hydrateIndexCache() bool {
+func (d *FileDocument) hydrateIndexCache(ctx context.Context) bool {
 	if d == nil || d.idx == nil || d.idx.Done() {
 		return false
 	}
-	sampleHash, err := d.ensureIndexSampleHash()
+	if !d.change.available {
+		return false
+	}
+	if _, err := os.Lstat(indexCachePath(d.path)); err != nil {
+		return false
+	}
+	sampleHash, err := d.ensureIndexSampleHash(ctx)
 	if err != nil {
 		return false
 	}
-	if cached, ok := loadIndexCache(d.path, d.size, d.mtime, sampleHash); ok {
-		d.idx = cached
-		return true
+	cached, ok := loadIndexCacheSnapshot(d.path, d.size, d.mtime, sampleHash, d.idx.EveryLines)
+	if !ok {
+		return false
 	}
-	return false
+	if err := d.ValidateUnchanged(); err != nil {
+		return false
+	}
+	return d.idx.RestoreSnapshotOwned(cached) == nil
 }
 
-func (d *FileDocument) ensureIndexSampleHash() (string, error) {
+func (d *FileDocument) ensureIndexSampleHash(ctx context.Context) (string, error) {
 	if d == nil {
 		return "", errDocumentClosed
 	}
@@ -253,23 +314,31 @@ func (d *FileDocument) ensureIndexSampleHash() (string, error) {
 	if closed {
 		return "", errDocumentClosed
 	}
-	sample, err := readSample(f, size, openSampleSize)
+	sourceHash, err := computeIndexSourceHash(ctx, f, size)
 	if err != nil {
 		return "", err
 	}
-	d.indexSampleHash = computeIndexSampleHash(f, size, sample)
+	d.indexSampleHash = sourceHash
 	return d.indexSampleHash, nil
 }
 
-func (d *FileDocument) saveIndexCache() {
+func (d *FileDocument) saveIndexCache(sourceHash string) {
 	if d == nil {
 		return
 	}
-	sampleHash, err := d.ensureIndexSampleHash()
-	if err != nil {
+	if sourceHash == "" {
 		return
 	}
-	_ = saveIndexCache(d.path, d.size, d.mtime, sampleHash, d.idx)
+	if !d.change.available {
+		return
+	}
+	if err := d.ValidateUnchanged(); err != nil {
+		return
+	}
+	d.indexSampleHashMu.Lock()
+	d.indexSampleHash = sourceHash
+	d.indexSampleHashMu.Unlock()
+	_ = saveIndexCache(d.path, d.size, d.mtime, sourceHash, d.idx)
 }
 
 func (d *FileDocument) Path() string {
@@ -289,27 +358,71 @@ func (d *FileDocument) IndexProgress() lineindex.Progress {
 }
 
 func (d *FileDocument) StartIndexing(ctx context.Context) error {
+	if d == nil {
+		return errors.New("document is required")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.indexMu.Lock()
+	defer d.indexMu.Unlock()
+	if d.isClosed() {
+		return errDocumentClosed
+	}
 	if d.idx.Done() {
 		return nil
 	}
-	if d.hydrateIndexCache() {
+	if d.hydrateIndexCache(ctx) {
 		return nil
 	}
 	if d.size == 0 {
 		d.idx.MarkDone(0, 0)
-		d.saveIndexCache()
+		emptyHash, err := computeIndexSourceHash(ctx, d.file, 0)
+		if err != nil {
+			return err
+		}
+		d.saveIndexCache(emptyHash)
 		return nil
 	}
-	if err := d.idx.BuildWithEncoding(ctx, io.NewSectionReader(d, 0, d.size), d.meta.Encoding); err != nil {
+	digest := newIndexSourceHash(d.size)
+	countingDigest := &indexDigestWriter{Writer: digest}
+	reader := io.TeeReader(io.NewSectionReader(d, 0, d.size), countingDigest)
+	if err := buildDocumentLineIndex(d.idx, ctx, reader, d.meta.Encoding); err != nil {
 		return err
 	}
-	d.saveIndexCache()
+	if countingDigest.bytes != d.size {
+		return fmt.Errorf("%w: line index consumed %d of %d source bytes", ErrSourceChanged, countingDigest.bytes, d.size)
+	}
+	if err := d.ValidateUnchanged(); err != nil {
+		return err
+	}
+	d.saveIndexCache(hex.EncodeToString(digest.Sum(nil)))
 	return nil
+}
+
+type indexDigestWriter struct {
+	io.Writer
+	bytes int64
+}
+
+func (w *indexDigestWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.bytes += int64(n)
+	return n, err
 }
 
 // RequestPriorityIndex seeds approximate sparse anchors near the active viewport.
 func (d *FileDocument) RequestPriorityIndex(offset int64) {
-	if d == nil || d.isClosed() || d.idx.Done() || d.size == 0 {
+	if d == nil {
+		return
+	}
+	// Keep the lifecycle read barrier through the first worker registration and
+	// request enqueue. Close takes the write side before waiting, which guarantees
+	// that priorityWG.Add cannot race a zero-counter Wait and that no request can
+	// be queued after Close's final drain.
+	d.lifecycleMu.RLock()
+	defer d.lifecycleMu.RUnlock()
+	if d.closed || d.file == nil || d.idx.Done() || d.size == 0 {
 		return
 	}
 	offset = d.ClampOffset(offset)
@@ -319,7 +432,7 @@ func (d *FileDocument) RequestPriorityIndex(offset int64) {
 		return
 	}
 	d.priorityMu.Unlock()
-	d.startPriorityIndexWorker()
+	d.startPriorityIndexWorkerLocked()
 	coalescePriorityIndexRequest(d.priorityRequests, d.priorityDone, offset)
 }
 
@@ -333,6 +446,27 @@ func (d *FileDocument) ApproxOffsetToLine(offset int64) (line int64, ok bool) {
 
 // ExactOffsetToLine returns the exact line containing offset after indexing completes.
 func (d *FileDocument) ExactOffsetToLine(offset int64) (line int64, ok bool, err error) {
+	return d.exactOffsetToLine(offset, -1, d.ReadAt)
+}
+
+// ExactOffsetToLineWithin returns the exact line containing offset only when
+// the complete scan from the nearest sparse anchor, including the fixed
+// newline lookahead, fits within maxScanBytes. When the index is incomplete or
+// the exact scan would exceed that byte budget, ok is false and no scan I/O is
+// performed. This lets latency-sensitive window rendering fall back to an
+// explicitly approximate line number without turning a bounded viewport read
+// into an O(offset) source scan.
+func (d *FileDocument) ExactOffsetToLineWithin(offset int64, maxScanBytes int64) (line int64, ok bool, err error) {
+	if maxScanBytes < 0 {
+		return 0, false, errors.New("exact offset scan byte budget must not be negative")
+	}
+	return d.exactOffsetToLine(offset, maxScanBytes, d.ReadAt)
+}
+
+// exactOffsetToLine uses maxScanBytes < 0 for the compatibility API's
+// deliberately unlimited exact scan. readAt is injected only so focused tests
+// can prove the bounded path rejects before issuing source I/O.
+func (d *FileDocument) exactOffsetToLine(offset int64, maxScanBytes int64, readAt func([]byte, int64) (int, error)) (line int64, ok bool, err error) {
 	if !d.idx.Done() {
 		return 0, false, nil
 	}
@@ -344,36 +478,67 @@ func (d *FileDocument) ExactOffsetToLine(offset int64) (line int64, ok bool, err
 	if offset <= entry.Offset {
 		return entry.Line, true, nil
 	}
+	lookaheadEnd := offset
+	if offset < d.size {
+		lookaheadEnd = offset + 4
+		if lookaheadEnd < offset || lookaheadEnd > d.size {
+			lookaheadEnd = d.size
+		}
+	}
+	if maxScanBytes >= 0 {
+		scanBytes := offset - entry.Offset
+		lookaheadBytes := lookaheadEnd - offset
+		if scanBytes > maxScanBytes || lookaheadBytes > maxScanBytes-scanBytes {
+			return 0, false, nil
+		}
+	}
 	startLine := entry.Line
 	startOffset := entry.Offset
-	if memo, ok := d.exactOffsetMemoFor(offset, entry); ok {
-		startLine = memo.Line
-		startOffset = memo.Offset
-	}
 
 	bufPtr := takeExactScanBuffer()
 	defer releaseExactScanBuffer(bufPtr)
 	buf := *bufPtr
-	carry := make([]byte, 0, lineBreakOverlap(d.meta.Encoding))
+	scanner := newlines.New(d.meta.Encoding)
 	currentLine := startLine
 	readOffset := startOffset
+	emitThroughOffset := func(br newlines.Break) bool {
+		if br.End <= offset {
+			currentLine++
+		}
+		return true
+	}
 
 	for readOffset < offset {
 		want := len(buf)
 		if remaining := offset - readOffset; remaining < int64(want) {
 			want = int(remaining)
 		}
-		n, readErr := d.ReadAt(buf[:want], readOffset)
+		n, readErr := readAt(buf[:want], readOffset)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
 			return 0, false, readErr
 		}
-		carry = scanLineBreakOffsets(d.meta.Encoding, carry, buf[:n], readOffset, func(_ int64) bool {
-			currentLine++
-			return true
-		})
+		if n != want {
+			return 0, false, io.ErrUnexpectedEOF
+		}
+		scanner.Scan(buf[:n], readOffset, emitThroughOffset)
 		readOffset += int64(n)
 		if errors.Is(readErr, io.EOF) || n == 0 {
 			break
+		}
+	}
+	if readOffset >= d.size {
+		scanner.Finish(emitThroughOffset)
+	} else if readOffset == offset {
+		if lookaheadEnd > offset {
+			lookahead := make([]byte, lookaheadEnd-offset)
+			n, readErr := readAt(lookahead, offset)
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				return 0, false, readErr
+			}
+			if n != len(lookahead) {
+				return 0, false, io.ErrUnexpectedEOF
+			}
+			scanner.Scan(lookahead, offset, emitThroughOffset)
 		}
 	}
 
@@ -389,56 +554,177 @@ func (d *FileDocument) ApproxLineToOffset(line int64) (offset int64, ok bool) {
 	return entry.Offset, true
 }
 
-// ExactLineToOffset returns a line start offset after the full sparse index is ready.
+// LineStartLookupStatus describes why a line-to-offset lookup did or did not
+// produce the requested exact line start.
+type LineStartLookupStatus uint8
+
+const (
+	// LineStartLookupPending means the sparse index was not complete. Result may
+	// still contain the nearest currently known index position.
+	LineStartLookupPending LineStartLookupStatus = iota
+	// LineStartLookupExact means Result.Line and Result.Offset are the requested
+	// exact line start.
+	LineStartLookupExact
+	// LineStartLookupAbsent means a completed index proves the requested line is
+	// beyond the final logical line.
+	LineStartLookupAbsent
+	// LineStartLookupLimited means the requested line may exist, but the exact
+	// scan stopped at its byte budget or cancellation boundary. Result may contain
+	// the nearest line start that was proven while scanning from the sparse index.
+	LineStartLookupLimited
+)
+
+// LineStartLookupResult preserves a usable offset zero by separating position
+// availability from Offset. For an exact result, Line is the requested line.
+// For a pending or limited result, Line is the actual known line at Offset.
+type LineStartLookupResult struct {
+	Status      LineStartLookupStatus
+	Line        int64
+	Offset      int64
+	HasPosition bool
+}
+
+// ExactLineToOffset returns a line start offset after the full sparse index is
+// ready. It is the compatibility API for callers that explicitly permit an
+// unlimited exact scan; latency-sensitive RPCs must use LookupLineStart.
 func (d *FileDocument) ExactLineToOffset(line int64) (offset int64, ok bool, err error) {
 	if line <= 0 || !d.idx.Done() {
 		return 0, false, nil
 	}
-	entry, ok := d.idx.ApproxLineToOffset(line)
-	if !ok {
+	result, err := d.lookupLineStart(context.Background(), line, -1, d.ReadAt)
+	if err != nil {
+		return 0, false, err
+	}
+	if result.Status != LineStartLookupExact {
 		return 0, false, nil
+	}
+	return result.Offset, true, nil
+}
+
+// LookupLineStart resolves a positive 1-based line under a hard source-read
+// budget. It distinguishes an exact result, a line proven absent by a complete
+// index, an incomplete index, and a budget/cancellation fallback. A canceled
+// scan returns its honest fallback result together with ctx.Err().
+func (d *FileDocument) LookupLineStart(ctx context.Context, line int64, maxScanBytes int64) (LineStartLookupResult, error) {
+	if maxScanBytes < 0 {
+		return LineStartLookupResult{}, errors.New("exact line scan byte budget must not be negative")
+	}
+	return d.lookupLineStart(ctx, line, maxScanBytes, d.ReadAtValidated)
+}
+
+// lookupLineStart uses maxScanBytes < 0 only for ExactLineToOffset's
+// compatibility path. readAt is injected so focused tests can prove the hard
+// byte ceiling and cancellation behavior without production hooks.
+func (d *FileDocument) lookupLineStart(ctx context.Context, line int64, maxScanBytes int64, readAt func([]byte, int64) (int, error)) (LineStartLookupResult, error) {
+	if line <= 0 {
+		return LineStartLookupResult{}, errors.New("line number must be positive")
+	}
+	if maxScanBytes < -1 {
+		return LineStartLookupResult{}, errors.New("exact line scan byte budget must not be less than -1")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if line == 1 {
+		return LineStartLookupResult{Status: LineStartLookupExact, Line: 1, Offset: 0, HasPosition: true}, nil
+	}
+
+	progress := d.idx.Progress()
+	entry, hasEntry := d.idx.ApproxLineToOffset(line)
+	pending := LineStartLookupResult{Status: LineStartLookupPending}
+	if hasEntry {
+		pending.Line = entry.Line
+		pending.Offset = entry.Offset
+		pending.HasPosition = true
+	}
+	if !progress.Done {
+		return pending, nil
+	}
+
+	// Progress.Lines is the completed count of logical newline breaks. Therefore
+	// the last valid 1-based line is Lines+1, including an empty line at EOF after
+	// a trailing newline. This proves a missing request without source I/O.
+	if line-1 > progress.Lines {
+		return LineStartLookupResult{Status: LineStartLookupAbsent}, nil
+	}
+	if !hasEntry {
+		return LineStartLookupResult{}, errors.New("completed line index has no line-start anchor")
 	}
 	if entry.Line == line {
 		d.rememberExactLineStart(line, entry.Offset)
-		return entry.Offset, true, nil
+		return LineStartLookupResult{Status: LineStartLookupExact, Line: line, Offset: entry.Offset, HasPosition: true}, nil
 	}
+
 	startLine := entry.Line
 	startOffset := entry.Offset
 	if memo, ok := d.exactLineStartMemoFor(line, entry); ok {
 		startLine = memo.Line
 		startOffset = memo.Offset
 	}
+	if startLine == line {
+		return LineStartLookupResult{Status: LineStartLookupExact, Line: line, Offset: startOffset, HasPosition: true}, nil
+	}
+	if startOffset < 0 || startOffset > d.size {
+		return LineStartLookupResult{}, errors.New("completed line index has an out-of-range line-start anchor")
+	}
+
+	fallback := LineStartLookupResult{
+		Status:      LineStartLookupLimited,
+		Line:        startLine,
+		Offset:      startOffset,
+		HasPosition: true,
+	}
+	if err := ctx.Err(); err != nil {
+		return fallback, err
+	}
+	if maxScanBytes == 0 {
+		return fallback, nil
+	}
+
+	scanEnd := d.size
+	if maxScanBytes >= 0 && maxScanBytes < d.size-startOffset {
+		scanEnd = startOffset + maxScanBytes
+	}
 
 	bufPtr := takeExactScanBuffer()
 	defer releaseExactScanBuffer(bufPtr)
 	buf := *bufPtr
-	carry := make([]byte, 0, lineBreakOverlap(d.meta.Encoding))
+	scanner := newlines.New(d.meta.Encoding)
 	currentLine := startLine
 	readOffset := startOffset
+	var foundOffset int64
+	emit := func(br newlines.Break) bool {
+		currentLine++
+		fallback.Line = currentLine
+		fallback.Offset = br.End
+		if currentLine == line {
+			foundOffset = br.End
+			return false
+		}
+		return true
+	}
 
-	for readOffset < d.size {
+	for readOffset < scanEnd {
+		if err := ctx.Err(); err != nil {
+			return fallback, err
+		}
 		want := len(buf)
-		if remaining := d.size - readOffset; remaining < int64(want) {
+		if remaining := scanEnd - readOffset; remaining < int64(want) {
 			want = int(remaining)
 		}
-		n, readErr := d.ReadAt(buf[:want], readOffset)
+		n, readErr := readAt(buf[:want], readOffset)
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			return 0, false, readErr
+			return LineStartLookupResult{}, readErr
 		}
-		var foundOffset int64
-		found := false
-		carry = scanLineBreakOffsets(d.meta.Encoding, carry, buf[:n], readOffset, func(nextOffset int64) bool {
-			currentLine++
-			if currentLine == line {
-				foundOffset = nextOffset
-				found = true
-				return false
-			}
-			return true
-		})
-		if found {
+		if n != want {
+			return LineStartLookupResult{}, io.ErrUnexpectedEOF
+		}
+		if err := ctx.Err(); err != nil {
+			return fallback, err
+		}
+		if !scanner.Scan(buf[:n], readOffset, emit) {
 			d.rememberExactLineStart(line, foundOffset)
-			return foundOffset, true, nil
+			return LineStartLookupResult{Status: LineStartLookupExact, Line: line, Offset: foundOffset, HasPosition: true}, nil
 		}
 		readOffset += int64(n)
 		if errors.Is(readErr, io.EOF) || n == 0 {
@@ -446,7 +732,20 @@ func (d *FileDocument) ExactLineToOffset(line int64) (offset int64, ok bool, err
 		}
 	}
 
-	return 0, false, nil
+	if readOffset < d.size {
+		return fallback, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fallback, err
+	}
+	if !scanner.Finish(emit) {
+		d.rememberExactLineStart(line, foundOffset)
+		return LineStartLookupResult{Status: LineStartLookupExact, Line: line, Offset: foundOffset, HasPosition: true}, nil
+	}
+
+	// A complete index said this line exists, but a full exact scan did not find
+	// it. Treat that as a source/index consistency failure, never as absence.
+	return LineStartLookupResult{}, fmt.Errorf("%w: completed line index expected line %d before EOF", ErrSourceChanged, line)
 }
 
 func (d *FileDocument) exactOffsetMemoFor(offset int64, floor lineindex.Entry) (exactOffsetLineMemo, bool) {
@@ -530,8 +829,19 @@ func (d *FileDocument) LineStartOffset(line int64) (offset int64, ok bool, err e
 	bufPtr := takeExactScanBuffer()
 	defer releaseExactScanBuffer(bufPtr)
 	buf := *bufPtr
-	carry := make([]byte, 0, lineBreakOverlap(d.meta.Encoding))
+	scanner := newlines.New(d.meta.Encoding)
 	readOffset := startOffset
+	var foundOffset int64
+	found := false
+	emit := func(br newlines.Break) bool {
+		currentLine++
+		if currentLine == line {
+			foundOffset = br.End
+			found = true
+			return false
+		}
+		return true
+	}
 
 	for readOffset < d.size {
 		want := len(buf)
@@ -545,17 +855,10 @@ func (d *FileDocument) LineStartOffset(line int64) (offset int64, ok bool, err e
 		if n == 0 {
 			break
 		}
-		var foundOffset int64
-		found := false
-		carry = scanLineBreakOffsets(d.meta.Encoding, carry, buf[:n], readOffset, func(nextStart int64) bool {
-			currentLine++
-			if currentLine == line {
-				foundOffset = nextStart
-				found = true
-				return false
-			}
-			return true
-		})
+		if n != want {
+			return 0, false, io.ErrUnexpectedEOF
+		}
+		scanner.Scan(buf[:n], readOffset, emit)
 		if found {
 			return foundOffset, true, nil
 		}
@@ -563,6 +866,12 @@ func (d *FileDocument) LineStartOffset(line int64) (offset int64, ok bool, err e
 		if errors.Is(readErr, io.EOF) {
 			break
 		}
+	}
+	if !found {
+		scanner.Finish(emit)
+	}
+	if found {
+		return foundOffset, true, nil
 	}
 
 	return 0, false, nil
@@ -609,6 +918,39 @@ func (d *FileDocument) ReadAt(p []byte, off int64) (int, error) {
 	return d.file.ReadAt(p, off)
 }
 
+// ReadAtValidated performs one positional read bracketed by authoritative
+// retained-handle state checks. It is intended for user-visible scans whose
+// result must never describe a changed or mixed source generation. The lower-
+// level ReadAt remains available for long internal passes that validate their
+// complete stream once at their own publication boundary.
+func (d *FileDocument) ReadAtValidated(p []byte, off int64) (int, error) {
+	return d.readAtValidated(p, off, nil)
+}
+
+// readAtValidated's hook is used only by deterministic package tests to
+// exchange the source after the physical read and before the closing state
+// check. Production callers always pass nil through ReadAtValidated.
+func (d *FileDocument) readAtValidated(p []byte, off int64, afterRead func()) (int, error) {
+	if err := d.beginRead(); err != nil {
+		return 0, err
+	}
+	defer d.endRead()
+	if off < 0 {
+		return 0, errors.New("negative read offset")
+	}
+	if err := d.validateHandleStateLocked(); err != nil {
+		return 0, err
+	}
+	n, readErr := d.file.ReadAt(p, off)
+	if afterRead != nil {
+		afterRead()
+	}
+	if stateErr := d.validateHandleStateLocked(); stateErr != nil {
+		return 0, stateErr
+	}
+	return n, readErr
+}
+
 // ReadRange reads [start, end) with bounds checks.
 func (d *FileDocument) ReadRange(start, end int64) ([]byte, error) {
 	return d.ReadRangeWithLimit(start, end, defaultReadRangeMaxBytes)
@@ -625,6 +967,9 @@ func (d *FileDocument) ReadRangeWithLimit(start, end int64, maxBytes int64) ([]b
 	if start < 0 {
 		start = 0
 	}
+	if start > d.size {
+		start = d.size
+	}
 	if end > d.size {
 		end = d.size
 	}
@@ -637,6 +982,12 @@ func (d *FileDocument) ReadRangeWithLimit(start, end int64, maxBytes int64) ([]b
 	if end-start > maxBytes {
 		return nil, fmt.Errorf("%w: range %d > limit %d", ErrReadRangeTooLarge, end-start, maxBytes)
 	}
+	if err := d.validateHandleStateLocked(); err != nil {
+		if d.cache != nil {
+			d.cache.clear()
+		}
+		return nil, err
+	}
 
 	if d.cache == nil {
 		buf := make([]byte, end-start)
@@ -644,9 +995,47 @@ func (d *FileDocument) ReadRangeWithLimit(start, end int64, maxBytes int64) ([]b
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, err
 		}
-		return buf[:n], nil
+		if n != len(buf) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if err := d.validateHandleStateLocked(); err != nil {
+			return nil, err
+		}
+		return buf, nil
 	}
-	return d.cache.readRange(start, end, d.readChunkLocked)
+	buf, err := d.cache.readRange(start, end, d.readChunkLocked)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(buf)) != end-start {
+		return nil, io.ErrUnexpectedEOF
+	}
+	if err := d.validateHandleStateLocked(); err != nil {
+		d.cache.clear()
+		return nil, err
+	}
+	return buf, nil
+}
+
+func (d *FileDocument) validateHandleStateLocked() error {
+	info, err := d.file.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() != d.size || !info.ModTime().Equal(d.mtime) {
+		return fmt.Errorf("%w: opened size=%d mtime=%s, current size=%d mtime=%s",
+			ErrSourceChanged, d.size, d.mtime.UTC().Format(time.RFC3339Nano), info.Size(), info.ModTime().UTC().Format(time.RFC3339Nano))
+	}
+	if d.change.available {
+		current, err := sourceChangeTokenForFile(d.file)
+		if err != nil {
+			return err
+		}
+		if !current.available || current != d.change {
+			return fmt.Errorf("%w: opened source mutation generation changed", ErrSourceChanged)
+		}
+	}
+	return nil
 }
 
 func (d *FileDocument) readChunkLocked(start int64, size int) ([]byte, error) {
@@ -669,7 +1058,22 @@ func (d *FileDocument) readChunkLocked(start int64, size int) ([]byte, error) {
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, err
 	}
-	return buf[:n], nil
+	if n != len(buf) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	return buf, nil
+}
+
+// ValidateUnchanged compares the retained source handle with the size,
+// modification time, and OS mutation generation captured when the document
+// was opened. The mutation generation detects ordinary same-object rewrites
+// even when a caller restores the visible modification time.
+func (d *FileDocument) ValidateUnchanged() error {
+	if err := d.beginRead(); err != nil {
+		return err
+	}
+	defer d.endRead()
+	return d.validateHandleStateLocked()
 }
 
 // VisibleLinesFromOffset returns displayable logical line slices from a byte offset.
@@ -689,6 +1093,21 @@ func (d *FileDocument) VisiblePageFromOffset(offset int64, count int, opts Visib
 	if count <= 0 {
 		return page, nil
 	}
+	if count > maxVisiblePageLines {
+		return page, fmt.Errorf("%w: line count %d > %d", ErrVisiblePageLimit, count, maxVisiblePageLines)
+	}
+	if opts.MaxBytes > maxVisiblePageBytes {
+		return page, fmt.Errorf("%w: page bytes %d > %d", ErrVisiblePageLimit, opts.MaxBytes, maxVisiblePageBytes)
+	}
+	if opts.MaxLineBytes > maxVisibleLineBytes {
+		return page, fmt.Errorf("%w: line bytes %d > %d", ErrVisiblePageLimit, opts.MaxLineBytes, maxVisibleLineBytes)
+	}
+	if opts.LongLineLimitBytes > maxLongLineProbeBytes {
+		return page, fmt.Errorf("%w: long-line probe %d > %d", ErrVisiblePageLimit, opts.LongLineLimitBytes, maxLongLineProbeBytes)
+	}
+	if opts.HorizontalByteOffset < 0 {
+		return page, fmt.Errorf("%w: horizontal byte offset must be non-negative", ErrVisiblePageLimit)
+	}
 	offset = page.StartOffset
 	if offset >= d.size {
 		return page, nil
@@ -705,11 +1124,14 @@ func (d *FileDocument) VisiblePageFromOffset(offset int64, count int, opts Visib
 	if opts.FirstLineNumber <= 0 {
 		opts.FirstLineNumber = 1
 	}
-	if opts.HorizontalByteOffset < 0 {
-		opts.HorizontalByteOffset = 0
+	if opts.FirstLineNumber > math.MaxInt64-int64(count) {
+		return page, fmt.Errorf("%w: first line number overflows requested page", ErrVisiblePageLimit)
 	}
 
-	end := offset + int64(opts.MaxBytes)
+	end := d.size
+	if int64(opts.MaxBytes) <= d.size-offset {
+		end = offset + int64(opts.MaxBytes)
+	}
 	data, err := d.ReadRange(offset, end)
 	if err != nil {
 		return page, err
@@ -728,16 +1150,25 @@ func (d *FileDocument) VisiblePageFromOffset(offset int64, count int, opts Visib
 		lineEnd := len(data)
 		hasNewline := false
 		newlineWidth := 0
-		if rel, width := findLineBreak(data[lineStart:], d.meta.Encoding); rel >= 0 {
-			lineEnd = lineStart + rel
+		br, hasBreak, breakErr := d.firstLineBreakWithLookahead(data[lineStart:], offset+int64(lineStart), offset+int64(len(data)))
+		if breakErr != nil {
+			return page, breakErr
+		}
+		if hasBreak {
+			lineEnd = int(br.Start - offset)
 			hasNewline = true
-			newlineWidth = width
+			newlineWidth = int(br.End - br.Start)
 		}
 
 		contentEnd := lineEnd
 		contentEnd = trimLineEndingPrefix(data, lineStart, contentEnd, d.meta.Encoding)
 
-		displayStart := lineStart + opts.HorizontalByteOffset
+		displayStart := lineStart
+		if opts.HorizontalByteOffset < contentEnd-lineStart {
+			displayStart += opts.HorizontalByteOffset
+		} else if opts.HorizontalByteOffset > 0 {
+			displayStart = contentEnd
+		}
 		if opts.HorizontalByteOffset > 0 {
 			hasLeftHidden := contentEnd > lineStart || (lineStart == 0 && startsInsideLine)
 			hasRightHidden := false
@@ -750,6 +1181,7 @@ func (d *FileDocument) VisiblePageFromOffset(offset int64, count int, opts Visib
 			displayEnd := contentEnd
 			if displayEnd-displayStart > opts.MaxLineBytes {
 				displayEnd = displayStart + opts.MaxLineBytes
+				displayEnd = alignVisibleDisplayEnd(data, displayStart, displayEnd, offset, d.meta.Encoding)
 				truncated = true
 				hasRightHidden = true
 			}
@@ -809,6 +1241,10 @@ func (d *FileDocument) VisiblePageFromOffset(offset int64, count int, opts Visib
 			displayEnd := contentEnd
 			if displayEnd-displayStart > opts.MaxLineBytes {
 				displayEnd = displayStart + opts.MaxLineBytes
+				displayEnd = alignVisibleDisplayEnd(data, displayStart, displayEnd, offset, d.meta.Encoding)
+				if displayEnd == displayStart {
+					return page, fmt.Errorf("%w: line byte budget %d cannot hold one complete character", ErrVisiblePageLimit, opts.MaxLineBytes)
+				}
 			}
 			hasRightHidden := displayEnd < contentEnd || lineContinuesBeyondRead
 			hasLeftHidden := displayStart > lineStart || (displayStart == lineStart && lineStart == 0 && startsInsideLine)
@@ -862,6 +1298,43 @@ func (d *FileDocument) VisiblePageFromOffset(offset int64, count int, opts Visib
 	return page, nil
 }
 
+// firstLineBreakWithLookahead resolves a CR or UTF-16 code unit that begins in
+// the bounded data and completes immediately after it. The fixed four-byte
+// lookahead affects framing only and is never appended to the visible payload.
+func (d *FileDocument) firstLineBreakWithLookahead(data []byte, absoluteStart int64, dataEnd int64) (newlines.Break, bool, error) {
+	scanner := newlines.New(d.meta.Encoding)
+	var found newlines.Break
+	ok := false
+	emit := func(br newlines.Break) bool {
+		found = br
+		ok = true
+		return false
+	}
+	completed := scanner.Scan(data, absoluteStart, emit)
+	if !completed || ok {
+		return found, ok, nil
+	}
+	if dataEnd >= d.size {
+		scanner.Finish(emit)
+		return found, ok, nil
+	}
+	lookaheadEnd := dataEnd + 4
+	if lookaheadEnd < dataEnd || lookaheadEnd > d.size {
+		lookaheadEnd = d.size
+	}
+	lookahead, err := d.ReadRange(dataEnd, lookaheadEnd)
+	if err != nil {
+		return newlines.Break{}, false, err
+	}
+	scanner.Scan(lookahead, dataEnd, func(br newlines.Break) bool {
+		if br.Start < dataEnd {
+			return emit(br)
+		}
+		return false
+	})
+	return found, ok, nil
+}
+
 func (d *FileDocument) lineExceedsByteLimit(offset int64, limit int) (bool, error) {
 	if d == nil || limit <= 0 {
 		return false, nil
@@ -897,35 +1370,35 @@ func (d *FileDocument) offsetStartsInsideLine(offset int64) (bool, error) {
 		return false, nil
 	}
 
-	switch d.meta.Encoding {
-	case "UTF-16LE":
-		data, err := d.ReadRange(offset-2, offset)
-		if err != nil {
-			return false, err
-		}
-		if len(data) < 2 {
-			return false, nil
-		}
-		return !bytes.Equal(data, []byte{0x0A, 0x00}) && !bytes.Equal(data, []byte{0x0D, 0x00}), nil
-	case "UTF-16BE":
-		data, err := d.ReadRange(offset-2, offset)
-		if err != nil {
-			return false, err
-		}
-		if len(data) < 2 {
-			return false, nil
-		}
-		return !bytes.Equal(data, []byte{0x00, 0x0A}) && !bytes.Equal(data, []byte{0x00, 0x0D}), nil
-	default:
-		data, err := d.ReadRange(offset-1, offset)
-		if err != nil {
-			return false, err
-		}
-		if len(data) == 0 {
-			return false, nil
-		}
-		return data[0] != '\n' && data[0] != '\r', nil
+	start := offset - 4
+	if start < 0 {
+		start = 0
 	}
+	if (d.meta.Encoding == "UTF-16LE" || d.meta.Encoding == "UTF-16BE") && start&1 != 0 {
+		start--
+	}
+	end := offset + 4
+	if end < offset || end > d.size {
+		end = d.size
+	}
+	data, err := d.ReadRange(start, end)
+	if err != nil {
+		return false, err
+	}
+	scanner := newlines.New(d.meta.Encoding)
+	isStart := false
+	emit := func(br newlines.Break) bool {
+		if br.End == offset {
+			isStart = true
+			return false
+		}
+		return true
+	}
+	completed := scanner.Scan(data, start, emit)
+	if completed && end == d.size {
+		scanner.Finish(emit)
+	}
+	return !isStart, nil
 }
 
 func (d *FileDocument) findLineStartWithinLimit(offset int64, limit int64) (int64, bool, error) {
@@ -933,31 +1406,52 @@ func (d *FileDocument) findLineStartWithinLimit(offset int64, limit int64) (int6
 		return 0, false, nil
 	}
 
-	const chunkSize int64 = 64 * 1024
-	scanned := int64(0)
-	pos := offset
-	for pos > 0 {
-		if scanned > limit {
-			return 0, true, nil
-		}
-		start := pos - chunkSize
-		if start < 0 {
-			start = 0
-		}
-		data, err := d.ReadRange(start, pos)
-		if err != nil {
-			return 0, false, err
-		}
-		if idx, width := findLastLineBreak(data, d.meta.Encoding); idx >= 0 {
-			return start + int64(idx+width), false, nil
-		}
-		scanned += pos - start
-		if start == 0 {
-			return 0, false, nil
-		}
-		pos = start
+	if limit < 0 {
+		return offset, true, nil
 	}
-
+	start := int64(0)
+	if limit < offset {
+		start = offset - limit
+	}
+	if start > 4 {
+		start -= 4
+	} else {
+		start = 0
+	}
+	if (d.meta.Encoding == "UTF-16LE" || d.meta.Encoding == "UTF-16BE") && start&1 != 0 {
+		start--
+	}
+	end := offset + 4
+	if end < offset || end > d.size {
+		end = d.size
+	}
+	data, err := d.ReadRange(start, end)
+	if err != nil {
+		return 0, false, err
+	}
+	scanner := newlines.New(d.meta.Encoding)
+	var last newlines.Break
+	found := false
+	emit := func(br newlines.Break) bool {
+		if br.End <= offset {
+			last = br
+			found = true
+		}
+		return true
+	}
+	scanner.Scan(data, start, emit)
+	if end == d.size {
+		scanner.Finish(emit)
+	}
+	if found {
+		if offset-last.End > limit {
+			return last.End, true, nil
+		}
+		return last.End, false, nil
+	}
+	if start > 0 {
+		return start, true, nil
+	}
 	return 0, false, nil
 }
 
@@ -969,31 +1463,42 @@ func (d *FileDocument) findLineEndWithinLimit(offset int64, limit int64) (int64,
 		return offset, true, nil
 	}
 
-	const chunkSize int64 = 64 * 1024
-	scanned := int64(0)
-	pos := offset
-	for pos < d.size {
-		if scanned > limit {
-			return pos, true, nil
-		}
-		end := pos + chunkSize
-		if end > d.size {
-			end = d.size
-		}
-		data, err := d.ReadRange(pos, end)
-		if err != nil {
-			return 0, false, err
-		}
-		if idx, _ := findLineBreak(data, d.meta.Encoding); idx >= 0 {
-			return pos + int64(idx), false, nil
-		}
-		scanned += end - pos
-		if end == d.size {
-			return d.size, false, nil
-		}
-		pos = end
+	end := offset + limit
+	if end < offset || end > d.size {
+		end = d.size
 	}
-
+	if end < d.size {
+		probeEnd := end + 4
+		if probeEnd < end || probeEnd > d.size {
+			probeEnd = d.size
+		}
+		end = probeEnd
+	}
+	data, err := d.ReadRange(offset, end)
+	if err != nil {
+		return 0, false, err
+	}
+	scanner := newlines.New(d.meta.Encoding)
+	var first newlines.Break
+	found := false
+	emit := func(br newlines.Break) bool {
+		first = br
+		found = true
+		return false
+	}
+	completed := scanner.Scan(data, offset, emit)
+	if completed && end == d.size {
+		scanner.Finish(emit)
+	}
+	if found {
+		if first.Start-offset > limit {
+			return first.Start, true, nil
+		}
+		return first.Start, false, nil
+	}
+	if end < d.size {
+		return end, true, nil
+	}
 	return d.size, false, nil
 }
 
@@ -1020,6 +1525,13 @@ func (d *FileDocument) Close() error {
 
 	d.priorityWG.Wait()
 	drainPriorityIndexRequests(d.priorityRequests)
+	// StartIndexing owns indexMu for its full hydrate/build/save lifecycle. Wait
+	// for it to observe the closed state and return before closing the source
+	// handle beneath an active sequential index read. Retain the barrier through
+	// the final handle close so a concurrent late StartIndexing call cannot enter
+	// between the barrier and finalization.
+	d.indexMu.Lock()
+	defer d.indexMu.Unlock()
 
 	d.lifecycleMu.Lock()
 	defer d.lifecycleMu.Unlock()
@@ -1056,128 +1568,6 @@ func (d *FileDocument) isClosed() bool {
 	return d.closed || d.file == nil
 }
 
-func findLineBreak(data []byte, encodingName string) (index int, width int) {
-	switch encodingName {
-	case "UTF-16LE":
-		lf := bytes.Index(data, []byte{0x0A, 0x00})
-		cr := bytes.Index(data, []byte{0x0D, 0x00})
-		if lf >= 0 && (cr < 0 || lf <= cr+2) {
-			return lf, 2
-		}
-		if cr >= 0 {
-			return cr, 2
-		}
-	case "UTF-16BE":
-		lf := bytes.Index(data, []byte{0x00, 0x0A})
-		cr := bytes.Index(data, []byte{0x00, 0x0D})
-		if lf >= 0 && (cr < 0 || lf <= cr+2) {
-			return lf, 2
-		}
-		if cr >= 0 {
-			return cr, 2
-		}
-	default:
-		lf := bytes.IndexByte(data, '\n')
-		cr := bytes.IndexByte(data, '\r')
-		if lf >= 0 && (cr < 0 || lf <= cr+1) {
-			return lf, 1
-		}
-		if cr >= 0 {
-			return cr, 1
-		}
-	}
-	return -1, 0
-}
-
-func lineBreakOverlap(encodingName string) int {
-	switch encodingName {
-	case "UTF-16LE", "UTF-16BE":
-		return 1
-	default:
-		return 0
-	}
-}
-
-func scanLineBreakOffsets(encodingName string, carry []byte, data []byte, baseOffset int64, emit func(nextOffset int64) bool) []byte {
-	overlap := lineBreakOverlap(encodingName)
-	if len(data) == 0 {
-		if overlap > len(carry) {
-			overlap = len(carry)
-		}
-		return append(carry[:0], carry[len(carry)-overlap:]...)
-	}
-
-	scanData := data
-	scanBase := baseOffset
-	if overlap > 0 && len(carry) > 0 {
-		seam := [2]byte{carry[len(carry)-1], data[0]}
-		if idx, width := findLineBreak(seam[:], encodingName); idx == 0 {
-			if !emit(baseOffset - int64(len(carry)) + int64(width)) {
-				return retainLineBreakCarry(carry, data, overlap)
-			}
-		}
-		scanData = data[1:]
-		scanBase = baseOffset + 1
-	}
-
-	searchFrom := 0
-	for searchFrom < len(scanData) {
-		idx, width := findLineBreak(scanData[searchFrom:], encodingName)
-		if idx < 0 {
-			break
-		}
-		rel := searchFrom + idx
-		if !emit(scanBase + int64(rel+width)) {
-			break
-		}
-		searchFrom = rel + width
-	}
-	return retainLineBreakCarry(carry, data, overlap)
-}
-
-func retainLineBreakCarry(carry []byte, data []byte, overlap int) []byte {
-	if overlap <= 0 {
-		return carry[:0]
-	}
-	if overlap > len(data) {
-		overlap = len(data)
-	}
-	return append(carry[:0], data[len(data)-overlap:]...)
-}
-
-func findLastLineBreak(data []byte, encodingName string) (index int, width int) {
-	switch encodingName {
-	case "UTF-16LE":
-		lf := bytes.LastIndex(data, []byte{0x0A, 0x00})
-		cr := bytes.LastIndex(data, []byte{0x0D, 0x00})
-		if lf >= cr && lf >= 0 {
-			return lf, 2
-		}
-		if cr >= 0 {
-			return cr, 2
-		}
-	case "UTF-16BE":
-		lf := bytes.LastIndex(data, []byte{0x00, 0x0A})
-		cr := bytes.LastIndex(data, []byte{0x00, 0x0D})
-		if lf >= cr && lf >= 0 {
-			return lf, 2
-		}
-		if cr >= 0 {
-			return cr, 2
-		}
-	default:
-		lf := bytes.LastIndexByte(data, '\n')
-		cr := bytes.LastIndexByte(data, '\r')
-		if lf >= cr && lf >= 0 {
-			return lf, 1
-		}
-		if cr >= 0 {
-			return cr, 1
-		}
-	}
-	return -1, 0
-}
-
 func trimLineEndingPrefix(data []byte, lineStart int, contentEnd int, encodingName string) int {
 	switch encodingName {
 	case "UTF-16LE":
@@ -1199,6 +1589,30 @@ func trimLineEndingPrefix(data []byte, lineStart int, contentEnd int, encodingNa
 func decodeVisibleText(encodingName string, data []byte, atFileStart bool) string {
 	text, _ := decodeVisibleTextWithOffsets(encodingName, data, atFileStart)
 	return text
+}
+
+func alignVisibleDisplayEnd(data []byte, displayStart, proposedEnd int, absoluteBase int64, encodingName string) int {
+	if proposedEnd <= displayStart || proposedEnd >= len(data) {
+		return proposedEnd
+	}
+	switch encodingName {
+	case "UTF-8", "":
+		for proposedEnd > displayStart && proposedEnd < len(data) && !utf8.RuneStart(data[proposedEnd]) {
+			proposedEnd--
+		}
+	case "UTF-16LE", "UTF-16BE":
+		if (absoluteBase+int64(proposedEnd))&1 != 0 {
+			proposedEnd--
+		}
+		if proposedEnd >= displayStart+2 && proposedEnd+2 <= len(data) {
+			before := decodeUTF16Unit(data[proposedEnd-2:proposedEnd], encodingName)
+			after := decodeUTF16Unit(data[proposedEnd:proposedEnd+2], encodingName)
+			if before >= 0xD800 && before <= 0xDBFF && after >= 0xDC00 && after <= 0xDFFF {
+				proposedEnd -= 2
+			}
+		}
+	}
+	return proposedEnd
 }
 
 func decodeVisibleTextWithOffsets(encodingName string, data []byte, atFileStart bool) (string, []int) {
@@ -1340,12 +1754,17 @@ func (d *FileDocument) seedPriorityIndex(offset int64) {
 
 	lineOffset := start
 	if start > 0 {
-		rel, width := findLineBreak(data, d.meta.Encoding)
-		if rel < 0 {
+		br, found, breakErr := d.firstLineBreakWithLookahead(data, start, end)
+		if breakErr != nil || !found {
 			return
 		}
-		lineOffset += int64(rel) + int64(width)
-		data = data[rel+width:]
+		lineOffset = br.End
+		consumed := br.End - start
+		if consumed >= int64(len(data)) {
+			data = nil
+		} else {
+			data = data[int(consumed):]
+		}
 		lineNumber++
 	}
 
@@ -1357,13 +1776,31 @@ func (d *FileDocument) seedPriorityIndex(offset int64) {
 	}
 
 	currentLine := lineNumber
-	scanLineBreakOffsets(d.meta.Encoding, nil, data, lineOffset, func(nextOffset int64) bool {
+	scanner := newlines.New(d.meta.Encoding)
+	emit := func(br newlines.Break) bool {
 		currentLine++
 		if (currentLine-1)%d.idx.EveryLines == 0 {
-			d.idx.AddPriorityEntry(lineindex.Entry{Line: currentLine, Offset: nextOffset})
+			d.idx.AddPriorityEntry(lineindex.Entry{Line: currentLine, Offset: br.End})
 		}
 		return true
-	})
+	}
+	scanner.Scan(data, lineOffset, emit)
+	if end == d.size {
+		scanner.Finish(emit)
+	} else if len(data) > 0 {
+		lookaheadEnd := end + 4
+		if lookaheadEnd < end || lookaheadEnd > d.size {
+			lookaheadEnd = d.size
+		}
+		if lookahead, readErr := d.ReadRange(end, lookaheadEnd); readErr == nil {
+			scanner.Scan(lookahead, end, func(br newlines.Break) bool {
+				if br.Start < end {
+					return emit(br)
+				}
+				return false
+			})
+		}
+	}
 
 	d.priorityMu.Lock()
 	d.priorityWindowLo = start
@@ -1371,7 +1808,9 @@ func (d *FileDocument) seedPriorityIndex(offset int64) {
 	d.priorityMu.Unlock()
 }
 
-func (d *FileDocument) startPriorityIndexWorker() {
+// startPriorityIndexWorkerLocked requires lifecycleMu to be held for reading.
+// That makes the first positive WaitGroup.Add happen-before Close's Wait.
+func (d *FileDocument) startPriorityIndexWorkerLocked() {
 	d.priorityOnce.Do(func() {
 		d.priorityWG.Add(1)
 		go func() {
@@ -1460,10 +1899,29 @@ func (d *FileDocument) prioritySeedLine(offset int64) (int64, bool) {
 		return 0, false
 	}
 	line := entry.Line
-	scanLineBreakOffsets(d.meta.Encoding, nil, data, entry.Offset, func(_ int64) bool {
-		line++
+	scanner := newlines.New(d.meta.Encoding)
+	emit := func(br newlines.Break) bool {
+		if br.End <= offset {
+			line++
+		}
 		return true
-	})
+	}
+	scanner.Scan(data, entry.Offset, emit)
+	if offset >= d.size {
+		scanner.Finish(emit)
+	} else {
+		lookaheadEnd := offset + 4
+		if lookaheadEnd < offset || lookaheadEnd > d.size {
+			lookaheadEnd = d.size
+		}
+		if lookaheadEnd > offset {
+			lookahead, readErr := d.ReadRange(offset, lookaheadEnd)
+			if readErr != nil {
+				return 0, false
+			}
+			scanner.Scan(lookahead, offset, emit)
+		}
+	}
 	return line, true
 }
 

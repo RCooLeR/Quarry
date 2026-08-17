@@ -13,9 +13,12 @@ import (
 
 const encodingDetectSampleSize = 1024 * 1024
 
-// ConvertEncodingFile rewrites a text file into the requested target encoding
+// convertEncodingFile rewrites a text file into the requested target encoding
 // while preserving Quarry's safe temp-output and optional swap workflow.
-func ConvertEncodingFile(ctx context.Context, sourcePath string, outputPath string, target string, opts FileOptions) (FileSummary, error) {
+func convertEncodingFile(ctx context.Context, sourcePath string, outputPath string, target string, opts FileOptions) (FileSummary, error) {
+	if opts.SwapOriginal {
+		return FileSummary{}, ErrSwapOriginalDisabled
+	}
 	same, err := samePath(sourcePath, outputPath)
 	if err != nil {
 		return FileSummary{}, err
@@ -83,11 +86,19 @@ func ConvertEncodingFile(ctx context.Context, sourcePath string, outputPath stri
 		return summary, err
 	}
 	detected := encodingx.DetectSample(sample)
+	if int64(len(sample)) < st.Size() {
+		detected = encodingx.DetectPrefixSample(sample)
+	}
+	if detected.RequiresConfirmation {
+		return summary, encodingx.ErrEncodingConfirmationRequired
+	}
 	bomLen := int64(len(encodingx.BOMBytes(detected.Name)))
+	processedBOMBytes := int64(0)
 	if detected.HasBOM {
 		if _, err := src.Seek(bomLen, io.SeekStart); err != nil {
 			return summary, err
 		}
+		processedBOMBytes = bomLen
 	} else if _, err := src.Seek(0, io.SeekStart); err != nil {
 		return summary, err
 	}
@@ -119,7 +130,7 @@ func ConvertEncodingFile(ctx context.Context, sourcePath string, outputPath stri
 	progressReader := &progressReader{
 		reader:    src,
 		total:     st.Size(),
-		processed: bomLen,
+		processed: processedBOMBytes,
 		report: func(processed int64) {
 			manifest.BytesProcessed = processed
 			if opts.Progress != nil {
@@ -157,6 +168,12 @@ func ConvertEncodingFile(ctx context.Context, sourcePath string, outputPath stri
 	}
 
 	copyErr := copyTranscoded(ctx, decodedReader, encodedWriter)
+	if copyErr == nil {
+		manifest.BytesProcessed = st.Size()
+		if opts.Progress != nil {
+			opts.Progress(Progress{BytesProcessed: st.Size(), BytesTotal: st.Size()})
+		}
+	}
 	closeErr, _ := closeWriter(encodedWriter)
 	dstCloseErr := error(nil)
 	if !writerIsDestination {
@@ -179,7 +196,7 @@ func ConvertEncodingFile(ctx context.Context, sourcePath string, outputPath stri
 		return summary, err
 	}
 
-	if err := renamePath(summary.TempPath, outputPath); err != nil {
+	if err := publishLegacyOutput(&summary, outputPath); err != nil {
 		writeFailedManifest(summary.ManifestPath, &manifest, err)
 		return summary, err
 	}
@@ -225,8 +242,12 @@ func copyTranscoded(ctx context.Context, src io.Reader, dst io.Writer) error {
 
 		n, err := src.Read(buf)
 		if n > 0 {
-			if _, writeErr := dst.Write(buf[:n]); writeErr != nil {
+			written, writeErr := dst.Write(buf[:n])
+			if writeErr != nil {
 				return writeErr
+			}
+			if written != n {
+				return io.ErrShortWrite
 			}
 		}
 		if errors.Is(err, io.EOF) {

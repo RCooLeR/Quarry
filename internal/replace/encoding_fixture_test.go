@@ -15,7 +15,7 @@ func TestConvertEncodingFileFixtureWindows1251ToUTF8(t *testing.T) {
 	srcPath := copyFixtureToTemp(t, "windows1251_crlf.txt")
 	outPath := filepath.Join(t.TempDir(), "output-utf8.txt")
 
-	if _, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -35,7 +35,7 @@ func TestConvertEncodingFileFixturePreservesUTF8BOM(t *testing.T) {
 	srcPath := copyFixtureToTemp(t, "utf8_bom_mixed.txt")
 	outPath := filepath.Join(t.TempDir(), "output-utf8-bom.txt")
 
-	if _, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -55,7 +55,7 @@ func TestConvertEncodingFileFixtureWindows1252ToUTF16BE(t *testing.T) {
 	srcPath := copyFixtureToTemp(t, "windows1252_mixed.txt")
 	outPath := filepath.Join(t.TempDir(), "output-utf16be.txt")
 
-	if _, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-16BE", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-16BE", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,7 +79,7 @@ func TestConvertLineEndingsFixtureUTF16BEPreservesBOM(t *testing.T) {
 	srcPath := copyFixtureToTemp(t, "utf16be_bom_mixed.txt")
 	outPath := filepath.Join(t.TempDir(), "output-utf16be-lf.txt")
 
-	summary, err := ConvertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
+	summary, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestConvertLineEndingsFixtureWindows1252ToCRLF(t *testing.T) {
 	srcPath := copyFixtureToTemp(t, "windows1252_mixed.txt")
 	outPath := filepath.Join(t.TempDir(), "output-1252-crlf.txt")
 
-	summary, err := ConvertLineEndingsFile(context.Background(), srcPath, outPath, "CRLF", FileOptions{})
+	summary, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "CRLF", FileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -144,7 +144,7 @@ func TestConvertEncodingFileFixtureWindows1252LargeProgress(t *testing.T) {
 
 	var callbacks int
 	var lastBytes int64
-	summary, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{
+	summary, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{
 		Progress: func(p Progress) {
 			callbacks++
 			if p.BytesProcessed < lastBytes {
@@ -197,7 +197,7 @@ func TestConvertLineEndingsFixtureWindows1252LargeCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ConvertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
+	summary, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1,6 +1,7 @@
 package replace
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -20,7 +21,7 @@ func TestConvertLineEndingsFileUTF8(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ConvertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
+	summary, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,6 +43,85 @@ func TestConvertLineEndingsFileUTF8(t *testing.T) {
 	}
 	if manifest.Status != "complete" {
 		t.Fatalf("manifest status = %q", manifest.Status)
+	}
+}
+
+func TestConvertLineEndingsDenseInputCoalescesProgressAndEndsAtExactSourceSize(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "dense.txt")
+	outPath := filepath.Join(dir, "dense-out.txt")
+	content := []byte(strings.Repeat("x\n", 200_000))
+	if err := os.WriteFile(srcPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var callbacks int
+	var last Progress
+	summary, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "CRLF", FileOptions{
+		Progress: func(p Progress) {
+			callbacks++
+			last = p
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if callbacks > 100 {
+		t.Fatalf("progress callbacks = %d for %d newlines; want byte-coalesced callbacks", callbacks, summary.Matches)
+	}
+	if summary.Matches != 200_000 {
+		t.Fatalf("matches = %d, want 200000", summary.Matches)
+	}
+	if last.BytesProcessed != int64(len(content)) || last.BytesTotal != int64(len(content)) {
+		t.Fatalf("final progress = %+v, want exact source size %d", last, len(content))
+	}
+}
+
+func TestConvertLineEndingsBOMlessProgressDoesNotCountSyntheticBOM(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "bomless.txt")
+	outPath := filepath.Join(dir, "bomless-out.txt")
+	content := []byte("alpha\nbeta\n")
+	if err := os.WriteFile(srcPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var progress []Progress
+	if _, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{
+		Progress: func(p Progress) { progress = append(progress, p) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(progress) == 0 {
+		t.Fatal("expected progress")
+	}
+	for _, p := range progress {
+		if p.BytesProcessed > int64(len(content)) {
+			t.Fatalf("progress exceeded source size: %+v", p)
+		}
+	}
+	if got := progress[len(progress)-1].BytesProcessed; got != int64(len(content)) {
+		t.Fatalf("final progress = %d, want %d", got, len(content))
+	}
+}
+
+func TestConvertLineEndingsPreservesUTF8RuneSplitAtDetectionBoundary(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "split-rune.txt")
+	outPath := filepath.Join(dir, "split-rune-out.txt")
+	content := bytes.Repeat([]byte{'a'}, lineEndingDetectSampleSize-1)
+	content = append(content, []byte("€\r\ntail")...)
+	if err := os.WriteFile(srcPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := bytes.ReplaceAll(content, []byte("\r\n"), []byte("\n"))
+	if !bytes.Equal(got, want) {
+		t.Fatalf("converted output differs at UTF-8 sample seam: got %x, want %x", got[len(got)-16:], want[len(want)-16:])
 	}
 }
 
@@ -73,7 +153,7 @@ func TestConvertLineEndingsFileUsesWholeSourceWhileEditableSliceIsDirty(t *testi
 		t.Fatalf("edited replacement still contains original marker: %q", string(encoded))
 	}
 
-	if _, err := ConvertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{}); err != nil {
+	if _, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "LF", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(outPath)
@@ -109,7 +189,7 @@ func TestConvertLineEndingsFilePreservesUTF16LEBOM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ConvertLineEndingsFile(context.Background(), srcPath, outPath, "CRLF", FileOptions{}); err != nil {
+	if _, err := convertLineEndingsFile(context.Background(), srcPath, outPath, "CRLF", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -139,7 +219,7 @@ func TestConvertLineEndingsFileCancelDeletesPartial(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ConvertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{
+	summary, err := convertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{
 		DeletePartialOnCancel: true,
 		Progress: func(p Progress) {
 			if !canceled && p.BytesProcessed > 0 {
@@ -174,7 +254,7 @@ func TestConvertLineEndingsFileCancelKeepsPartial(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ConvertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{
+	summary, err := convertLineEndingsFile(ctx, srcPath, outPath, "LF", FileOptions{
 		DeletePartialOnCancel: false,
 		Progress: func(p Progress) {
 			if !canceled && p.BytesProcessed > 0 {

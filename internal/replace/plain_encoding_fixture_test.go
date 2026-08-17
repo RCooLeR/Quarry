@@ -22,7 +22,7 @@ func TestReplacePlainFileFixtureWindows1251(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ReplacePlainFile(context.Background(), srcPath, outPath, pattern, replacement, FileOptions{})
+	summary, err := replacePlainFile(context.Background(), srcPath, outPath, pattern, replacement, FileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}

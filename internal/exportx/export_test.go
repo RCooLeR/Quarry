@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -381,6 +382,102 @@ func TestSplitBySizeWritesSequentialParts(t *testing.T) {
 	}
 }
 
+func TestCheckedSplitPartCountUsesExactIntegerArithmetic(t *testing.T) {
+	tests := []struct {
+		name    string
+		total   int64
+		part    int64
+		want    int
+		wantErr bool
+	}{
+		{name: "zero", total: 0, part: 1, want: 0},
+		{name: "exact multiple", total: 12, part: 4, want: 3},
+		{name: "one byte remainder", total: 13, part: 4, want: 4},
+		{name: "above float exactness", total: 1<<53 + 1, part: 1 << 53, want: 2},
+		{name: "max int exact", total: math.MaxInt64, part: math.MaxInt64, want: 1},
+		{name: "max int remainder", total: math.MaxInt64, part: math.MaxInt64 - 1, want: 2},
+		{name: "negative total", total: -1, part: 1, wantErr: true},
+		{name: "zero part", total: 1, part: 0, wantErr: true},
+		{name: "negative part", total: 1, part: -1, wantErr: true},
+		{name: "too many parts", total: maxSplitParts + 1, part: 1, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := checkedSplitPartCount(tt.total, tt.part)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("checkedSplitPartCount(%d, %d) succeeded with %d", tt.total, tt.part, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tt.want {
+				t.Fatalf("count = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestCheckedSplitPartRangesCoverHugeSizesExactly(t *testing.T) {
+	tests := []struct {
+		total int64
+		part  int64
+	}{
+		{total: 1<<53 + 1, part: 1 << 53},
+		{total: math.MaxInt64, part: math.MaxInt64 - 1},
+		{total: 10_001, part: 2},
+	}
+	for _, tt := range tests {
+		count, err := checkedSplitPartCount(tt.total, tt.part)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var previousEnd int64
+		for part := 0; part < count; part++ {
+			start, end, err := checkedSplitPartRange(tt.total, tt.part, part)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if start != previousEnd {
+				t.Fatalf("total=%d part=%d index=%d starts at %d after prior end %d", tt.total, tt.part, part, start, previousEnd)
+			}
+			if end <= start || end > tt.total {
+				t.Fatalf("invalid range [%d,%d) for total %d", start, end, tt.total)
+			}
+			previousEnd = end
+		}
+		if previousEnd != tt.total {
+			t.Fatalf("covered through %d, want %d", previousEnd, tt.total)
+		}
+	}
+}
+
+type fixedSizeReader struct{ size int64 }
+
+func (r fixedSizeReader) Size() int64 { return r.size }
+
+func (r fixedSizeReader) ReadAt([]byte, int64) (int, error) {
+	return 0, errors.New("read must not be reached for a rejected split")
+}
+
+func TestSplitBySizeRejectsExcessivePartCountBeforeCreatingArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	basePath := filepath.Join(dir, "split.bin")
+	_, err := SplitBySize(context.Background(), fixedSizeReader{size: maxSplitParts + 1}, "source.bin", basePath, 1, SplitOptions{})
+	if err == nil {
+		t.Fatal("expected excessive part-count error")
+	}
+	entries, readErr := os.ReadDir(dir)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("split created artifacts before rejecting hostile count: %v", entries)
+	}
+}
+
 func TestSplitBySizeUsesWholeSourceWhileEditableSliceIsDirty(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "huge-window.log")
@@ -461,6 +558,9 @@ func TestSplitBySizeComputesPartSHA256WhenRequested(t *testing.T) {
 	if summary.ChecksumAlgorithm != "sha256" {
 		t.Fatalf("checksum algorithm = %q, want sha256", summary.ChecksumAlgorithm)
 	}
+	if !summary.Complete || summary.Failure != "" {
+		t.Fatalf("summary status = %+v", summary)
+	}
 	if len(summary.OutputChecksums) != 3 {
 		t.Fatalf("checksums = %d, want 3", len(summary.OutputChecksums))
 	}
@@ -471,7 +571,7 @@ func TestSplitBySizeComputesPartSHA256WhenRequested(t *testing.T) {
 	}
 
 	manifest := readSplitManifest(t, summary.ManifestPath)
-	if manifest.Mode != "split-size" || manifest.Parts != 3 {
+	if manifest.Mode != "split-size" || manifest.Parts != 3 || !manifest.Complete || manifest.Failure != "" {
 		t.Fatalf("manifest = %+v, want split-size with 3 parts", manifest)
 	}
 	if manifest.OutputChecksums[0].SHA256 != want || manifest.OutputChecksums[0].Path != partPath(basePath, 1) {
@@ -497,7 +597,7 @@ func TestSplitByLineCountWritesExactLines(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.Parts != 3 {
+	if summary.Parts != 3 || !summary.Complete || summary.Failure != "" {
 		t.Fatalf("parts = %d, want 3", summary.Parts)
 	}
 
@@ -544,7 +644,7 @@ func TestSplitByLineCountComputesPartSHA256WhenRequested(t *testing.T) {
 	}
 
 	manifest := readSplitManifest(t, summary.ManifestPath)
-	if manifest.Mode != "split-lines" || manifest.Parts != 3 {
+	if manifest.Mode != "split-lines" || manifest.Parts != 3 || !manifest.Complete || manifest.Failure != "" {
 		t.Fatalf("manifest = %+v, want split-lines with 3 parts", manifest)
 	}
 	if manifest.OutputChecksums[0].SHA256 != want || manifest.OutputChecksums[0].Path != partPath(basePath, 1) {
@@ -570,9 +670,12 @@ func TestSplitBySizeRejectsExistingManifestBeforeWritingParts(t *testing.T) {
 	}
 	defer doc.Close()
 
-	_, err = SplitBySize(context.Background(), doc, srcPath, basePath, 3, SplitOptions{ComputeSHA256: true})
+	summary, err := SplitBySize(context.Background(), doc, srcPath, basePath, 3, SplitOptions{ComputeSHA256: true})
 	if !errors.Is(err, fileio.ErrExists) {
 		t.Fatalf("err = %v, want ErrExists", err)
+	}
+	if summary.Complete || summary.Failure == "" || len(summary.Outputs) != 0 {
+		t.Fatalf("summary = %+v", summary)
 	}
 	if matches, matchErr := filepath.Glob(filepath.Join(dir, "split.part*.txt")); matchErr != nil {
 		t.Fatal(matchErr)
@@ -589,24 +692,70 @@ func TestSplitBySizeRejectsExistingManifestBeforeWritingParts(t *testing.T) {
 }
 
 func TestEnsureManifestAvailableUsesKindInRequiredPathError(t *testing.T) {
-	if err := ensureExportManifestAvailable(" "); err == nil || err.Error() != "export manifest path is required" {
+	if err := ensureExportManifestAvailable(""); err == nil || err.Error() != "export manifest path is required" {
 		t.Fatalf("export manifest error = %v", err)
 	}
-	if err := ensureSplitManifestAvailable(" "); err == nil || err.Error() != "split manifest path is required" {
+	if err := ensureSplitManifestAvailable(""); err == nil || err.Error() != "split manifest path is required" {
 		t.Fatalf("split manifest error = %v", err)
 	}
 }
 
-func TestEnsureManifestAvailableRejectsTempConflict(t *testing.T) {
+func TestSplitManifestDoesNotTouchLegacyDeterministicTemp(t *testing.T) {
 	dir := t.TempDir()
-	path := filepath.Join(dir, "out.json")
-	if err := os.WriteFile(path+".quarry.tmp", []byte("partial"), 0o600); err != nil {
+	srcPath := filepath.Join(dir, "source.txt")
+	basePath := filepath.Join(dir, "split.txt")
+	manifestPath := filepath.Join(dir, "manifest.json")
+	legacyTempPath := manifestPath + ".quarry.tmp"
+	if err := os.WriteFile(srcPath, []byte("abcdef"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(legacyTempPath, []byte("unowned sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := document.OpenFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
 
-	err := ensureExportManifestAvailable(path)
-	if !errors.Is(err, fileio.ErrTempExists) {
-		t.Fatalf("err = %v, want ErrTempExists", err)
+	summary, err := SplitBySize(context.Background(), doc, srcPath, basePath, 3, SplitOptions{ManifestPath: manifestPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Complete {
+		t.Fatalf("summary = %+v, want complete", summary)
+	}
+	if got, err := os.ReadFile(legacyTempPath); err != nil || string(got) != "unowned sentinel" {
+		t.Fatalf("legacy temp = %q, %v", got, err)
+	}
+}
+
+func TestExportManifestDoesNotTouchLegacyDeterministicTemp(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "source.txt")
+	outPath := filepath.Join(dir, "output.txt")
+	manifestPath := filepath.Join(dir, "manifest.json")
+	legacyTempPath := manifestPath + ".quarry.tmp"
+	if err := os.WriteFile(srcPath, []byte("alpha"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(legacyTempPath, []byte("unowned sentinel"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	doc, err := document.OpenFile(srcPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer doc.Close()
+
+	if _, err := ExportByteRange(context.Background(), doc, srcPath, outPath, 0, doc.Size(), Options{ManifestPath: manifestPath}); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := os.ReadFile(legacyTempPath); err != nil || string(got) != "unowned sentinel" {
+		t.Fatalf("legacy temp = %q, %v", got, err)
+	}
+	if _, err := os.Stat(manifestPath); err != nil {
+		t.Fatalf("manifest not published: %v", err)
 	}
 }
 
@@ -665,12 +814,17 @@ func TestSplitBySizeRejectsExistingPartOutput(t *testing.T) {
 	}
 	defer doc.Close()
 
-	if _, err := SplitBySize(context.Background(), doc, srcPath, basePath, 3, SplitOptions{}); err == nil {
-		t.Fatal("expected existing-output error")
+	summary, err := SplitBySize(context.Background(), doc, srcPath, basePath, 3, SplitOptions{})
+	if !errors.Is(err, fileio.ErrExists) {
+		t.Fatalf("error = %v, want ErrExists", err)
 	}
+	if summary.Complete || summary.Failure == "" || len(summary.Outputs) != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	assertFileBytes(t, partPath(basePath, 1), []byte("existing"))
 }
 
-func TestSplitBySizeReportsCreatedPartCleanupFailure(t *testing.T) {
+func TestSplitBySizeExistingLaterPartPreservesVerifiedEarlierPart(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	basePath := filepath.Join(dir, "split.txt")
@@ -688,27 +842,15 @@ func TestSplitBySizeReportsCreatedPartCleanupFailure(t *testing.T) {
 	}
 	defer doc.Close()
 
-	originalRemoveFile := removeFile
-	removeFile = func(path string) error {
-		if strings.Contains(path, "part0001") {
-			return errors.New("cleanup denied")
-		}
-		return originalRemoveFile(path)
+	summary, err := SplitBySize(context.Background(), doc, srcPath, basePath, 3, SplitOptions{})
+	if !errors.Is(err, fileio.ErrExists) {
+		t.Fatalf("error = %v, want ErrExists", err)
 	}
-	defer func() {
-		removeFile = originalRemoveFile
-	}()
-
-	_, err = SplitBySize(context.Background(), doc, srcPath, basePath, 3, SplitOptions{})
-	if err == nil {
-		t.Fatal("expected existing-output and cleanup errors")
+	var incomplete *SplitIncompleteError
+	if !errors.As(err, &incomplete) || summary.Complete || len(summary.Outputs) != 1 || len(incomplete.Outputs) != 1 {
+		t.Fatalf("summary = %+v, error = %v", summary, err)
 	}
-	if !strings.Contains(err.Error(), "output file already exists") {
-		t.Fatalf("err = %v, want existing-output context", err)
-	}
-	if !strings.Contains(err.Error(), "cleanup denied") {
-		t.Fatalf("err = %v, want cleanup failure context", err)
-	}
+	assertFileBytes(t, partPath(basePath, 1), []byte("abc"))
 	if got, readErr := os.ReadFile(conflictPath); readErr != nil {
 		t.Fatal(readErr)
 	} else if string(got) != "existing" {
@@ -716,7 +858,7 @@ func TestSplitBySizeReportsCreatedPartCleanupFailure(t *testing.T) {
 	}
 }
 
-func TestSplitByLineCountRejectsExistingLaterPartAndDeletesCreatedParts(t *testing.T) {
+func TestSplitByLineCountExistingLaterPartPreservesVerifiedEarlierPart(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	basePath := filepath.Join(dir, "split.txt")
@@ -734,12 +876,14 @@ func TestSplitByLineCountRejectsExistingLaterPartAndDeletesCreatedParts(t *testi
 	}
 	defer doc.Close()
 
-	if _, err := SplitByLineCount(context.Background(), doc, srcPath, basePath, 2, SplitOptions{}); err == nil {
-		t.Fatal("expected existing-output error")
+	summary, splitErr := SplitByLineCount(context.Background(), doc, srcPath, basePath, 2, SplitOptions{})
+	if !errors.Is(splitErr, fileio.ErrExists) {
+		t.Fatalf("error = %v, want ErrExists", splitErr)
 	}
-	if _, err := os.Stat(partPath(basePath, 1)); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("created first part should be deleted, stat err = %v", err)
+	if summary.Complete || summary.Failure == "" || len(summary.Outputs) != 1 {
+		t.Fatalf("summary = %+v", summary)
 	}
+	assertFileBytes(t, partPath(basePath, 1), []byte("one\ntwo\n"))
 	got, err := os.ReadFile(conflictPath)
 	if err != nil {
 		t.Fatal(err)
@@ -749,7 +893,7 @@ func TestSplitByLineCountRejectsExistingLaterPartAndDeletesCreatedParts(t *testi
 	}
 }
 
-func TestSplitBySizeCancelDeletesCreatedParts(t *testing.T) {
+func TestSplitBySizeCancelPreservesVerifiedParts(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	basePath := filepath.Join(dir, "split.txt")
@@ -765,7 +909,7 @@ func TestSplitBySizeCancelDeletesCreatedParts(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	_, err = SplitBySize(ctx, doc, srcPath, basePath, 4096, SplitOptions{
+	summary, err := SplitBySize(ctx, doc, srcPath, basePath, 4096, SplitOptions{
 		Progress: func(done int64, total int64, parts int) {
 			if !canceled && parts >= 1 && done > 0 {
 				canceled = true
@@ -776,14 +920,14 @@ func TestSplitBySizeCancelDeletesCreatedParts(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if matches, matchErr := filepath.Glob(filepath.Join(dir, "split.part*.txt")); matchErr != nil {
-		t.Fatal(matchErr)
-	} else if len(matches) != 0 {
-		t.Fatalf("expected cleanup of split outputs, found %v", matches)
+	if summary.Complete || summary.Failure == "" || len(summary.Outputs) != 1 {
+		t.Fatalf("summary = %+v", summary)
 	}
+	want := []byte(strings.Repeat("abcdef", 4096))[:4096]
+	assertFileBytes(t, partPath(basePath, 1), want)
 }
 
-func TestSplitByLineCountCancelDeletesCreatedParts(t *testing.T) {
+func TestSplitByLineCountCancelPreservesVerifiedParts(t *testing.T) {
 	dir := t.TempDir()
 	srcPath := filepath.Join(dir, "source.txt")
 	basePath := filepath.Join(dir, "split.txt")
@@ -799,7 +943,7 @@ func TestSplitByLineCountCancelDeletesCreatedParts(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	_, err = SplitByLineCount(ctx, doc, srcPath, basePath, 2, SplitOptions{
+	summary, err := SplitByLineCount(ctx, doc, srcPath, basePath, 2, SplitOptions{
 		Progress: func(done int64, total int64, parts int) {
 			if !canceled && parts >= 1 && done > 0 {
 				canceled = true
@@ -810,9 +954,8 @@ func TestSplitByLineCountCancelDeletesCreatedParts(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if matches, matchErr := filepath.Glob(filepath.Join(dir, "split.part*.txt")); matchErr != nil {
-		t.Fatal(matchErr)
-	} else if len(matches) != 0 {
-		t.Fatalf("expected cleanup of split outputs, found %v", matches)
+	if summary.Complete || summary.Failure == "" || len(summary.Outputs) != 1 {
+		t.Fatalf("summary = %+v", summary)
 	}
+	assertFileBytes(t, partPath(basePath, 1), []byte("one\ntwo\n"))
 }

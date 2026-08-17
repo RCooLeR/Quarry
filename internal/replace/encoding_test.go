@@ -1,6 +1,7 @@
 package replace
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -11,6 +12,27 @@ import (
 	"github.com/quarry/quarry-wails3/internal/document"
 	"github.com/quarry/quarry-wails3/internal/encodingx"
 )
+
+func TestConvertEncodingPreservesUTF8RuneSplitAtDetectionBoundary(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "split-rune.txt")
+	outPath := filepath.Join(dir, "split-rune-out.txt")
+	content := bytes.Repeat([]byte{'a'}, encodingDetectSampleSize-2)
+	content = append(content, []byte("😀 tail")...)
+	if err := os.WriteFile(srcPath, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(outPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("encoding conversion changed UTF-8 sample seam: got %x, want %x", got[len(got)-16:], content[len(content)-16:])
+	}
+}
 
 func TestConvertEncodingFileWindows1251ToUTF8(t *testing.T) {
 	dir := t.TempDir()
@@ -24,7 +46,7 @@ func TestConvertEncodingFileWindows1251ToUTF8(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	summary, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{})
+	summary, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +76,7 @@ func TestConvertEncodingFileWritesUTF16BOM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-16LE", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-16LE", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -102,7 +124,7 @@ func TestConvertEncodingFileUsesWholeSourceWhileEditableSliceIsDirty(t *testing.
 		t.Fatalf("edited replacement still contains original marker: %q", string(encoded))
 	}
 
-	if _, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-16LE", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-16LE", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(outPath)
@@ -140,7 +162,7 @@ func TestConvertEncodingFileDropsUTF8BOMWhenSourceWasNotUTF8BOM(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := ConvertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{}); err != nil {
+	if _, err := convertEncodingFile(context.Background(), srcPath, outPath, "UTF-8", FileOptions{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -170,7 +192,7 @@ func TestConvertEncodingFileCancelDeletesPartial(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ConvertEncodingFile(ctx, srcPath, outPath, "UTF-8", FileOptions{
+	summary, err := convertEncodingFile(ctx, srcPath, outPath, "UTF-8", FileOptions{
 		DeletePartialOnCancel: true,
 		Progress: func(p Progress) {
 			if !canceled && p.BytesProcessed > 0 {
@@ -209,7 +231,7 @@ func TestConvertEncodingFileCancelKeepsPartial(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var canceled bool
-	summary, err := ConvertEncodingFile(ctx, srcPath, outPath, "UTF-8", FileOptions{
+	summary, err := convertEncodingFile(ctx, srcPath, outPath, "UTF-8", FileOptions{
 		DeletePartialOnCancel: false,
 		Progress: func(p Progress) {
 			if !canceled && p.BytesProcessed > 0 {

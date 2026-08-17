@@ -4,7 +4,34 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/quarry/quarry-wails3/internal/plugins"
 )
+
+func TestCSVDescriptorUsesTruthfulPerOperationCapabilities(t *testing.T) {
+	descriptor := Plugin()
+	if err := descriptor.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	operations := make(map[string]plugins.OperationCapability, len(descriptor.Operations))
+	for _, operation := range descriptor.Operations {
+		operations[operation.ID] = operation
+	}
+	if got := operations["inspect-sample"]; got.Processing != plugins.ProcessingConfigurableSample || got.MaxInputBytes != 0 {
+		t.Fatalf("inspect metadata = %+v", got)
+	}
+	if got := operations["project-columns-file"]; got.Processing != plugins.ProcessingStreaming || got.Memory != plugins.MemoryRecordProportional || !got.AtomicOutput {
+		t.Fatalf("projection metadata = %+v", got)
+	}
+	if got := operations["deduplicate-rows"]; got.Processing != plugins.ProcessingStreaming || got.Memory != plugins.MemoryBounded || got.MaxUnitBytes != MaxLogicalRecordBytes || !strings.Contains(strings.Join(got.Notes, " "), "refuses before growth") {
+		t.Fatalf("dedupe metadata = %+v", got)
+	}
+
+	descriptor.FilePatterns[0] = "*.changed"
+	if got := Plugin().FilePatterns[0]; got != "*.csv" {
+		t.Fatalf("mutating returned descriptor changed CSV patterns: %q", got)
+	}
+}
 
 func TestCSVRuntimePluginRoutesInspectionSchemaPreviewAndGuide(t *testing.T) {
 	var runtime Runtime = RuntimePlugin()
@@ -70,6 +97,17 @@ func TestCSVRuntimePluginRoutesProjectionAndSQLConversion(t *testing.T) {
 	}
 	if summary.RecordsWritten != 2 || !strings.Contains(projected.String(), "name,id") {
 		t.Fatalf("project summary/output = %#v/%q", summary, projected.String())
+	}
+
+	var added strings.Builder
+	addSummary, err := runtime.AddColumn(context.Background(), strings.NewReader(input), &added, AddColumnOptions{
+		Delimiter: ',', Position: 1, Value: "constant",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if addSummary.RecordsWritten != 2 || added.String() != "id,constant,name\n1,constant,Ada\n" {
+		t.Fatalf("add-column summary/output = %#v/%q", addSummary, added.String())
 	}
 
 	var sql strings.Builder

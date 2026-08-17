@@ -11,11 +11,11 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.wails.app"
+        applicationId "com.rcooler.quarry"
         minSdk 21
         targetSdk 34
         versionCode 1
-        versionName "1.0"
+        versionName "0.0.0-dev"
 
         // Configure supported ABIs
         ndk {
@@ -23,28 +23,10 @@ android {
         }
     }
 
-    def keystoreFile = System.getenv("ANDROID_KEYSTORE_FILE")
-    def hasKeystore = keystoreFile != null && !keystoreFile.trim().isEmpty()
-
-    signingConfigs {
-        // A real keystore can be provided via environment variables; without
-        // one, release builds are signed with the debug keystore so they can
-        // be installed for testing (not suitable for Play Store uploads).
-        release {
-            if (hasKeystore) {
-                storeFile file(keystoreFile)
-                storePassword System.getenv("ANDROID_KEYSTORE_PASSWORD")
-                keyAlias System.getenv("ANDROID_KEY_ALIAS")
-                keyPassword System.getenv("ANDROID_KEY_PASSWORD")
-            }
-        }
-    }
-
     buildTypes {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
-            signingConfig hasKeystore ? signingConfigs.release : signingConfigs.debug
         }
         debug {
             debuggable true
@@ -71,6 +53,15 @@ android {
         // Don't strip Go symbols in debug builds
         doNotStrip '*/arm64-v8a/libwails.so'
         doNotStrip '*/x86_64/libwails.so'
+    }
+}
+
+// Mobile distribution is unsupported. Disabling the variant at the Android
+// plugin boundary also prevents direct `gradlew assembleRelease` or
+// `bundleRelease` calls from bypassing the repository Taskfile containment.
+androidComponents {
+    beforeVariants(selector().withBuildType("release")) { variantBuilder ->
+        variantBuilder.enable = false
     }
 }
 
