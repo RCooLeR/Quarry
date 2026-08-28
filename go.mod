@@ -1,9 +1,9 @@
 module github.com/quarry/quarry-wails3
 
-go 1.26.6
+go 1.27.0
 
 require (
-	github.com/wailsapp/wails/v3 v3.0.0-alpha2.106
+	github.com/wailsapp/wails/v3 v3.0.0-beta.15
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.41.0
 )
@@ -16,5 +16,4 @@ require (
 	github.com/jchv/go-winloader v0.0.0-20250406163304-c1995be93bd1 // indirect
 	github.com/mattn/go-colorable v0.1.15 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
-	github.com/wailsapp/wails/webview2 v1.0.28 // indirect
 )

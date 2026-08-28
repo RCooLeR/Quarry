@@ -110,13 +110,7 @@ func FindPlain(ctx context.Context, r ReaderAtSize, pattern []byte, opts PlainOp
 	if size < 0 {
 		return errors.New("source size must not be negative")
 	}
-	startOffset := opts.StartOffset
-	if startOffset < 0 {
-		startOffset = 0
-	}
-	if startOffset > size {
-		startOffset = size
-	}
+	startOffset := min(max(opts.StartOffset, 0), size)
 	buf := make([]byte, opts.ChunkSize)
 	keepSize := len(pattern) - 1
 	if opts.WholeWord {
@@ -132,10 +126,7 @@ func FindPlain(ctx context.Context, r ReaderAtSize, pattern []byte, opts PlainOp
 		needle = asciifold.Fold(pattern)
 	}
 
-	off := startOffset - int64(keepSize)
-	if off < 0 {
-		off = 0
-	}
+	off := max(startOffset-int64(keepSize), 0)
 	hits := 0
 
 	for off < size {
@@ -193,10 +184,7 @@ func FindPlain(ctx context.Context, r ReaderAtSize, pattern []byte, opts PlainOp
 			searchFrom = pos + 1
 		}
 
-		keep := keepSize
-		if keep > len(window) {
-			keep = len(window)
-		}
+		keep := min(keepSize, len(window))
 		carry = append(carry[:0], window[len(window)-keep:]...)
 
 		off += int64(n)
@@ -263,18 +251,9 @@ func FindPlainBackward(ctx context.Context, r ReaderAtSize, pattern []byte, opts
 		default:
 		}
 
-		chunkStart := end - int64(opts.ChunkSize)
-		if chunkStart < 0 {
-			chunkStart = 0
-		}
-		readStart := chunkStart - int64(keepSize)
-		if readStart < 0 {
-			readStart = 0
-		}
-		readEnd := end + int64(keepSize)
-		if readEnd > size {
-			readEnd = size
-		}
+		chunkStart := max(end-int64(opts.ChunkSize), 0)
+		readStart := max(chunkStart-int64(keepSize), 0)
+		readEnd := min(end+int64(keepSize), size)
 
 		want := int(readEnd - readStart)
 		if want > len(buf) {
@@ -420,10 +399,7 @@ func previewAt(r ReaderAtSize, offset int64, length int, radius int) (string, in
 	if radius > MaxPreviewBytes {
 		return "", 0, searchLimit("preview radius %d exceeds %d bytes", radius, MaxPreviewBytes)
 	}
-	start := offset - int64(radius)
-	if start < 0 {
-		start = 0
-	}
+	start := max(offset-int64(radius), 0)
 	end := offset + int64(length+radius)
 	if size := r.Size(); end > size {
 		end = size

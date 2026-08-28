@@ -843,7 +843,7 @@ var tableElementKeywords = wordSet(`
 
 func wordSet(words string) map[string]bool {
 	set := make(map[string]bool)
-	for _, word := range strings.Fields(words) {
+	for word := range strings.FieldsSeq(words) {
 		set[word] = true
 	}
 	return set

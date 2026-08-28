@@ -290,10 +290,7 @@ func (pt *PieceTable) rangeEquals(src document.ReaderAtSize, start int64, end in
 		within := max64(start, pieceStart) - pieceStart
 		remaining := min64(end, pieceEnd) - max64(start, pieceStart)
 		for remaining > 0 {
-			chunk := remaining
-			if chunk > int64(len(buf)) {
-				chunk = int64(len(buf))
-			}
+			chunk := min(remaining, int64(len(buf)))
 			want := expected[expectedOffset : expectedOffset+chunk]
 			switch current.source {
 			case pieceOriginal:
@@ -400,10 +397,7 @@ func (pt *PieceTable) WriteTo(ctx context.Context, src document.ReaderAtSize, ds
 				default:
 				}
 
-				chunkEnd := pos + int64(len(buf))
-				if chunkEnd > end {
-					chunkEnd = end
-				}
+				chunkEnd := min(pos+int64(len(buf)), end)
 				w, err := dst.Write(pt.added[pos:chunkEnd])
 				written += int64(w)
 				if opts.Progress != nil {

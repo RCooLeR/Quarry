@@ -321,8 +321,7 @@ func publishLegacyOutput(summary *FileSummary, outputPath string) error {
 		summary.Published = true
 		return nil
 	}
-	var publication *fileio.PublicationError
-	if errors.As(err, &publication) {
+	if publication, ok := errors.AsType[*fileio.PublicationError](err); ok {
 		summary.Published = true
 		summary.PublicationUncertain = publication.LocationUncertain
 	}

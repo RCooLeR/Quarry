@@ -87,10 +87,7 @@ func ValidUTF8Prefix(sample []byte) bool {
 	if utf8.Valid(sample) {
 		return true
 	}
-	firstCandidate := len(sample) - 3
-	if firstCandidate < 0 {
-		firstCandidate = 0
-	}
+	firstCandidate := max(len(sample)-3, 0)
 	for start := len(sample) - 1; start >= firstCandidate; start-- {
 		width := utf8SequenceWidth(sample[start])
 		if width == 0 {

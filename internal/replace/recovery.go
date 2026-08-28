@@ -1,8 +1,7 @@
 package replace
 
 import (
-	"bytes"
-	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -338,54 +337,9 @@ func recoveryArtifactExists(path string) (bool, error) {
 }
 
 func decodeRecoveryManifest(data []byte) (Manifest, error) {
-	keys := json.NewDecoder(bytes.NewReader(data))
-	token, err := keys.Token()
-	if err != nil {
-		return Manifest{}, fmt.Errorf("%w: %v", ErrInvalidRecoveryManifest, err)
-	}
-	if delimiter, ok := token.(json.Delim); !ok || delimiter != '{' {
-		return Manifest{}, fmt.Errorf("%w: top-level JSON value must be an object", ErrInvalidRecoveryManifest)
-	}
-	seen := make(map[string]struct{}, 20)
-	for keys.More() {
-		keyToken, err := keys.Token()
-		if err != nil {
-			return Manifest{}, fmt.Errorf("%w: %v", ErrInvalidRecoveryManifest, err)
-		}
-		key, ok := keyToken.(string)
-		if !ok {
-			return Manifest{}, fmt.Errorf("%w: manifest field name is not a string", ErrInvalidRecoveryManifest)
-		}
-		if _, duplicate := seen[key]; duplicate {
-			return Manifest{}, fmt.Errorf("%w: duplicate field %q", ErrInvalidRecoveryManifest, key)
-		}
-		seen[key] = struct{}{}
-		var value json.RawMessage
-		if err := keys.Decode(&value); err != nil {
-			return Manifest{}, fmt.Errorf("%w: %v", ErrInvalidRecoveryManifest, err)
-		}
-	}
-	if _, err := keys.Token(); err != nil {
-		return Manifest{}, fmt.Errorf("%w: %v", ErrInvalidRecoveryManifest, err)
-	}
-	if err := keys.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = errors.New("multiple JSON values")
-		}
-		return Manifest{}, fmt.Errorf("%w: trailing data: %v", ErrInvalidRecoveryManifest, err)
-	}
-
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	var manifest Manifest
-	if err := decoder.Decode(&manifest); err != nil {
+	if err := jsonv2.Unmarshal(data, &manifest, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return Manifest{}, fmt.Errorf("%w: %v", ErrInvalidRecoveryManifest, err)
-	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		if err == nil {
-			err = errors.New("multiple JSON values")
-		}
-		return Manifest{}, fmt.Errorf("%w: trailing data: %v", ErrInvalidRecoveryManifest, err)
 	}
 	return manifest, nil
 }

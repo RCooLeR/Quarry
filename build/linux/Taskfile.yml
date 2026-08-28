@@ -12,6 +12,9 @@ vars:
 tasks:
   build:
     summary: Builds the application for Linux
+    preconditions:
+      - sh: '{{if eq .OBFUSCATED "true"}}exit 1{{else}}exit 0{{end}}'
+        msg: "Obfuscated builds are temporarily unavailable: no tagged Garble release supports Go 1.27."
     cmds:
       # Linux links native GTK/WebKit libraries through CGO. The cross image
       # contains libraries and GCC for its own CPU architecture only, so reject
@@ -55,8 +58,8 @@ tasks:
           DEV:
             ref: .DEV
     preconditions:
-      - sh: '{{if eq .OBFUSCATED "true"}}command -v garble >/dev/null 2>&1{{else}}true{{end}}'
-        msg: "garble is required for obfuscated builds. Install it with: go install mvdan.cc/garble@v0.17.0 (requires Go 1.26.2+). See https://github.com/burrowers/garble/releases for version/toolchain compatibility."
+      - sh: '{{if eq .OBFUSCATED "true"}}exit 1{{else}}exit 0{{end}}'
+        msg: "Obfuscated builds are temporarily unavailable: no tagged Garble release supports Go 1.27."
     cmds:
       - '{{if eq .OBFUSCATED "true"}}garble {{.GARBLE_ARGS}} build{{else}}go build{{end}} {{.BUILD_FLAGS}} -o {{.OUTPUT}}'
     vars:
@@ -77,6 +80,8 @@ tasks:
           OBFUSCATED:
             ref: .OBFUSCATED
     preconditions:
+      - sh: '{{if eq .OBFUSCATED "true"}}false{{else}}true{{end}}'
+        msg: "Obfuscated builds are temporarily unavailable: no tagged Garble release supports Go 1.27."
       - sh: '[ "{{.DOCKER_ARCH}}" = "{{.HOST_ARCH}}" ]'
         msg: "Linux Docker builds require target architecture {{.DOCKER_ARCH}} to match host architecture {{.HOST_ARCH}} because the image uses native GCC and GTK/WebKit libraries."
       - sh: docker info > /dev/null 2>&1

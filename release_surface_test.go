@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"os/exec"
@@ -957,14 +958,13 @@ func TestPinnedReleaseToolchainIsConsistent(t *testing.T) {
 	if err := json.Unmarshal(data, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if manifest.PackageManager != "npm@11.17.0" || manifest.Engines["npm"] != "11.17.0" {
+	if manifest.PackageManager != "npm@12.0.2" || manifest.Engines["npm"] != "12.0.2" {
 		t.Fatalf("npm pin is inconsistent: packageManager=%q engines=%q", manifest.PackageManager, manifest.Engines["npm"])
 	}
-	// Wails v3.0.0-alpha2.106 vendors runtime alpha.94. Keep the published
-	// frontend package on that exact protocol peer: older runtimes omit the
-	// framework's chunked-call transport, while arbitrary newer alpha packages
-	// are not a compatibility policy.
-	if manifest.Dependencies["@wailsio/runtime"] != "3.0.0-alpha.94" {
+	// Keep the Wails frontend runtime on the exact protocol peer selected by the
+	// Go module and CLI. Arbitrarily mixing prerelease generations is not a
+	// compatibility policy for the desktop bridge.
+	if manifest.Dependencies["@wailsio/runtime"] != "3.0.0-beta.15" {
 		t.Fatalf("Wails frontend runtime must remain exact, got %q", manifest.Dependencies["@wailsio/runtime"])
 	}
 	for group, dependencies := range map[string]map[string]string{
@@ -981,7 +981,7 @@ func TestPinnedReleaseToolchainIsConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(nodeVersion)) != "24.19.0" {
+	if strings.TrimSpace(string(nodeVersion)) != "24.20.0" {
 		t.Fatalf(".node-version = %q", nodeVersion)
 	}
 
@@ -1005,18 +1005,16 @@ func TestPinnedReleaseToolchainIsConsistent(t *testing.T) {
 	}
 	text := combined.String()
 	for _, required := range []string{
-		"go 1.26.6",
+		"go 1.27.0",
 		"GOTOOLCHAIN: local",
-		"node-version: 24.19.0",
-		"npm --version)\" = \"11.17.0",
-		"github.com/wailsapp/wails/v3 v3.0.0-alpha2.106",
-		"github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106",
-		"honnef.co/go/tools/cmd/staticcheck@v0.7.0",
+		"node-version: 24.20.0",
+		"npm --version)\" = \"12.0.2",
+		"github.com/wailsapp/wails/v3 v3.0.0-beta.15",
+		"github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15",
+		"honnef.co/go/tools/cmd/staticcheck@v0.8.1",
 		"golang.org/x/vuln/cmd/govulncheck@v1.7.0",
 		"github.com/rhysd/actionlint/cmd/actionlint@v1.7.12",
-		"version: v2.17.1",
-		"GARBLE_VERSION=v0.17.0",
-		"mvdan.cc/garble@v0.17.0",
+		"version: v2.18.0",
 	} {
 		if !strings.Contains(text, required) {
 			t.Errorf("release toolchain is missing exact pin %q", required)
@@ -1042,5 +1040,92 @@ func TestDependencyUpdatePolicyAndCrossImagePin(t *testing.T) {
 	from := regexp.MustCompile(`(?m)^FROM\s+[^\s@]+@sha256:[0-9a-f]{64}\s*$`)
 	if !from.Match(dockerfile) {
 		t.Fatal("cross-build container base must use a content digest, not a mutable tag alone")
+	}
+	const crossBase = "FROM golang:1.27.0-trixie@sha256:ae28539d2ef595b9a2930dd7f031d9592376829dc0eae7cb869559f7d5812c3a"
+	if !bytes.Contains(dockerfile, []byte(crossBase)) {
+		t.Fatalf("cross-build container does not use the qualified Go 1.27 base %q", crossBase)
+	}
+	if bytes.Contains(dockerfile, []byte("go install mvdan.cc/garble")) {
+		t.Fatal("cross-build image still installs a Garble release that rejects Go 1.27")
+	}
+	for _, required := range []string{
+		"OBFUSCATED",
+		"no tagged Garble release supports Go 1.27",
+		"exit 1",
+		"ARG ZIG_VERSION=0.16.0",
+		"zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz",
+		"70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00",
+		"ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17",
+		"ARG MACOS_SDK_VERSION=26.1",
+		"ARG MACOS_SDK_SHA256=beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c",
+		"pkg-config --atleast-version=4.14 gtk4",
+		"pkg-config --exists webkitgtk-6.0",
+		"-mmacos-version-min=13.0",
+		"export MACOSX_DEPLOYMENT_TARGET=13.0",
+	} {
+		if !bytes.Contains(dockerfile, []byte(required)) {
+			t.Errorf("cross-build image is missing Go 1.27 build requirement %q", required)
+		}
+	}
+	if bytes.Contains(dockerfile, []byte("-mmacosx-version-min=12.0")) || bytes.Contains(dockerfile, []byte("-mmacos-version-min=12.0")) {
+		t.Error("cross-build image still targets unsupported macOS 12")
+	}
+}
+
+func TestGo127DarwinMinimumIsConsistent(t *testing.T) {
+	taskData, err := os.ReadFile("build/darwin/Taskfile.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task := string(taskData)
+	for _, required := range []string{
+		`CGO_CFLAGS: "-mmacosx-version-min=13.0"`,
+		`CGO_LDFLAGS: "-mmacosx-version-min=13.0"`,
+		`MACOSX_DEPLOYMENT_TARGET: "13.0"`,
+		"no tagged Garble release supports Go 1.27",
+	} {
+		if !strings.Contains(task, required) {
+			t.Errorf("Darwin build surface is missing Go 1.27 requirement %q", required)
+		}
+	}
+	if strings.Contains(task, "mmacosx-version-min=12.0") || strings.Contains(task, `MACOSX_DEPLOYMENT_TARGET: "12.0"`) {
+		t.Error("Darwin build surface still targets unsupported macOS 12")
+	}
+
+	for _, path := range []string{"build/darwin/Info.plist", "build/darwin/Info.dev.plist"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		metadata := string(data)
+		if !strings.Contains(metadata, "<key>LSMinimumSystemVersion</key>") || !strings.Contains(metadata, "<string>13.0.0</string>") {
+			t.Errorf("%s does not declare macOS 13 as its minimum", path)
+		}
+		if strings.Contains(metadata, "<string>12.0.0</string>") {
+			t.Errorf("%s still declares unsupported macOS 12", path)
+		}
+	}
+}
+
+func TestBuildAssetUpdaterReappliesDarwinMinimum(t *testing.T) {
+	data, err := os.ReadFile("build/Taskfile.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	block := taskfileTaskBlock(t, string(data), "update:build-assets")
+	upstream := strings.Index(block, "wails3 update build-assets")
+	policy := strings.Index(block, "go run ./assetpolicy")
+	if upstream < 0 || policy < 0 || policy <= upstream {
+		t.Fatalf("build-asset policy must run after the Wails updater:\n%s", block)
+	}
+	for _, required := range []string{
+		`MACOS_MINIMUM: "13.0.0"`,
+		`-macos-minimum "{{.MACOS_MINIMUM}}"`,
+		"darwin/Info.plist",
+		"darwin/Info.dev.plist",
+	} {
+		if !strings.Contains(block, required) {
+			t.Errorf("build-asset updater does not preserve the macOS floor: missing %q", required)
+		}
 	}
 }

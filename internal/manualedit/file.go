@@ -329,8 +329,7 @@ func writeOpenTableToFile(
 		sourceOwned = false
 		return closeErr
 	}); err != nil {
-		var publicationErr *fileio.PublicationError
-		if errors.As(err, &publicationErr) {
+		if publicationErr, ok := errors.AsType[*fileio.PublicationError](err); ok {
 			result.Complete = true
 			result.Published = true
 			result.PublicationUncertain = publicationErr.LocationUncertain

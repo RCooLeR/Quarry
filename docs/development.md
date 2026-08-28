@@ -31,9 +31,9 @@
         └── editor/          # QuarryEditor.ts + highlight profiles
 ```
 
-Module: `github.com/quarry/quarry-wails3` (Go 1.26.6). Stack: Wails v3
-`v3.0.0-alpha2.106` with its matching published frontend runtime
-`3.0.0-alpha.94`, React + TypeScript + Vite, and CodeMirror 6. The frontend
+Module: `github.com/quarry/quarry-wails3` (Go 1.27.0). Stack: Wails v3
+`v3.0.0-beta.15` with its matching published frontend runtime
+`3.0.0-beta.15`, React + TypeScript + Vite, and CodeMirror 6. The frontend
 package is `quarry-frontend`.
 
 ## Build & test
@@ -56,11 +56,11 @@ task verify:race
 The first command creates the ignored frontend bundle before whole-module Go
 commands, then verifies module and lockfile immutability, default and
 production-tag Go tests, frontend tests/type-check/bundle budgets, vet,
-staticcheck `v0.7.0`, govulncheck `v1.7.0`, npm audit, actionlint `v1.7.12`, and
-GoReleaser `v2.17.1` containment. The second command is separate because the
+staticcheck `v0.8.1`, govulncheck `v1.7.0`, npm audit, actionlint `v1.7.12`, and
+GoReleaser `v2.18.0` containment. The second command is separate because the
 race suite is materially slower. Scanner versions are pinned in `Taskfile.yml`;
-CI additionally fixes Go 1.26.6, Node 24.19.0, npm 11.17.0, Wails CLI
-`v3.0.0-alpha2.106`, runner generations, and every GitHub Action to a full
+CI additionally fixes Go 1.27.0, Node 24.20.0, npm 12.0.2, Wails CLI
+`v3.0.0-beta.15`, runner generations, and every GitHub Action to a full
 commit SHA.
 
 To prove clean-checkout behavior, use a new clone rather than deleting files
@@ -75,8 +75,10 @@ Quarry does not ship a network server or server container. The registered
 `FileService` is a desktop-local capability surface and is not authenticated or
 confined for remote use. Builds made manually with the Wails `server` tag exit
 before starting the runtime. `task setup:docker` remains available only for the
-desktop cross-OS image. Linux builds through that image are same-architecture
-only: native GTK/WebKit libraries and GCC cannot safely serve another `GOARCH`.
+desktop cross-OS image. Its Debian 13/Trixie base enforces Wails beta.15's GTK
+4.14-or-newer requirement at image-build time. Linux builds through that image
+are same-architecture only: native GTK/WebKit libraries and GCC cannot safely
+serve another `GOARCH`.
 
 The desktop bridge uses Quarry's bounded HTTP guard ahead of Wails. Keep the Go
 and npm Wails versions paired: the frontend runtime's 512 KiB chunk protocol is
@@ -87,17 +89,24 @@ service calls and cancellation. Do not bypass it by installing Wails'
 and added to the guard's frontend-surface contract test.
 
 The frontend dependency graph is intentionally npm-only and pinned by
-`package-lock.json` and npm `11.17.0`; alternate package managers are not supported. Set
+`package-lock.json` and npm `12.0.2`; alternate package managers are not supported. Set
 `WAILS_VITE_PORT` when the default dev port (`9245`) is already occupied.
+
+Obfuscated builds are temporarily disabled. Garble `v0.17.0`, the newest
+tagged release, rejects Go 1.27; normal builds remain supported while the
+project waits for a compatible tagged Garble release that can be pinned and
+qualified.
 
 The production frontend build enforces the startup and total JavaScript budgets
 in `frontend/scripts/check-bundle-budget.mjs`. Optional workbench views must
-remain lazy-loaded: the module entry is capped at 280 KiB uncompressed and
-90 KiB gzip; the complete initial module graph, including module preloads, is
-capped at 320 KiB uncompressed and 110 KiB gzip. The initial stylesheet is
+remain lazy-loaded. The application entry is capped at 280 KiB uncompressed
+and 90 KiB gzip; the complete initial module graph, including module preloads,
+is capped at 320 KiB uncompressed and 110 KiB gzip. The initial stylesheet is
 capped at 64 KiB, every JavaScript chunk at 320 KiB, and all JavaScript chunks
-together at 700 KiB. Change a budget only with a reviewed bundle analysis and
-an explanation of the startup impact.
+together at 720 KiB. Vite 8's Rolldown chunk groups isolate the React 19 runtime
+from Quarry's entry, preserving the tighter entry limits and a separately
+cacheable framework chunk. Change a budget only with a reviewed bundle analysis
+and an explanation of the startup impact.
 
 Android and iOS are not supported release targets and are intentionally absent
 from the root task inventory. Their generated platform Taskfiles support only
@@ -186,6 +195,10 @@ wails3 task common:update:build-assets
 
 Review the generated files under `build/` before committing so package names,
 bundle identifiers, installer text, and desktop entries stay consistent.
+Use the task rather than invoking `wails3 update build-assets` directly. Wails
+beta.15 regenerates the Darwin plists with its macOS 12 default; the task's
+cross-platform policy step validates both generated plists and reapplies
+Quarry's required macOS 13 minimum.
 
 ## How to add a new data tool
 

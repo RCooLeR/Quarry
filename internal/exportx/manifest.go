@@ -2,7 +2,9 @@ package exportx
 
 import (
 	"context"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -62,11 +64,6 @@ func writeExportManifest(ctx context.Context, summary Summary, validate func(con
 	if summary.ManifestPath == "" {
 		return errors.New("export manifest path is required")
 	}
-	data, err := json.MarshalIndent(summary, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
 	manifest, err := fileio.OpenAtomicOutput(
 		summary.ManifestPath,
 		[]string{summary.SourcePath, summary.OutputPath},
@@ -76,15 +73,28 @@ func writeExportManifest(ctx context.Context, summary Summary, validate func(con
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, manifest.Cleanup()) }()
-	if n, err := manifest.Write(data); err != nil {
+	if err := writeManifestJSON(manifest, &summary); err != nil {
 		return err
-	} else if n != len(data) {
-		return io.ErrShortWrite
 	}
 	if validate != nil {
 		return manifest.CommitContextValidated(ctx, validate)
 	}
 	return manifest.CommitContext(ctx)
+}
+
+// writeManifestJSON streams the indented document directly to its private
+// atomic output. DefaultOptionsV1 keeps the established manifest wire format
+// while avoiding a second, potentially large in-memory copy of the document.
+func writeManifestJSON(out io.Writer, value any) error {
+	if err := jsonv2.MarshalWrite(out, value, jsonv1.DefaultOptionsV1(), jsontext.WithIndent("  ")); err != nil {
+		return err
+	}
+	if n, err := io.WriteString(out, "\n"); err != nil {
+		return err
+	} else if n != 1 {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func exportManifestPublicationError(summary Summary, err error) error {

@@ -57,10 +57,7 @@ func BuildVisiblePreviews(lines []document.VisualLine, edits []Edit, selected in
 
 func previewAnchor(lines []document.VisualLine, edit Edit) (int, bool) {
 	start := edit.Start
-	end := edit.End
-	if end < start {
-		end = start
-	}
+	end := max(edit.End, start)
 	for i, line := range lines {
 		lineStart := line.Offset
 		lineEnd := line.DisplayEndOffset

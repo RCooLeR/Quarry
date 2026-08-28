@@ -3,6 +3,7 @@ package plugins
 import (
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -385,12 +386,7 @@ func (d Descriptor) Validate() error {
 }
 
 func (d Descriptor) HasCapability(capability Capability) bool {
-	for _, candidate := range d.Capabilities {
-		if candidate == capability {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(d.Capabilities, capability)
 }
 
 func (h FormatterHook) Validate(pluginID string) error {

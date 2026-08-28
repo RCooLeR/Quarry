@@ -2,13 +2,13 @@
 
 ## Prerequisites
 
-- **Go** 1.26.6 or newer. CI and release-candidate validation use exactly
-  1.26.6 from `go.mod`.
-- **Node.js** `^20.19.0` or `>=22.12.0` with **npm** `11.17.0` (the frontend
-  install is locked to npm and `package-lock.json`). The canonical CI runtime
-  is Node 24.19.0, also recorded in `.node-version`.
-- **Wails v3 CLI** `v3.0.0-alpha2.106`, matching `go.mod`:
-  `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106`
+- **Go** 1.27.0 or newer. CI and release-candidate validation use exactly
+  1.27.0 from `go.mod`.
+- **Node.js** `^22.22.2`, `^24.15.0`, or `>=26.0.0` with **npm** `12.0.2` (the
+  frontend install is locked to npm and `package-lock.json`). The canonical CI
+  runtime is Node 24.20.0, also recorded in `.node-version`.
+- **Wails v3 CLI** `v3.0.0-beta.15`, matching `go.mod`:
+  `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15`
 - **[Task](https://taskfile.dev/)** (optional) — the `Taskfile.yml` wraps the
   common Wails commands
 

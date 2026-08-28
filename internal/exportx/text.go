@@ -139,10 +139,7 @@ func exportByteRangeTextCore(ctx context.Context, doc document.ReaderAtSize, sou
 	}
 	summary.StartOffset = start
 	summary.EndOffset = end
-	total := end - start
-	if total < 0 {
-		total = 0
-	}
+	total := max(end-start, 0)
 	if err := validateExportSource(ctx, doc, nil); err != nil {
 		return summary, err
 	}

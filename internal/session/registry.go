@@ -190,10 +190,7 @@ func NewWithLimit(maxOpen int) *Registry {
 	if maxOpen <= 0 {
 		maxOpen = DefaultMaxOpenFiles
 	}
-	maxOpening := DefaultMaxConcurrentOpens
-	if maxOpening > maxOpen {
-		maxOpening = maxOpen
-	}
+	maxOpening := min(DefaultMaxConcurrentOpens, maxOpen)
 	return &Registry{files: make(map[string]*registryEntry), maxOpen: maxOpen, maxOpening: maxOpening}
 }
 
@@ -849,14 +846,11 @@ func (r *Registry) BeginShutdown() <-chan struct{} {
 		var wg sync.WaitGroup
 		errCh := make(chan error, len(handles))
 		for _, handle := range handles {
-			handle := handle
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				if err := handle.Finish(); err != nil {
 					errCh <- err
 				}
-			}()
+			})
 		}
 		wg.Wait()
 		<-openDone

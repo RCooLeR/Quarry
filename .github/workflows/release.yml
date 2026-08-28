@@ -106,21 +106,24 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.19.0
+          node-version: 24.20.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
 
       - name: Verify pinned toolchain and dependency graph
         shell: bash
         run: |
-          test "$(go env GOVERSION)" = "go1.26.6"
-          test "$(node --version)" = "v24.19.0"
-          test "$(npm --version)" = "11.17.0"
+          test "$(go env GOVERSION)" = "go1.27.0"
+          test "$(node --version)" = "v24.20.0"
+          test "$(npm --version)" = "12.0.2"
           go mod verify
           go mod tidy -diff
 
       - name: Install pinned Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
 
       - name: Install and verify pinned NSIS compiler
         shell: pwsh
@@ -212,20 +215,23 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.19.0
+          node-version: 24.20.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
+
       - name: Verify pinned toolchain and dependency graph
         run: |
-          test "$(go env GOVERSION)" = "go1.26.6"
-          test "$(node --version)" = "v24.19.0"
-          test "$(npm --version)" = "11.17.0"
+          test "$(go env GOVERSION)" = "go1.27.0"
+          test "$(node --version)" = "v24.20.0"
+          test "$(npm --version)" = "12.0.2"
           go mod verify
           go mod tidy -diff
 
       - name: Install pinned Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
 
       - name: Build
         run: wails3 task linux:build

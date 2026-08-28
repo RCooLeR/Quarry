@@ -229,13 +229,7 @@ func appendWithBoundedCapacity(dst, src []byte, maxCapacity int) []byte {
 	if required <= cap(dst) {
 		return append(dst, src...)
 	}
-	capacity := cap(dst) * 2
-	if capacity < required {
-		capacity = required
-	}
-	if capacity > maxCapacity {
-		capacity = maxCapacity
-	}
+	capacity := min(max(cap(dst)*2, required), maxCapacity)
 	grown := make([]byte, len(dst), capacity)
 	copy(grown, dst)
 	return append(grown, src...)

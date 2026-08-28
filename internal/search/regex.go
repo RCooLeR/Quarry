@@ -178,10 +178,7 @@ func FindRegexpBackward(ctx context.Context, r ReaderAtSize, re *regexp.Regexp, 
 		if processed > endOffset {
 			processed = endOffset
 		}
-		retained := eligible
-		if retained > len(matches) {
-			retained = len(matches)
-		}
+		retained := min(eligible, len(matches))
 		opts.Progress(Progress{
 			BytesProcessed: int64(processed),
 			BytesTotal:     endOffset,

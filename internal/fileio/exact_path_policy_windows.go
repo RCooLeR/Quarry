@@ -35,8 +35,8 @@ func validatePlatformExactPath(path string, clean string, directory bool) error 
 	if strings.Contains(remainder, ":") {
 		return invalidWindowsExactPath(path, clean, "NTFS alternate-data-stream path spellings are not supported")
 	}
-	components := strings.Split(remainder, `\`)
-	for _, component := range components {
+	components := strings.SplitSeq(remainder, `\`)
+	for component := range components {
 		if component == "" {
 			continue
 		}

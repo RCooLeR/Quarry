@@ -362,7 +362,7 @@ func TestFindPlainWholeWordAcrossBoundaryNeedsNextByte(t *testing.T) {
 }
 
 func TestFindPlainWholeWordUnicodeBoundariesAreChunkInvariant(t *testing.T) {
-	const supplementaryLetter = "𐐀" // Deseret capital letter; four UTF-8 bytes.
+	const supplementaryLetter = "\U00016EA0" // Beria Erfe capital letter Arkab, added in Unicode 17.
 	for chunkSize := len("cat") + utf8.UTFMax; chunkSize <= 13; chunkSize++ {
 		for padding := 0; padding < chunkSize; padding++ {
 			data := strings.Repeat(".", padding) + supplementaryLetter + "cat cat cat" + supplementaryLetter

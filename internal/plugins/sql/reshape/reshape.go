@@ -376,10 +376,7 @@ func classifyStatementPrefix(statement []byte) statementPrefixClass {
 	}
 	rest := statement[index:]
 	const keyword = "insert"
-	limit := len(rest)
-	if limit > len(keyword) {
-		limit = len(keyword)
-	}
+	limit := min(len(rest), len(keyword))
 	for offset := 0; offset < limit; offset++ {
 		if lower(rest[offset]) != keyword[offset] {
 			return statementPrefixOther

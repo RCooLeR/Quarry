@@ -421,10 +421,7 @@ func collectBatchMatches(ctx context.Context, r ReaderAtSize, rules *compiledBat
 	if size < 0 {
 		return nil, 0, errors.New("source size must not be negative")
 	}
-	resultCapacity := maxHits
-	if resultCapacity < 0 {
-		resultCapacity = 0
-	}
+	resultCapacity := max(maxHits, 0)
 	results := make([]batchMatch, 0, resultCapacity)
 	var conflicts int64
 
@@ -486,10 +483,7 @@ func collectBatchMatches(ctx context.Context, r ReaderAtSize, rules *compiledBat
 }
 
 func collectBatchPrefix(ctx context.Context, window []byte, processLimit int, rules *compiledBatchSet, wholeWord bool, windowStart int64, size int64, remaining int) (int, []batchMatch, int, error) {
-	capacity := remaining
-	if capacity < 0 {
-		capacity = 0
-	}
+	capacity := max(remaining, 0)
 	found := make([]batchMatch, 0, capacity)
 	consumed, _, conflicts, err := arbitrateBatchPrefix(ctx, window, processLimit, size, windowStart, rules, wholeWord, remaining, func(candidate batchCandidate, conflictCount int) error {
 		found = append(found, batchMatch{

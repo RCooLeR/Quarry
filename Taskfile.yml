@@ -7,11 +7,11 @@ vars:
   APP_NAME: "quarry"
   BIN_DIR: "bin"
   VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
-  WAILS_VERSION: "v3.0.0-alpha2.106"
-  STATICCHECK_VERSION: "v0.7.0"
+  WAILS_VERSION: "v3.0.0-beta.15"
+  STATICCHECK_VERSION: "v0.8.1"
   GOVULNCHECK_VERSION: "v1.7.0"
   ACTIONLINT_VERSION: "v1.7.12"
-  GORELEASER_VERSION: "v2.17.1"
+  GORELEASER_VERSION: "v2.18.0"
 
 includes:
   common: ./build/Taskfile.yml

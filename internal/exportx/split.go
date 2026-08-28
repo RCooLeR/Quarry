@@ -2,10 +2,8 @@ package exportx
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"path/filepath"
 	"strings"
 
@@ -103,10 +101,7 @@ func checkedSplitPartRange(total int64, bytesPerPart int64, partIndex int) (int6
 
 	start := int64(partIndex) * bytesPerPart
 	remaining := total - start
-	partLength := bytesPerPart
-	if remaining < partLength {
-		partLength = remaining
-	}
+	partLength := min(remaining, bytesPerPart)
 	return start, start + partLength, nil
 }
 
@@ -311,11 +306,6 @@ func writeSplitManifest(ctx context.Context, summary SplitSummary, validate func
 	if summary.ManifestPath == "" {
 		return errors.New("split manifest path is required")
 	}
-	data, err := json.MarshalIndent(summary, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
 	protectedPaths := make([]string, 0, len(summary.Outputs)+1)
 	protectedPaths = append(protectedPaths, summary.SourcePath)
 	protectedPaths = append(protectedPaths, summary.Outputs...)
@@ -324,10 +314,8 @@ func writeSplitManifest(ctx context.Context, summary SplitSummary, validate func
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, manifest.Cleanup()) }()
-	if n, err := manifest.Write(data); err != nil {
+	if err := writeManifestJSON(manifest, &summary); err != nil {
 		return err
-	} else if n != len(data) {
-		return io.ErrShortWrite
 	}
 	if validate != nil {
 		return manifest.CommitContextValidated(ctx, validate)

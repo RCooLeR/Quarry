@@ -796,10 +796,7 @@ func normalizeSQLColumnNames(columns []string) []string {
 		candidate := base
 		candidateKey := baseKey
 		if _, exists := used[candidateKey]; exists {
-			suffix := nextSuffix[baseKey]
-			if suffix < 2 {
-				suffix = 2
-			}
+			suffix := max(nextSuffix[baseKey], 2)
 			for {
 				candidate = sqlIdentifierWithSuffix(base, suffix)
 				candidateKey = foldSQLIdentifier(candidate)

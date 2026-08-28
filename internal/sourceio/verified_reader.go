@@ -116,10 +116,7 @@ func (r *VerifiedDocumentReader) ReadAt(dst []byte, offset int64) (int, error) {
 		}
 		chunkIndex := current / r.expected.chunkSize
 		chunkStart := chunkIndex * r.expected.chunkSize
-		chunkEnd := chunkStart + r.expected.chunkSize
-		if chunkEnd > size {
-			chunkEnd = size
-		}
+		chunkEnd := min(chunkStart+r.expected.chunkSize, size)
 		chunkLength := chunkEnd - chunkStart
 		buffer := r.buffer[:int(chunkLength)]
 		if !r.cacheValid || r.cachedChunk != chunkIndex {

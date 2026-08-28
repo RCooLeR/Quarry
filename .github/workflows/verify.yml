@@ -93,19 +93,22 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.19.0
+          node-version: 24.20.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
 
       - name: Verify pinned toolchain
         shell: bash
         run: |
-          test "$(go env GOVERSION)" = "go1.26.6"
-          test "$(node --version)" = "v24.19.0"
-          test "$(npm --version)" = "11.17.0"
+          test "$(go env GOVERSION)" = "go1.27.0"
+          test "$(node --version)" = "v24.20.0"
+          test "$(npm --version)" = "12.0.2"
 
       - name: Install pinned Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-alpha2.106
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
 
       - name: Verify Go dependency graph
         run: |
@@ -163,9 +166,12 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.19.0
+          node-version: 24.20.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
 
       - name: Verify dependency manifests
         run: |
@@ -183,7 +189,7 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.7.0
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
           "$(go env GOPATH)/bin/staticcheck" ./...
           "$(go env GOPATH)/bin/staticcheck" -tags production ./...
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/staticcheck" ./...
@@ -205,7 +211,7 @@ jobs:
         env:
           NODE_USE_SYSTEM_CA: "1"
         run: |
-          test "$(npm --version)" = "11.17.0"
+          test "$(npm --version)" = "12.0.2"
           npm audit --audit-level=high
 
       - name: Lint GitHub Actions workflows with pinned actionlint
@@ -218,7 +224,7 @@ jobs:
       - name: Check GoReleaser containment config
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: v2.17.1
+          version: v2.18.0
           args: check
 
       - name: Verify analysis preserved source inputs
@@ -254,9 +260,12 @@ jobs:
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.19.0
+          node-version: 24.20.0
           cache: npm
           cache-dependency-path: frontend/package-lock.json
+
+      - name: Install pinned npm
+        run: npm install --global npm@12.0.2
 
       - name: Write verification record
         env:
@@ -284,8 +293,8 @@ jobs:
               workflow:{runId:$runId, attempt:$runAttempt},
               toolchain:{go:$goVersion, node:$nodeVersion, npm:$npmVersion,
                 goToolchainPolicy:"local",
-                wails:"v3.0.0-alpha2.106", staticcheck:"v0.7.0",
-                govulncheck:"v1.7.0", actionlint:"v1.7.12", goreleaser:"v2.17.1"},
+                wails:"v3.0.0-beta.15", staticcheck:"v0.8.1",
+                govulncheck:"v1.7.0", actionlint:"v1.7.12", goreleaser:"v2.18.0"},
               inputs:{goModSha256:$goModSha256, goSumSha256:$goSumSha256,
                 frontendPackageSha256:$packageSha256, frontendLockSha256:$lockSha256},
               gates:["windows-tests-build", "linux-tests-build", "linux-production-tests",

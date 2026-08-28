@@ -580,10 +580,7 @@ func writeRegexBatchPrefix(ctx context.Context, dst io.Writer, window []byte, pr
 }
 
 func collectRegexBatchPrefix(ctx context.Context, window []byte, processLimit int, rules []compiledRegexBatchRule, windowStart int64, remaining int, conflictState *regexBatchConflictState) (int, []regexBatchMatch, int, error) {
-	capacity := remaining
-	if capacity < 0 {
-		capacity = 0
-	}
+	capacity := max(remaining, 0)
 	found := make([]regexBatchMatch, 0, capacity)
 	safeLimit, _, conflicts, err := streamRegexBatchPrefix(ctx, window, processLimit, rules, windowStart, conflictState, func(candidate regexBatchCandidate) error {
 		if remaining > 0 && len(found) >= remaining {
@@ -755,10 +752,7 @@ func compileRegexBatchRules(rules []BatchRule, caseInsensitive bool, maxMatchWin
 }
 
 func regexBatchReplacementSnippet(r ReaderAtSize, offset int64, length int, rule compiledRegexBatchRule, loc []int, radius int) (string, string, error) {
-	start := offset - int64(radius)
-	if start < 0 {
-		start = 0
-	}
+	start := max(offset-int64(radius), 0)
 	end := offset + int64(length+radius)
 	if size := r.Size(); end > size {
 		end = size

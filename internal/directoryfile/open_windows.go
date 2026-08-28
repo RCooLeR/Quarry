@@ -101,8 +101,8 @@ func windowsDirectoryPath(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if strings.HasPrefix(abs, `\\`) {
-		return `\\?\UNC\` + strings.TrimPrefix(abs, `\\`), nil
+	if after, ok := strings.CutPrefix(abs, `\\`); ok {
+		return `\\?\UNC\` + after, nil
 	}
 	return `\\?\` + abs, nil
 }

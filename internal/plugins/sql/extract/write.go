@@ -2,9 +2,12 @@ package extract
 
 import (
 	"context"
-	"encoding/json"
+	jsonv1 "encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 
 	"github.com/quarry/quarry-wails3/internal/document"
@@ -174,15 +177,16 @@ func writePreview(ctx context.Context, doc document.ReaderAtSize, sourcePath str
 			},
 		})
 		if err != nil {
-			var publication *fileio.PublicationError
-			if errors.As(err, &publication) && publication.LocationUncertain {
-				summary.PublicationUncertain = true
-			} else if errors.As(err, &publication) && publication.FinalPath == table.OutputPath {
-				table.Bytes = part.BytesWritten
-				table.SHA256 = part.SHA256
-				summary.Outputs = append(summary.Outputs, table)
-				done += part.BytesWritten
-				summary.BytesWritten += part.BytesWritten
+			if publication, ok := errors.AsType[*fileio.PublicationError](err); ok {
+				if publication.LocationUncertain {
+					summary.PublicationUncertain = true
+				} else if publication.FinalPath == table.OutputPath {
+					table.Bytes = part.BytesWritten
+					table.SHA256 = part.SHA256
+					summary.Outputs = append(summary.Outputs, table)
+					done += part.BytesWritten
+					summary.BytesWritten += part.BytesWritten
+				}
 			}
 			return failWrite(summary, err)
 		}
@@ -212,8 +216,7 @@ func finishWrite(summary WriteSummary, err error) (WriteSummary, error) {
 	if err == nil {
 		return summary, nil
 	}
-	var publication *fileio.PublicationError
-	if errors.As(err, &publication) {
+	if publication, ok := errors.AsType[*fileio.PublicationError](err); ok {
 		if publication.LocationUncertain {
 			summary.PublicationUncertain = true
 		} else if publication.FinalPath == summary.ManifestPath {
@@ -270,11 +273,6 @@ func validateWriteSource(ctx context.Context, doc document.ReaderAtSize, validat
 }
 
 func writeManifest(ctx context.Context, doc document.ReaderAtSize, validate func(context.Context) error, summary WriteSummary) (retErr error) {
-	data, err := json.MarshalIndent(summary, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
 	sources := make([]string, 0, len(summary.Outputs)+1)
 	sources = append(sources, summary.SourcePath)
 	for _, output := range summary.Outputs {
@@ -285,16 +283,24 @@ func writeManifest(ctx context.Context, doc document.ReaderAtSize, validate func
 		return err
 	}
 	defer func() { retErr = errors.Join(retErr, out.Cleanup()) }()
-	written, err := out.Write(data)
-	if err != nil {
+	if err := writeManifestJSON(out, &summary); err != nil {
 		return err
-	}
-	if written != len(data) {
-		return errors.New("short SQL extraction manifest write")
 	}
 	return out.CommitContextValidated(ctx, func(ctx context.Context) error {
 		return validateWriteSource(ctx, doc, validate)
 	})
+}
+
+func writeManifestJSON(out io.Writer, value any) error {
+	if err := jsonv2.MarshalWrite(out, value, jsonv1.DefaultOptionsV1(), jsontext.WithIndent("  ")); err != nil {
+		return err
+	}
+	if n, err := io.WriteString(out, "\n"); err != nil {
+		return err
+	} else if n != 1 {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func preflightWritePaths(sourcePath string, manifestPath string, tables []TableRange) error {

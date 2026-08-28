@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 
 	"github.com/quarry/quarry-wails3/internal/fileio"
@@ -663,10 +664,5 @@ func minInt(a int, b int) int {
 }
 
 func isAllowedValue(value string, allowed ...string) bool {
-	for _, candidate := range allowed {
-		if value == candidate {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(allowed, value)
 }

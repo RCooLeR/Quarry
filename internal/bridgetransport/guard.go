@@ -48,7 +48,7 @@ type limits struct {
 
 func productionLimits() limits {
 	return limits{
-		// Wails runtime alpha.94 chunks JSON strings above 512 KiB. At or
+		// Wails runtime beta.15 chunks JSON strings above 512 KiB. At or
 		// below that threshold UTF-8 needs at most three bytes per UTF-16
 		// code unit, so 2 MiB covers every conforming ordinary request.
 		maxUnchunkedBody: 2 * 1024 * 1024,

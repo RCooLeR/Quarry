@@ -14,10 +14,9 @@
 #   docker run --rm -v $(pwd):/app wails-cross windows amd64
 #   docker run --rm -v $(pwd):/app wails-cross windows arm64
 
-FROM golang:1.26.6-bookworm@sha256:116d58cbd88c1297624acc6e967a060012422bacf9930927e23fb719189c6f36
+FROM golang:1.27.0-trixie@sha256:ae28539d2ef595b9a2930dd7f031d9592376829dc0eae7cb869559f7d5812c3a
 
 ARG TARGETARCH
-ARG GARBLE_VERSION=v0.17.0
 
 # TARGETARCH is supplied by BuildKit for the selected image platform. Do not
 # silently treat a missing or unsupported value as amd64: Linux builds use the
@@ -34,26 +33,33 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-4-dev libwebkitgtk-6.0-dev \
     && rm -rf /var/lib/apt/lists/*
 
-RUN go install mvdan.cc/garble@${GARBLE_VERSION}
+# Wails beta.15 uses GTK APIs introduced in 4.14. Keep the image from building
+# successfully with headers that compile tests but cannot link the application.
+RUN pkg-config --atleast-version=4.14 gtk4 \
+    && pkg-config --exists webkitgtk-6.0
+
+# Garble v0.17.0 rejects Go 1.27, and no newer tagged release supports it yet.
+# Keep the normal cross-build image usable and reject OBFUSCATED explicitly in
+# build.sh until a compatible tagged release can be pinned here.
 
 # Install a checksum-pinned Zig archive for the image's host architecture.
-ARG ZIG_VERSION=0.14.0
+ARG ZIG_VERSION=0.16.0
 RUN ZIG_ARCH=$(case "${TARGETARCH}" in arm64) echo "aarch64" ;; amd64) echo "x86_64" ;; *) exit 1 ;; esac) && \
-    ZIG_FILE="zig-linux-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" && \
+    ZIG_FILE="zig-${ZIG_ARCH}-linux-${ZIG_VERSION}.tar.xz" && \
     curl -fSL "https://ziglang.org/download/${ZIG_VERSION}/${ZIG_FILE}" -o "/tmp/${ZIG_FILE}" && \
     EXPECTED=$(case "${ZIG_ARCH}" in \
-        aarch64) echo "ab64e3ea277f6fc5f3d723dcd95d9ce1ab282c8ed0f431b4de880d30df891e4f" ;; \
-        x86_64) echo "473ec26806133cf4d1918caf1a410f8403a13d979726a9045b421b685031a982" ;; \
+        aarch64) echo "ea4b09bfb22ec6f6c6ceac57ab63efb6b46e17ab08d21f69f3a48b38e1534f17" ;; \
+        x86_64) echo "70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00" ;; \
         *) exit 1 ;; \
     esac) && \
     echo "${EXPECTED}  /tmp/${ZIG_FILE}" | sha256sum -c - && \
     tar -xJ -f "/tmp/${ZIG_FILE}" -C /opt && \
     rm "/tmp/${ZIG_FILE}" && \
-    ln -s /opt/zig-linux-${ZIG_ARCH}-${ZIG_VERSION}/zig /usr/local/bin/zig
+    ln -s /opt/zig-${ZIG_ARCH}-linux-${ZIG_VERSION}/zig /usr/local/bin/zig
 
 # Download macOS SDK (required for darwin targets)
-ARG MACOS_SDK_VERSION=14.5
-ARG MACOS_SDK_SHA256=6e146275d19f027faa2e8354da5e0267513abf013b8f16ad65a231653a2b1c5d
+ARG MACOS_SDK_VERSION=26.1
+ARG MACOS_SDK_SHA256=beee7212d265a6d2867d0236cc069314b38d5fb3486a6515734e76fa210c784c
 RUN SDK_FILE="MacOSX${MACOS_SDK_VERSION}.sdk.tar.xz" && \
     curl -fL "https://github.com/joseluisq/macosx-sdks/releases/download/${MACOS_SDK_VERSION}/${SDK_FILE}" -o "/tmp/${SDK_FILE}" && \
     echo "${MACOS_SDK_SHA256}  /tmp/${SDK_FILE}" | sha256sum -c - && \
@@ -79,11 +85,11 @@ for arg in "$@"; do
     fi
     case "$arg" in
         -target) SKIP_NEXT=1 ;;
-        -mmacosx-version-min=*) ;;
+        -mmacosx-version-min=*|-mmacos-version-min=*) ;;
         *) ARGS="$ARGS $arg" ;;
     esac
 done
-exec zig cc -fno-sanitize=all -target aarch64-macos-none -isysroot /opt/macos-sdk -I/opt/macos-sdk/usr/include -L/opt/macos-sdk/usr/lib -F/opt/macos-sdk/System/Library/Frameworks -w $ARGS
+exec zig cc -fno-sanitize=all -target aarch64-macos-none -mmacos-version-min=13.0 -isysroot /opt/macos-sdk -I/opt/macos-sdk/usr/include -L/opt/macos-sdk/usr/lib -F/opt/macos-sdk/System/Library/Frameworks -w $ARGS
 ZIGWRAP
 RUN chmod +x /usr/local/bin/zcc-darwin-arm64
 
@@ -99,11 +105,11 @@ for arg in "$@"; do
     fi
     case "$arg" in
         -target) SKIP_NEXT=1 ;;
-        -mmacosx-version-min=*) ;;
+        -mmacosx-version-min=*|-mmacos-version-min=*) ;;
         *) ARGS="$ARGS $arg" ;;
     esac
 done
-exec zig cc -fno-sanitize=all -target x86_64-macos-none -isysroot /opt/macos-sdk -I/opt/macos-sdk/usr/include -L/opt/macos-sdk/usr/lib -F/opt/macos-sdk/System/Library/Frameworks -w $ARGS
+exec zig cc -fno-sanitize=all -target x86_64-macos-none -mmacos-version-min=13.0 -isysroot /opt/macos-sdk -I/opt/macos-sdk/usr/include -L/opt/macos-sdk/usr/lib -F/opt/macos-sdk/System/Library/Frameworks -w $ARGS
 ZIGWRAP
 RUN chmod +x /usr/local/bin/zcc-darwin-amd64
 
@@ -160,11 +166,13 @@ case "${OS}-${ARCH}" in
         export CC=zcc-darwin-arm64
         export GOARCH=arm64
         export GOOS=darwin
+        export MACOSX_DEPLOYMENT_TARGET=13.0
         ;;
     darwin-amd64|darwin-x86_64)
         export CC=zcc-darwin-amd64
         export GOARCH=amd64
         export GOOS=darwin
+        export MACOSX_DEPLOYMENT_TARGET=13.0
         ;;
     linux-arm64|linux-aarch64)
         export CC=gcc
@@ -194,6 +202,11 @@ case "${OS}-${ARCH}" in
         ;;
 esac
 
+if [ "${OBFUSCATED:-false}" = "true" ]; then
+    echo "obfuscated builds are disabled: no tagged Garble release supports Go 1.27; use a normal build until a compatible tagged release is pinned" >&2
+    exit 1
+fi
+
 export CGO_ENABLED=1
 export CGO_CFLAGS="-w"
 
@@ -222,13 +235,7 @@ if [ -n "$EXTRA_TAGS" ]; then
     TAGS="${TAGS},${EXTRA_TAGS}"
 fi
 
-COMPILER="go build"
-if [ "$OBFUSCATED" = "true" ]; then
-    COMPILER="garble ${GARBLE_ARGS} build"
-    TAGS="${TAGS},wails_obfuscated"
-fi
-
-${COMPILER} -tags "$TAGS" -trimpath -buildvcs=false -ldflags="$LDFLAGS" -o bin/${APP}-${GOOS}-${GOARCH}${EXT} .
+go build -tags "$TAGS" -trimpath -buildvcs=false -ldflags="$LDFLAGS" -o bin/${APP}-${GOOS}-${GOARCH}${EXT} .
 echo "Built: bin/${APP}-${GOOS}-${GOARCH}${EXT}"
 SCRIPT
 RUN chmod +x /usr/local/bin/build.sh

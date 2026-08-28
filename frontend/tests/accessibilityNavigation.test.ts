@@ -20,7 +20,7 @@ describe("App accessibility helpers", () => {
 
   it("only marks the workbench inert and hidden while a modal is active", () => {
     expect(modalBackgroundAttributes(false)).toEqual({});
-    expect(modalBackgroundAttributes(true)).toEqual({ inert: "", "aria-hidden": true });
+    expect(modalBackgroundAttributes(true)).toEqual({ inert: true, "aria-hidden": true });
   });
 
   it("moves focus through bounded action lists with arrows, Home, and End", () => {

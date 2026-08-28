@@ -107,10 +107,16 @@ tasks:
       - npm run dev -- --port {{.VITE_PORT}} --strictPort
 
   update:build-assets:
-    summary: Updates the build assets
+    summary: Updates build assets and reapplies Quarry's platform policy
     dir: build
     cmds:
       - wails3 update build-assets -name "{{.APP_NAME}}" -binaryname "{{.APP_NAME}}" -config config.yml -dir .
+      # Wails beta.15 currently regenerates both Darwin plists with a macOS 12
+      # floor. Go 1.27 requires macOS 13, so fail closed unless the generated
+      # files contain exactly one minimum-version key and then enforce it.
+      - go run ./assetpolicy -macos-minimum "{{.MACOS_MINIMUM}}" darwin/Info.plist darwin/Info.dev.plist
+    vars:
+      MACOS_MINIMUM: "13.0.0"
 
   setup:docker:
     summary: Builds the desktop cross-OS image (~800MB download)

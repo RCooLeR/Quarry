@@ -1,6 +1,7 @@
 package replace
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -137,6 +138,12 @@ func TestLoadManifestRejectsOversizedUnknownAndTrailingJSON(t *testing.T) {
 		{name: "duplicate field", mutate: func(data []byte) []byte {
 			return append(data[:len(data)-1], []byte(`,"operation":"regex-replace"}`)...)
 		}},
+		{name: "invalid UTF-8", mutate: func(data []byte) []byte {
+			return bytes.Replace(data, []byte("plain-replace"), []byte{'p', 'l', 'a', 'i', 'n', '-', 0xff}, 1)
+		}},
+		{name: "case-mismatched field", mutate: func(data []byte) []byte {
+			return bytes.Replace(data, []byte(`"operation"`), []byte(`"Operation"`), 1)
+		}},
 		{name: "trailing object", mutate: func(data []byte) []byte {
 			return append(data, []byte(` {}`)...)
 		}},
@@ -160,6 +167,39 @@ func TestLoadManifestRejectsOversizedUnknownAndTrailingJSON(t *testing.T) {
 				t.Fatalf("LoadManifest error = %v, want ErrInvalidRecoveryManifest", err)
 			}
 		})
+	}
+}
+
+func TestLoadManifestPreservesNullAndZeroSemantics(t *testing.T) {
+	dir := t.TempDir()
+	sourcePath := filepath.Join(dir, "source.sql")
+	outputPath := filepath.Join(dir, "output.sql")
+	manifestPath := outputPath + recoveryManifestSuffix
+	data, err := json.Marshal(map[string]any{
+		"operation":      "plain-replace",
+		"source":         sourcePath,
+		"output":         outputPath,
+		"tempOutput":     nil,
+		"startedAt":      time.Unix(1_700_000_000, 0).UTC(),
+		"completedAt":    nil,
+		"sourceSize":     nil,
+		"bytesProcessed": 0,
+		"matches":        nil,
+		"status":         "failed",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manifestPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest, err := LoadManifest(manifestPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manifest.TempOutput != "" || manifest.CompletedAt != nil || manifest.SourceSize != 0 || manifest.BytesProcessed != 0 || manifest.Matches != 0 {
+		t.Fatalf("null/zero fields decoded as %#v", manifest)
 	}
 }
 

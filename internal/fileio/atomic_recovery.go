@@ -1,11 +1,11 @@
 package fileio
 
 import (
-	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -725,14 +725,9 @@ func loadAtomicWriteJournal(path string) (atomicWriteJournalPayload, bool, error
 	if len(data) > atomicWriteJournalMax {
 		return atomicWriteJournalPayload{}, true, fmt.Errorf("%w: journal exceeds %d bytes", ErrAtomicRecoveryJournal, atomicWriteJournalMax)
 	}
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
 	var journal atomicWriteJournal
-	if err := decoder.Decode(&journal); err != nil {
+	if err := jsonv2.Unmarshal(data, &journal, jsonv2.RejectUnknownMembers(true)); err != nil {
 		return atomicWriteJournalPayload{}, true, fmt.Errorf("%w: %v", ErrAtomicRecoveryJournal, err)
-	}
-	if err := ensureAtomicJournalEOF(decoder); err != nil {
-		return atomicWriteJournalPayload{}, true, err
 	}
 	if err := validateAtomicWriteJournal(path, journal.atomicWriteJournalPayload); err != nil {
 		return atomicWriteJournalPayload{}, true, err
@@ -745,17 +740,6 @@ func loadAtomicWriteJournal(path string) (atomicWriteJournalPayload, bool, error
 		return atomicWriteJournalPayload{}, true, fmt.Errorf("%w: checksum mismatch", ErrAtomicRecoveryJournal)
 	}
 	return journal.atomicWriteJournalPayload, true, nil
-}
-
-func ensureAtomicJournalEOF(decoder *json.Decoder) error {
-	var extra any
-	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
-		if err == nil {
-			return fmt.Errorf("%w: trailing JSON value", ErrAtomicRecoveryJournal)
-		}
-		return fmt.Errorf("%w: %v", ErrAtomicRecoveryJournal, err)
-	}
-	return nil
 }
 
 func validateAtomicWriteJournal(path string, journal atomicWriteJournalPayload) error {

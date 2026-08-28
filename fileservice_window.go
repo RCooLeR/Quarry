@@ -38,10 +38,7 @@ func (s *FileService) GetMatchWindow(fileID string, hitOffset int64, hitLength i
 	}
 
 	margin := min(256, (budget-hitLength)/2)
-	hint := hitOffset - int64(margin)
-	if hint < 0 {
-		hint = 0
-	}
+	hint := max(hitOffset-int64(margin), 0)
 	matchEnd := hitOffset + int64(hitLength)
 	if matchEnd-hint > int64(budget) {
 		hint = matchEnd - int64(budget)

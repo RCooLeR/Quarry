@@ -98,10 +98,7 @@ func prepareTextRange(doc document.ReaderAtSize, start int64, end int64, kind te
 }
 
 func inspectSourceBOM(doc document.ReaderAtSize, size int64, kind textEncodingKind) (int64, error) {
-	prefixLength := int64(3)
-	if size < prefixLength {
-		prefixLength = size
-	}
+	prefixLength := min(size, int64(3))
 	if prefixLength <= 0 {
 		return 0, nil
 	}

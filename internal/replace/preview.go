@@ -83,10 +83,7 @@ func PreviewPlain(ctx context.Context, r ReaderAtSize, pattern []byte, repl []by
 }
 
 func replacementSnippet(r ReaderAtSize, offset int64, length int, repl []byte, radius int) (string, string, error) {
-	start := offset - int64(radius)
-	if start < 0 {
-		start = 0
-	}
+	start := max(offset-int64(radius), 0)
 	end := offset + int64(length+radius)
 	if size := r.Size(); end > size {
 		end = size

@@ -48,8 +48,8 @@ Built with **Go + [Wails v3](https://v3.wails.io/) + React + TypeScript +
 
 ## Quick start
 
-Canonical prerequisites: [Go](https://go.dev/) 1.26.6, Node.js 24.19.0 with npm
-11.17.0, Wails CLI `v3.0.0-alpha2.106`, and [Task](https://taskfile.dev/)
+Canonical prerequisites: [Go](https://go.dev/) 1.27.0, Node.js 24.20.0 with npm
+12.0.2, Wails CLI `v3.0.0-beta.15`, and [Task](https://taskfile.dev/)
 (optional but convenient). Compatible developer Node ranges and exact install
 commands are listed in [Getting started](docs/getting-started.md).
 

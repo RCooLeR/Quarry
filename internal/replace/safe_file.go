@@ -138,8 +138,7 @@ func replaceBatchFileAtomic(ctx context.Context, sourcePath string, outputPath s
 		return err
 	}
 	if err := out.CommitContextValidated(ctx, validateSource); err != nil {
-		var publication *fileio.PublicationError
-		if errors.As(err, &publication) {
+		if publication, ok := errors.AsType[*fileio.PublicationError](err); ok {
 			summary.Published = true
 			summary.PublicationUncertain = publication.LocationUncertain
 		}

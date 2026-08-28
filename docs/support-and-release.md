@@ -89,9 +89,10 @@ installer, and then signs and timestamps the outer installer.
 ## Linux validation boundary
 
 The raw `linux:build` task remains available for local and CI validation, but
-its target CPU architecture must match the host. The Docker fallback contains
-native GCC and GTK/WebKit libraries rather than a cross-architecture sysroot,
-so the task rejects mismatched `ARCH` values before frontend or container work.
+its target CPU architecture must match the host. The Debian 13/Trixie Docker
+fallback contains native GCC, GTK 4.14+, and WebKitGTK 6 libraries rather than
+a cross-architecture sysroot, so the task rejects mismatched `ARCH` values
+before frontend or container work.
 Every Linux package or signing entry point (`package`, AppImage, deb, rpm, Arch,
 and their generate/sign helpers) fails before build, download, or output work.
 The legacy AppImage helper also exits immediately; it no longer downloads or
@@ -107,9 +108,9 @@ clean-machine distro matrix.
 ## macOS distribution boundary
 
 The raw `darwin:build` task and the local `darwin:run` developer wrapper remain
-available for source-level validation. Every macOS package, application-bundle,
-signing, and notarization task fails before build, output, credential, or
-network work. The root `package` task dispatches to that same fail-closed
+available for source-level validation on macOS 13 or newer. Every macOS
+package, application-bundle, signing, and notarization task fails before build,
+output, credential, or network work. The root `package` task dispatches to that same fail-closed
 platform guard when it runs on macOS; it cannot construct an `.app` bundle as a
 fallback. The local run wrapper's ad-hoc-signed `.dev.app` is not a package or a
 redistributable artifact.

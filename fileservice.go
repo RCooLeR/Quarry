@@ -1008,10 +1008,7 @@ func boundedSearchPreview(ctx context.Context, doc *document.FileDocument, match
 	if err != nil {
 		return "", false, err
 	}
-	readEnd = alignedEnd
-	if readEnd < readStart {
-		readEnd = readStart
-	}
+	readEnd = max(alignedEnd, readStart)
 	if err := ctx.Err(); err != nil {
 		return "", false, err
 	}

@@ -1045,13 +1045,7 @@ func (d *FileDocument) readChunkLocked(start int64, size int) ([]byte, error) {
 	if start >= d.size {
 		return nil, nil
 	}
-	end := start + int64(size)
-	if end > d.size {
-		end = d.size
-	}
-	if end < start {
-		end = start
-	}
+	end := max(min(start+int64(size), d.size), start)
 
 	buf := make([]byte, end-start)
 	n, err := d.file.ReadAt(buf, start)
@@ -1370,10 +1364,7 @@ func (d *FileDocument) offsetStartsInsideLine(offset int64) (bool, error) {
 		return false, nil
 	}
 
-	start := offset - 4
-	if start < 0 {
-		start = 0
-	}
+	start := max(offset-4, 0)
 	if (d.meta.Encoding == "UTF-16LE" || d.meta.Encoding == "UTF-16BE") && start&1 != 0 {
 		start--
 	}
@@ -1724,14 +1715,8 @@ func (d *FileDocument) seedPriorityIndex(offset int64) {
 		return
 	}
 
-	start := offset - priorityIndexWindowSize/2
-	if start < 0 {
-		start = 0
-	}
-	end := start + priorityIndexWindowSize
-	if end > d.size {
-		end = d.size
-	}
+	start := max(offset-priorityIndexWindowSize/2, 0)
+	end := min(start+priorityIndexWindowSize, d.size)
 	if start >= end {
 		d.priorityMu.Unlock()
 		return
@@ -1809,14 +1794,12 @@ func (d *FileDocument) seedPriorityIndex(offset int64) {
 }
 
 // startPriorityIndexWorkerLocked requires lifecycleMu to be held for reading.
-// That makes the first positive WaitGroup.Add happen-before Close's Wait.
+// That makes the first WaitGroup.Go call happen-before Close's Wait.
 func (d *FileDocument) startPriorityIndexWorkerLocked() {
 	d.priorityOnce.Do(func() {
-		d.priorityWG.Add(1)
-		go func() {
-			defer d.priorityWG.Done()
+		d.priorityWG.Go(func() {
 			d.runPriorityIndexWorker()
-		}()
+		})
 	})
 }
 

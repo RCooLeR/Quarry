@@ -41,10 +41,7 @@ func (d *FileDocument) AlignTextOffsetBackward(offset int64) (int64, error) {
 			return offset, nil
 		}
 		start := offset - 2
-		end := offset + 2
-		if end > d.size {
-			end = d.size
-		}
+		end := min(offset+2, d.size)
 		data, err := d.ReadRangeWithLimit(start, end, 4)
 		if err != nil {
 			return 0, err
@@ -70,10 +67,7 @@ func (d *FileDocument) AlignTextOffsetBackward(offset int64) (int64, error) {
 		if offset >= d.size {
 			return offset, nil
 		}
-		start := offset - 3
-		if start < 0 {
-			start = 0
-		}
+		start := max(offset-3, 0)
 		data, err := d.ReadRangeWithLimit(start, offset+1, 4)
 		if err != nil {
 			return 0, err
@@ -107,10 +101,7 @@ func (d *FileDocument) AlignTextOffsetForward(offset int64) (int64, error) {
 		return offset, nil
 	}
 
-	end := back + 4
-	if end > d.size {
-		end = d.size
-	}
+	end := min(back+4, d.size)
 	data, err := d.ReadRangeWithLimit(back, end, 4)
 	if err != nil {
 		return 0, err
@@ -186,10 +177,7 @@ func (d *FileDocument) PreviousWindowStart(currentStart int64, maxBytes int64, m
 	if currentStart <= 0 {
 		return 0, nil
 	}
-	rangeStart := currentStart - maxBytes
-	if rangeStart < 0 {
-		rangeStart = 0
-	}
+	rangeStart := max(currentStart-maxBytes, 0)
 	rangeStart, err := d.AlignTextOffsetForward(rangeStart)
 	if err != nil {
 		return 0, err
@@ -219,10 +207,7 @@ func (d *FileDocument) PreviousWindowStart(currentStart int64, maxBytes int64, m
 	}
 	pos := rangeStart
 	for pos < currentStart {
-		end := pos + int64(bufSize)
-		if end > currentStart {
-			end = currentStart
-		}
+		end := min(pos+int64(bufSize), currentStart)
 		data, readErr := d.ReadRangeWithLimit(pos, end, int64(bufSize))
 		if readErr != nil {
 			return 0, readErr

@@ -5,12 +5,10 @@ export function primaryShortcut(key: string): string {
 }
 
 export function modalBackgroundAttributes(active: boolean): {
-  inert?: "";
+  inert?: true;
   "aria-hidden"?: true;
 } {
-  // React 18 does not yet treat `inert` as a boolean DOM property. The empty
-  // standards-compliant attribute preserves support in Chromium/WebView2.
-  return active ? { inert: "", "aria-hidden": true } : {};
+  return active ? { inert: true, "aria-hidden": true } : {};
 }
 
 /** Roving focus for bounded search/bookmark action lists. */

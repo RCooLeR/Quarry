@@ -1,6 +1,7 @@
 package fileio
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"os"
@@ -216,6 +217,73 @@ func TestRecoverAtomicWritePreservesCorruptJournalAndNamedArtifacts(t *testing.T
 	}
 	assertOptionalRecoveryArtifact(t, path, []byte("current"))
 	assertOptionalRecoveryArtifact(t, journalPath, []byte(`{"version":1,"checksum":"wrong"}`))
+}
+
+func TestAtomicWriteJournalStrictJSONDecoding(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func([]byte, atomicWriteJournal) []byte
+	}{
+		{name: "unknown field", mutate: func(data []byte, _ atomicWriteJournal) []byte {
+			return bytes.Replace(data, []byte(`"checksum"`), []byte(`"forged":true,"checksum"`), 1)
+		}},
+		{name: "duplicate field", mutate: func(data []byte, _ atomicWriteJournal) []byte {
+			return bytes.Replace(data, []byte(`"version": 1`), []byte(`"version": 1,"version": 1`), 1)
+		}},
+		{name: "invalid UTF-8", mutate: func(data []byte, journal atomicWriteJournal) []byte {
+			invalidID := append([]byte(nil), journal.OperationID...)
+			invalidID[0] = 0xff
+			return bytes.Replace(data, []byte(journal.OperationID), invalidID, 1)
+		}},
+		{name: "case-mismatched field", mutate: func(data []byte, _ atomicWriteJournal) []byte {
+			return bytes.Replace(data, []byte(`"operationId"`), []byte(`"OperationId"`), 1)
+		}},
+		{name: "trailing value", mutate: func(data []byte, _ atomicWriteJournal) []byte {
+			return append(data, []byte(` {}`)...)
+		}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "settings.json")
+			journal := installAtomicRecoveryFixture(t, path, ".settings.tmp", false, nil, []byte("new settings"))
+			journalPath := path + atomicWriteJournalSuffix
+			data, err := os.ReadFile(journalPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutated := test.mutate(data, journal)
+			if err := os.WriteFile(journalPath, mutated, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, present, err := loadAtomicWriteJournal(path); !present || !errors.Is(err, ErrAtomicRecoveryJournal) {
+				t.Fatalf("loadAtomicWriteJournal = present %v, error %v; want present invalid journal", present, err)
+			}
+		})
+	}
+}
+
+func TestAtomicWriteJournalPreservesNullAndZeroSemantics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	journal := installAtomicRecoveryFixture(t, path, ".settings.tmp", false, nil, []byte("new settings"))
+	journalPath := path + atomicWriteJournalSuffix
+	data, err := os.ReadFile(journalPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = bytes.Replace(data, []byte(`"newSize":`), []byte(`"oldSize":null,"oldSha256":null,"newSize":`), 1)
+	if err := os.WriteFile(journalPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, present, err := loadAtomicWriteJournal(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !present || got.OldSize != 0 || got.OldSHA256 != "" || got != journal.atomicWriteJournalPayload {
+		t.Fatalf("decoded journal = %#v, present %v; want original zero-value payload", got, present)
+	}
 }
 
 func TestInspectAtomicWriteRejectsChecksumValidOversizedGenerationBeforeArtifacts(t *testing.T) {

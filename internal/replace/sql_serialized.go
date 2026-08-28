@@ -107,8 +107,7 @@ func ReplaceSQLPlainFileAtomic(ctx context.Context, sourcePath string, outputPat
 		return err
 	}
 	if err := out.CommitContextValidated(ctx, validateSource); err != nil {
-		var publication *fileio.PublicationError
-		if errors.As(err, &publication) {
+		if publication, ok := errors.AsType[*fileio.PublicationError](err); ok {
 			summary.Published = true
 			summary.PublicationUncertain = publication.LocationUncertain
 		}

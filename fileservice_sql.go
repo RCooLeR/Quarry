@@ -495,7 +495,7 @@ func (s *FileService) SqlSplitByTableViaDialog(fileID string) (TransformResult, 
 		defer current.Release()
 		sum, err := sqlextract.SplitByTable(ctx, current.file.Doc, current.file.Path, current.entry.Summary,
 			sqlextract.WriteOptions{
-				PlanOptions: sqlextract.PlanOptions{OutputDir: dir},
+				OutputDir: dir,
 				Progress: func(done, total int64, outputs int) {
 					if progress != nil {
 						progress(done, fmt.Sprintf("%d of %d bytes; %d table outputs", done, total, outputs))

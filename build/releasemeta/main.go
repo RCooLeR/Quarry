@@ -80,7 +80,7 @@ func parseVersion(raw string) (releaseVersion, error) {
 		return releaseVersion{}, fmt.Errorf("version %q is not canonical semantic version MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]", raw)
 	}
 	if matches[4] != "" {
-		for _, identifier := range strings.Split(matches[4], ".") {
+		for identifier := range strings.SplitSeq(matches[4], ".") {
 			if isDecimal(identifier) && len(identifier) > 1 && identifier[0] == '0' {
 				return releaseVersion{}, fmt.Errorf("version %q has a prerelease numeric identifier with a leading zero", raw)
 			}

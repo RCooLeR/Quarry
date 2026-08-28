@@ -485,10 +485,7 @@ func alignUTF8WindowStart(readRange func(a, b int64) ([]byte, error), start, siz
 	if start <= 0 || start >= size {
 		return start, nil
 	}
-	probeStart := start - (utf8.UTFMax - 1)
-	if probeStart < 0 {
-		probeStart = 0
-	}
+	probeStart := max(start-(utf8.UTFMax-1), 0)
 	probeEnd := boundedEditWindowEnd(start, size, utf8.UTFMax)
 	probe, err := readRange(probeStart, probeEnd)
 	if err != nil {
@@ -897,10 +894,7 @@ func alignToLineStart(readRange func(a, b int64) ([]byte, error), start int64, m
 	if start <= 0 {
 		return 0, nil
 	}
-	from := start - maxScan
-	if from < 0 {
-		from = 0
-	}
+	from := max(start-maxScan, 0)
 	buf, err := readRange(from, start)
 	if err != nil {
 		return 0, err

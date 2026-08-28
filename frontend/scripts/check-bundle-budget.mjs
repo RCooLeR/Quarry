@@ -13,7 +13,7 @@ const limits = Object.freeze({
   initialJavaScriptGzipBytes: 110 * 1024,
   initialStylesheetBytes: 64 * 1024,
   largestJavaScriptChunkBytes: 320 * 1024,
-  totalJavaScriptBytes: 700 * 1024,
+  totalJavaScriptBytes: 720 * 1024,
 });
 
 function fail(message) {

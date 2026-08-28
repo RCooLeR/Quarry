@@ -200,10 +200,7 @@ func validUTF8WindowEnd(payload []byte, truncated bool) (int, error) {
 	if !truncated || !encodingx.ValidUTF8Prefix(payload) {
 		return 0, fmt.Errorf("%w: invalid UTF-8 input", ErrCSVSourceEncodingMalformed)
 	}
-	minimum := len(payload) - 3
-	if minimum < 0 {
-		minimum = 0
-	}
+	minimum := max(len(payload)-3, 0)
 	for end := len(payload) - 1; end >= minimum; end-- {
 		if utf8.Valid(payload[:end]) {
 			return end, nil
