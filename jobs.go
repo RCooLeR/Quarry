@@ -294,8 +294,9 @@ func (m *jobManager) publishOutput(jobID string, publish func() error) error {
 	if m.afterOutputPublication != nil {
 		m.afterOutputPublication(jobID, err)
 	}
-	var publication *fileio.PublicationError
-	if err == nil || errors.As(err, &publication) {
+	if err == nil {
+		job.committed = true
+	} else if _, published := errors.AsType[*fileio.PublicationError](err); published {
 		job.committed = true
 	}
 	return err

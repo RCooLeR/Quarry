@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useEffectEvent, useLayoutEffect, useMemo, useReducer, useRef, useState } from "react";
 import { Events } from "@wailsio/runtime";
 import { AppLifecycle, FileService } from "../bindings/github.com/quarry/quarry-wails3";
 import type { QuarryEditor, FileMetaData, StagingStateData, WindowStatus } from "./editor/QuarryEditor";
@@ -1232,8 +1232,7 @@ function App() {
       setOperationBusy(false);
     }
   };
-  const openFileRef = useRef(openFilePath);
-  openFileRef.current = openFilePath;
+  const openFileFromEffect = useEffectEvent(openFilePath);
 
   // Native file drops (Wails) → open each dropped path.
   useEffect(() => {
@@ -1251,7 +1250,7 @@ function App() {
         if (closeFlowRef.current || tabTransitionRef.current || busyRef.current) {
           omitted = Math.min(Number.MAX_SAFE_INTEGER, omitted + paths.length);
         } else {
-          for (const file of paths) await openFileRef.current(file);
+          for (const file of paths) await openFileFromEffect(file);
         }
         if (omitted > 0) {
           notifyInstant("Open dropped files", {
@@ -1417,7 +1416,7 @@ function App() {
     void (async () => {
       for (const p of saved) {
         if (cancelled) return;
-        await openFileRef.current(p);
+        await openFileFromEffect(p);
       }
       if (!cancelled) restoredRef.current = true;
     })();

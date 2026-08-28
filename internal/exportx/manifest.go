@@ -109,8 +109,7 @@ func markUncertainPublication(summary *Summary, err error) {
 	if summary == nil {
 		return
 	}
-	var publication *fileio.PublicationError
-	if errors.As(err, &publication) && publication.LocationUncertain {
+	if publication, ok := errors.AsType[*fileio.PublicationError](err); ok && publication.LocationUncertain {
 		summary.PublicationUncertain = true
 	}
 }

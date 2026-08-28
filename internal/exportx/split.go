@@ -344,15 +344,14 @@ func recordSplitPart(summary *SplitSummary, outputPath string, partSummary Summa
 }
 
 func splitPartWasPublished(err error, outputPath string) bool {
-	var publication *fileio.PublicationError
-	return errors.As(err, &publication) && !publication.LocationUncertain && publication.FinalPath == outputPath
+	publication, ok := errors.AsType[*fileio.PublicationError](err)
+	return ok && !publication.LocationUncertain && publication.FinalPath == outputPath
 }
 
 func failSplit(summary SplitSummary, err error) (SplitSummary, error) {
 	summary.Complete = false
 	summary.Failure = err.Error()
-	var publication *fileio.PublicationError
-	if errors.As(err, &publication) && publication.LocationUncertain {
+	if publication, ok := errors.AsType[*fileio.PublicationError](err); ok && publication.LocationUncertain {
 		summary.PublicationUncertain = true
 	}
 	summary.Parts = len(summary.Outputs)

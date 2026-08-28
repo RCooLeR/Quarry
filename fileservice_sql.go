@@ -947,8 +947,8 @@ func transformResultAfterPublication(result TransformResult, err error) (Transfo
 	if err == nil {
 		return result, nil
 	}
-	var publication *fileio.PublicationError
-	if errors.As(err, &publication) &&
+	publication, published := errors.AsType[*fileio.PublicationError](err)
+	if published &&
 		!publication.LocationUncertain &&
 		publication.FinalPath == result.OutputPath {
 		if result.Note != "" {

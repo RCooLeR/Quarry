@@ -546,8 +546,10 @@ func (s *FileService) RefreshFile(fileID string) (FileMeta, error) {
 		// rewrite that no later poll can distinguish. Preserve the registry's
 		// typed committed-error contract, but translate it at this RPC boundary
 		// into authoritative metadata plus a bounded warning.
-		var committed *session.ReopenCommittedError
-		if f == nil || !errors.As(err, &committed) {
+		if f == nil {
+			return FileMeta{}, normalizeSessionLeaseError(fileID, err)
+		}
+		if _, ok := errors.AsType[*session.ReopenCommittedError](err); !ok {
 			return FileMeta{}, normalizeSessionLeaseError(fileID, err)
 		}
 		warning := boundedRefreshWarning(err)
