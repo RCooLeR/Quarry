@@ -12,7 +12,7 @@ vars:
   # Password is stored securely in system keychain. Run: wails3 setup signing
 
   # Docker image for cross-compilation with CGO (used when CGO_ENABLED=1 on non-Windows)
-  CROSS_IMAGE: wails-cross
+  CROSS_IMAGE: quarry-wails-cross
   OWNERSHIP_FIX_IMAGE: alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
 
 tasks:

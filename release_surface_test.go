@@ -730,6 +730,24 @@ func TestCrossImageRejectsMissingOrUnsupportedBuildArchitecture(t *testing.T) {
 	}
 }
 
+func TestCrossImageTagIsProjectScoped(t *testing.T) {
+	checks := map[string]string{
+		"build/Taskfile.yml":         "docker build -t quarry-wails-cross ",
+		"build/windows/Taskfile.yml": "CROSS_IMAGE: quarry-wails-cross",
+		"build/darwin/Taskfile.yml":  "CROSS_IMAGE: quarry-wails-cross",
+		"build/linux/Taskfile.yml":   "CROSS_IMAGE: quarry-wails-cross",
+	}
+	for path, required := range checks {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read %s: %v", path, err)
+		}
+		if !strings.Contains(string(data), required) {
+			t.Errorf("%s does not use Quarry's project-scoped cross-image tag %q", path, required)
+		}
+	}
+}
+
 func TestVerificationRecordNamesOnlyExecutedGates(t *testing.T) {
 	data, err := os.ReadFile(".github/workflows/verify.yml")
 	if err != nil {

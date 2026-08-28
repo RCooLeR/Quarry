@@ -6,7 +6,7 @@ includes:
 vars:
   # Docker image for same-architecture cross-OS builds (used on non-Linux hosts
   # or when a native Linux C compiler is unavailable).
-  CROSS_IMAGE: wails-cross
+  CROSS_IMAGE: quarry-wails-cross
   OWNERSHIP_FIX_IMAGE: alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
 
 tasks:

@@ -125,7 +125,7 @@ tasks:
       Darwin and Windows targets use Zig. Linux targets must match the host/image
       CPU architecture because they link native GTK/WebKit libraries with GCC.
     cmds:
-      - docker build -t wails-cross -f build/docker/Dockerfile.cross build/docker/
+      - docker build -t quarry-wails-cross -f build/docker/Dockerfile.cross build/docker/
     preconditions:
       - sh: docker info > /dev/null 2>&1
         msg: "Docker is required. Please install Docker first."
