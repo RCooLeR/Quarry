@@ -1,0 +1,104 @@
+version: '3'
+
+env:
+  GOTOOLCHAIN: local
+
+vars:
+  APP_NAME: "quarry"
+  # The root include runs this workspace in src; direct calls already start
+  # here. Resolve that execution directory, not Task's outer ROOT_DIR.
+  SOURCE_DIR:
+    sh: pwd
+  REPO_DIR: '{{joinPath .SOURCE_DIR ".."}}'
+  BIN_DIR: "../bin"
+  VITE_PORT: '{{.WAILS_VITE_PORT | default 9245}}'
+  WAILS_VERSION: "v3.0.0-beta.23"
+  STATICCHECK_VERSION: "v0.8.1"
+  GOVULNCHECK_VERSION: "v1.8.0"
+  ACTIONLINT_VERSION: "v1.7.12"
+  GORELEASER_VERSION: "v2.18.2"
+
+includes:
+  common: ./build/Taskfile.yml
+  windows: ./build/windows/Taskfile.yml
+  darwin: ./build/darwin/Taskfile.yml
+  linux: ./build/linux/Taskfile.yml
+
+tasks:
+  verify:
+    summary: Runs the canonical local correctness, static-analysis, dependency, and workflow gates
+    cmds:
+      - go mod verify
+      - task: common:verify:go:modules
+      # main.go embeds the ignored frontend/dist build output. Generate it
+      # before any whole-module Go command so this gate works in a fresh clone.
+      - task: frontend:check
+      - go test -count=1 ./...
+      - go test -tags production -count=1 ./...
+      - task: verify:static
+      - task: verify:security
+      - task: verify:workflows
+
+  verify:race:
+    summary: Runs the race-enabled Go suite used by the Linux CI gate
+    cmds:
+      - task: frontend:check
+      - go test -race -count=1 ./...
+
+  verify:static:
+    summary: Runs vet and the pinned staticcheck release for default and production builds
+    cmds:
+      - task: frontend:check
+      - go vet ./...
+      - go vet -tags production ./...
+      - go run honnef.co/go/tools/cmd/staticcheck@{{.STATICCHECK_VERSION}} ./...
+      - go run honnef.co/go/tools/cmd/staticcheck@{{.STATICCHECK_VERSION}} -tags production ./...
+
+  verify:security:
+    summary: Scans reachable Go code and the locked npm graph with pinned tools
+    env:
+      NODE_USE_SYSTEM_CA: "1"
+    cmds:
+      - task: frontend:check
+      - go run golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}} ./...
+      - go run golang.org/x/vuln/cmd/govulncheck@{{.GOVULNCHECK_VERSION}} -tags production ./...
+      - cmd: npm audit --audit-level=high
+        dir: frontend
+
+  verify:workflows:
+    summary: Lints workflows and checks publication containment with pinned tool releases
+    # Relative to this workspace, including when the root Taskfile forwards it.
+    dir: ..
+    cmds:
+      - go run github.com/rhysd/actionlint/cmd/actionlint@{{.ACTIONLINT_VERSION}} -no-color
+      - go run github.com/goreleaser/goreleaser/v2@{{.GORELEASER_VERSION}} check
+
+  build:
+    summary: Builds the application
+    cmds:
+      - task: "{{OS}}:build"
+
+  package:
+    summary: Builds a local, unqualified package for validation (never publishes)
+    cmds:
+      - task: "{{OS}}:package"
+
+  frontend:check:
+    summary: Generates bindings, installs the locked dependencies, tests, type-checks, and builds the frontend
+    cmds:
+      - task: common:build:frontend
+
+  run:
+    summary: Runs the application
+    cmds:
+      - task: "{{OS}}:run"
+
+  dev:
+    summary: Runs the application in development mode
+    cmds:
+      - wails3 dev -config ./build/config.yml -port {{.VITE_PORT}}
+
+  setup:docker:
+    summary: Builds the desktop cross-OS image (~800MB download)
+    cmds:
+      - task: common:setup:docker

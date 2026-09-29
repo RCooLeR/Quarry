@@ -56,6 +56,9 @@ jobs:
     needs: source-identity
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    defaults:
+      run:
+        working-directory: src
     strategy:
       fail-fast: false
       matrix:
@@ -87,15 +90,16 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
           cache: true
+          cache-dependency-path: src/go.sum
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.20.0
+          node-version: 24.21.0
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
 
       - name: Install pinned npm
         run: npm install --global npm@12.0.2
@@ -103,12 +107,12 @@ jobs:
       - name: Verify pinned toolchain
         shell: bash
         run: |
-          test "$(go env GOVERSION)" = "go1.27.0"
-          test "$(node --version)" = "v24.20.0"
+          test "$(go env GOVERSION)" = "go1.27.1"
+          test "$(node --version)" = "v24.21.0"
           test "$(npm --version)" = "12.0.2"
 
       - name: Install pinned Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
 
       - name: Verify Go dependency graph
         run: |
@@ -149,6 +153,9 @@ jobs:
     needs: source-identity
     runs-on: ubuntu-24.04
     timeout-minutes: 35
+    defaults:
+      run:
+        working-directory: src
     steps:
       - name: Checkout verified commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -157,18 +164,27 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Install Linux desktop dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config gcc libc6-dev \
+            libgtk-4-dev libwebkitgtk-6.0-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev
+
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
           cache: true
+          cache-dependency-path: src/go.sum
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.20.0
+          node-version: 24.21.0
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
 
       - name: Install pinned npm
         run: npm install --global npm@12.0.2
@@ -177,6 +193,14 @@ jobs:
         run: |
           go mod verify
           go mod tidy -diff
+
+      - name: Install pinned Wails CLI
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
+
+      # This job has its own checkout. Whole-module analysis needs the embedded
+      # frontend and native desktop headers even though it produces no binary.
+      - name: Generate bindings and embedded frontend for analysis
+        run: wails3 task frontend:check
 
       - name: Run Go vet
         run: |
@@ -200,14 +224,14 @@ jobs:
           GOTOOLCHAIN: local
           GOVULNDB: https://vuln.go.dev
         run: |
-          go install golang.org/x/vuln/cmd/govulncheck@v1.7.0
+          go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
           "$(go env GOPATH)/bin/govulncheck" ./...
           "$(go env GOPATH)/bin/govulncheck" -tags production ./...
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/govulncheck" ./...
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/govulncheck" -tags production ./...
 
       - name: Audit locked frontend dependencies
-        working-directory: frontend
+        working-directory: src/frontend
         env:
           NODE_USE_SYSTEM_CA: "1"
         run: |
@@ -215,6 +239,7 @@ jobs:
           npm audit --audit-level=high
 
       - name: Lint GitHub Actions workflows with pinned actionlint
+        working-directory: .
         env:
           GOTOOLCHAIN: local
         run: |
@@ -224,7 +249,7 @@ jobs:
       - name: Check GoReleaser containment config
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94 # v7.2.3
         with:
-          version: v2.18.0
+          version: v2.18.2
           args: check
 
       - name: Verify analysis preserved source inputs
@@ -243,6 +268,9 @@ jobs:
       - analysis
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: src
     steps:
       - name: Checkout verified commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -254,15 +282,15 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
           cache: false
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.20.0
+          node-version: 24.21.0
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
 
       - name: Install pinned npm
         run: npm install --global npm@12.0.2
@@ -293,8 +321,8 @@ jobs:
               workflow:{runId:$runId, attempt:$runAttempt},
               toolchain:{go:$goVersion, node:$nodeVersion, npm:$npmVersion,
                 goToolchainPolicy:"local",
-                wails:"v3.0.0-beta.15", staticcheck:"v0.8.1",
-                govulncheck:"v1.7.0", actionlint:"v1.7.12", goreleaser:"v2.18.0"},
+                wails:"v3.0.0-beta.23", staticcheck:"v0.8.1",
+                govulncheck:"v1.8.0", actionlint:"v1.7.12", goreleaser:"v2.18.2"},
               inputs:{goModSha256:$goModSha256, goSumSha256:$goSumSha256,
                 frontendPackageSha256:$packageSha256, frontendLockSha256:$lockSha256},
               gates:["windows-tests-build", "linux-tests-build", "linux-production-tests",

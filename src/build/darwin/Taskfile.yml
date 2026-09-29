@@ -1,0 +1,158 @@
+version: '3'
+
+includes:
+  common: ../Taskfile.yml
+
+vars:
+  # Docker image for cross-compilation (used when building on non-macOS)
+  CROSS_IMAGE: quarry-wails-cross
+  OWNERSHIP_FIX_IMAGE: alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+
+tasks:
+  build:
+    summary: Builds the application
+    preconditions:
+      - sh: '{{if eq .OBFUSCATED "true"}}exit 1{{else}}exit 0{{end}}'
+        msg: "Obfuscated builds are disabled: Garble v0.18.0 has not completed Quarry obfuscation qualification. Use a normal build until obfuscation qualification is complete."
+    cmds:
+      - task: '{{if eq OS "darwin"}}build:native{{else}}build:docker{{end}}'
+        vars:
+          ARCH: '{{.ARCH}}'
+          DEV: '{{.DEV}}'
+          OUTPUT: '{{.OUTPUT}}'
+          EXTRA_TAGS: '{{.EXTRA_TAGS}}'
+          OBFUSCATED: '{{.OBFUSCATED}}'
+    vars:
+      DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
+      OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
+
+  build:native:
+    summary: Builds the application natively on macOS
+    internal: true
+    deps:
+      - task: common:build:frontend
+        vars:
+          BUILD_FLAGS:
+            ref: .BUILD_FLAGS
+          OBFUSCATED:
+            ref: .OBFUSCATED
+          DEV:
+            ref: .DEV
+    cmds:
+      - 'go build {{.BUILD_FLAGS}} -o "{{.OUTPUT}}"'
+    vars:
+      BUILD_FLAGS: '{{if eq .DEV "true"}}{{if .EXTRA_TAGS}}-tags {{.EXTRA_TAGS}} {{end}}-buildvcs=false -gcflags=all="-l"{{else}}-tags production{{if .EXTRA_TAGS}},{{.EXTRA_TAGS}}{{end}} -trimpath -buildvcs=false -ldflags="-w -s -X=github.com/quarry/quarry-wails3/internal/buildinfo.Version={{.APP_VERSION | default "0.0.0-dev"}} -X=github.com/quarry/quarry-wails3/internal/buildinfo.Commit={{.BUILD_COMMIT | default "unknown"}} -X=github.com/quarry/quarry-wails3/internal/buildinfo.BuildDate={{.BUILD_DATE | default "unknown"}}"{{end}}'
+      DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
+      OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
+    env:
+      GOOS: darwin
+      CGO_ENABLED: 1
+      GOARCH: '{{.ARCH | default ARCH}}'
+      CGO_CFLAGS: "-mmacosx-version-min=13.0"
+      CGO_LDFLAGS: "-mmacosx-version-min=13.0"
+      MACOSX_DEPLOYMENT_TARGET: "13.0"
+
+  build:docker:
+    summary: Cross-compiles for macOS using Docker (for Linux/Windows hosts)
+    internal: true
+    deps:
+      - task: common:build:frontend
+        vars:
+          OBFUSCATED:
+            ref: .OBFUSCATED
+    preconditions:
+      - sh: docker info > /dev/null 2>&1
+        msg: "Docker is required for cross-compilation. Please install Docker."
+      - sh: docker image inspect {{.CROSS_IMAGE}} > /dev/null 2>&1
+        msg: |
+          Docker image '{{.CROSS_IMAGE}}' not found.
+          Build it first: wails3 task setup:docker
+    cmds:
+      - docker run --rm -v "{{.REPO_DIR}}:/app" {{.DOCKER_MOUNTS}} -e APP_NAME="{{.APP_NAME}}" -e APP_VERSION="{{.APP_VERSION | default "0.0.0-dev"}}" -e BUILD_COMMIT="{{.BUILD_COMMIT | default "unknown"}}" -e BUILD_DATE="{{.BUILD_DATE | default "unknown"}}" {{if .EXTRA_TAGS}}-e EXTRA_TAGS="{{.EXTRA_TAGS}}"{{end}} {{.CROSS_IMAGE}} darwin {{.DOCKER_ARCH}}
+      - cmd: docker run --rm -v "{{.REPO_DIR}}:/app" "{{.OWNERSHIP_FIX_IMAGE}}" chown -R $(id -u):$(id -g) /app/bin
+        platforms: [linux, darwin]
+      - mkdir -p {{.BIN_DIR}}
+      - mv "{{.BIN_DIR}}/{{.APP_NAME}}-darwin-{{.DOCKER_ARCH}}" "{{.OUTPUT}}"
+    vars:
+      DOCKER_ARCH: '{{if eq .ARCH "arm64"}}arm64{{else if eq .ARCH "amd64"}}amd64{{else}}arm64{{end}}'
+      DEFAULT_OUTPUT: '{{.BIN_DIR}}/{{.APP_NAME}}'
+      OUTPUT: '{{ .OUTPUT | default .DEFAULT_OUTPUT }}'
+      # Repository-relative replacements resolve under /app/src. Add mounts
+      # for external replacements with a DOCKER_MOUNTS CLI override if needed.
+      DOCKER_MOUNTS: '-v "quarry-go-mod-cache:/go/pkg/mod"'
+
+  build:universal:
+    summary: Builds darwin universal binary (arm64 + amd64)
+    deps:
+      - task: build
+        vars:
+          ARCH: amd64
+          OUTPUT: "{{.BIN_DIR}}/{{.APP_NAME}}-amd64"
+      - task: build
+        vars:
+          ARCH: arm64
+          OUTPUT: "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
+    cmds:
+      - task: '{{if eq OS "darwin"}}build:universal:lipo:native{{else}}build:universal:lipo:go{{end}}'
+
+  build:universal:lipo:native:
+    summary: Creates universal binary using native lipo (macOS)
+    internal: true
+    cmds:
+      - lipo -create -output "{{.BIN_DIR}}/{{.APP_NAME}}" "{{.BIN_DIR}}/{{.APP_NAME}}-amd64" "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
+      - rm "{{.BIN_DIR}}/{{.APP_NAME}}-amd64" "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
+
+  build:universal:lipo:go:
+    summary: Creates universal binary using wails3 tool lipo (Linux/Windows)
+    internal: true
+    cmds:
+      - wails3 tool lipo -output "{{.BIN_DIR}}/{{.APP_NAME}}" -input "{{.BIN_DIR}}/{{.APP_NAME}}-amd64" -input "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
+      - rm -f "{{.BIN_DIR}}/{{.APP_NAME}}-amd64" "{{.BIN_DIR}}/{{.APP_NAME}}-arm64"
+
+  package:
+    summary: Rejects unsupported macOS application packaging
+    cmds:
+      - task: unsupported:distribution
+
+  package:universal:
+    summary: Rejects unsupported macOS universal application packaging
+    cmds:
+      - task: unsupported:distribution
+
+  create:app:bundle:
+    summary: Rejects unsupported macOS application-bundle creation
+    cmds:
+      - task: unsupported:distribution
+
+  run:
+    cmds:
+      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/MacOS"
+      - mkdir -p "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/Resources"
+      - cp build/darwin/icons.icns "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/Resources"
+      - |
+        if [ -f build/darwin/Assets.car ]; then
+          cp build/darwin/Assets.car "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/Resources"
+        fi
+      - cp "{{.BIN_DIR}}/{{.APP_NAME}}" "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/MacOS"
+      - cp "build/darwin/Info.dev.plist" "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/Info.plist"
+      - codesign --force --deep --sign - "{{.BIN_DIR}}/{{.APP_NAME}}.dev.app"
+      - '"{{.BIN_DIR}}/{{.APP_NAME}}.dev.app/Contents/MacOS/{{.APP_NAME}}"'
+
+  sign:
+    summary: Rejects unsupported macOS distribution signing
+    cmds:
+      - task: unsupported:distribution
+
+  sign:notarize:
+    summary: Rejects unsupported macOS signing and notarization
+    cmds:
+      - task: unsupported:distribution
+
+  unsupported:distribution:
+    internal: true
+    summary: Reject unsupported macOS package, bundle, signing, and notarization work
+    cmds:
+      - |
+        echo "macOS package/bundle/signing/notarization tasks are disabled; raw darwin:build and darwin:run remain available for local developer validation only."
+        echo "Re-enable distribution only after secure atomic output is implemented and qualified on macOS, an approved project license and signing/provenance policy exist, and clean-machine install/upgrade/uninstall qualification passes."
+        exit 1

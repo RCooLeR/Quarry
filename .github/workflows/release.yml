@@ -40,11 +40,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
           cache: true
+          cache-dependency-path: src/go.sum
 
       - name: Bind canonical version to annotated tag and checked-out commit
         id: metadata
+        working-directory: src
         env:
           RELEASE_TAG: ${{ github.ref_name }}
           RELEASE_BUILD_NUMBER: ${{ github.run_number }}
@@ -52,7 +54,7 @@ jobs:
         run: |
           go run ./build/releasemeta \
             -release-tag "$RELEASE_TAG" \
-            -repository . \
+            -repository .. \
             -build-number "$RELEASE_BUILD_NUMBER" \
             -github-output "$GITHUB_OUTPUT" \
             -provenance-out "$PROVENANCE_PATH"
@@ -100,30 +102,33 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
           cache: true
+          cache-dependency-path: src/go.sum
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.20.0
+          node-version: 24.21.0
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
 
       - name: Install pinned npm
         run: npm install --global npm@12.0.2
 
       - name: Verify pinned toolchain and dependency graph
         shell: bash
+        working-directory: src
         run: |
-          test "$(go env GOVERSION)" = "go1.27.0"
-          test "$(node --version)" = "v24.20.0"
+          test "$(go env GOVERSION)" = "go1.27.1"
+          test "$(node --version)" = "v24.21.0"
           test "$(npm --version)" = "12.0.2"
           go mod verify
           go mod tidy -diff
 
       - name: Install pinned Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
+        working-directory: src
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
 
       - name: Install and verify pinned NSIS compiler
         shell: pwsh
@@ -133,15 +138,16 @@ jobs:
           if ($LASTEXITCODE -ne 0 -or $actual -ne "v3.11") { throw "makensis version '$actual' does not match pinned 'v3.11'" }
 
       - name: Build unsigned Windows 10/11 x64 NSIS validation candidate
+        working-directory: src
         run: wails3 task windows:package:candidate
 
       - name: Verify installer, payload, runtime bootstrapper, and clean source inputs
         shell: pwsh
         run: |
-          ./build/windows/verify-unqualified-nsis-candidate.ps1 `
+          ./src/build/windows/verify-unqualified-nsis-candidate.ps1 `
             -InstallerPath bin/quarry-amd64-installer.exe `
             -BinaryPath bin/quarry.exe `
-            -BootstrapperPath build/windows/nsis/MicrosoftEdgeWebview2Setup.exe `
+            -BootstrapperPath src/build/windows/nsis/MicrosoftEdgeWebview2Setup.exe `
             -ProductVersion $env:APP_VERSION `
             -PlatformVersion $env:PLATFORM_VERSION `
             -BuildNumber $env:BUILD_NUMBER `
@@ -209,31 +215,35 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version-file: src/go.mod
           cache: true
+          cache-dependency-path: src/go.sum
 
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.20.0
+          node-version: 24.21.0
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: src/frontend/package-lock.json
 
       - name: Install pinned npm
         run: npm install --global npm@12.0.2
 
       - name: Verify pinned toolchain and dependency graph
+        working-directory: src
         run: |
-          test "$(go env GOVERSION)" = "go1.27.0"
-          test "$(node --version)" = "v24.20.0"
+          test "$(go env GOVERSION)" = "go1.27.1"
+          test "$(node --version)" = "v24.21.0"
           test "$(npm --version)" = "12.0.2"
           go mod verify
           go mod tidy -diff
 
       - name: Install pinned Wails CLI
-        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15
+        working-directory: src
+        run: go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23
 
       - name: Build
+        working-directory: src
         run: wails3 task linux:build
 
       - name: Verify embedded provenance and clean source inputs
@@ -252,8 +262,8 @@ jobs:
         run: |
           mkdir -p release-artifacts/quarry-linux-amd64
           install -m 0755 bin/quarry release-artifacts/quarry-linux-amd64/quarry
-          install -m 0644 build/linux/quarry.desktop release-artifacts/quarry-linux-amd64/quarry.desktop
-          install -m 0644 build/appicon.png release-artifacts/quarry-linux-amd64/appicon.png
+          install -m 0644 src/build/linux/quarry.desktop release-artifacts/quarry-linux-amd64/quarry.desktop
+          install -m 0644 src/build/appicon.png release-artifacts/quarry-linux-amd64/appicon.png
           archive="release-artifacts/quarry_${APP_VERSION}_linux_amd64.tar.gz"
           tar --sort=name --mtime="@${SOURCE_DATE_EPOCH}" --owner=0 --group=0 --numeric-owner \
             -C release-artifacts -cf - quarry-linux-amd64 | gzip -n > "$archive"

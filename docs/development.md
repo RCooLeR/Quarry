@@ -4,49 +4,55 @@
 
 ```
 .
-├── main.go                  # Wails app setup (window, title bar, file-drop)
-├── fileservice.go           # FileService: open/close, windows, search
-├── fileservice_csv.go       # CSV tools (inspect/schema/convert/transform/export)
-├── fileservice_sql.go       # SQL tools (analyze/extract/reshape/schemadiff/…)
-├── fileservice_edit.go      # staging, save-copy, in-place containment boundary
-├── fileservice_hex.go       # hex window
-├── jobs.go                  # cancellable background-job manager
-├── build/                   # Wails build config + per-OS Taskfiles + icons
-├── internal/                # the streaming engine (no UI deps)
-│   ├── document/ lineindex/ # windowed reads, chunk cache, sparse line index
-│   ├── editwindow/ manualedit/ inplace/   # staged edits + dormant transaction primitive
-│   ├── search/ replace/ regexutil/        # streaming, encoding-aware matching
-│   ├── exportx/ fileio/                    # byte-range export, atomic writes
-│   ├── encodingx/ asciifold/               # encodings, BOM, case-folding
-│   ├── session/ settings/ units/ logger/   # registry + misc support
-│   └── plugins/
-│       ├── csv/             # inspect, schema, convert, transform, export
-│       └── sql/             # analyze, extract, preset, reshape, schemadiff, highlight
-└── frontend/
-    └── src/
-        ├── App.tsx          # workbench shell: menus, panels, state
-        ├── Tools.tsx        # the CSV / SQL data-tools panel
-        ├── CsvGrid.tsx HexView.tsx DiffView.tsx Sidebar.tsx
-        ├── MenuBar.tsx CommandPalette.tsx XRay.tsx
-        └── editor/          # QuarryEditor.ts + highlight profiles
+├── src/                     # self-contained application workspace
+│   ├── go.mod, go.sum       # unchanged Go module/import identity
+│   ├── main.go              # Wails window, title bar, file-drop
+│   ├── fileservice*.go      # bounded service APIs and adjacent tests
+│   ├── jobs.go              # cancellable background-job manager
+│   ├── build/               # platform assets, Go build helpers, Taskfiles
+│   ├── internal/            # streaming engine (no UI dependencies)
+│   │   ├── document/ lineindex/         # windowed reads and sparse line index
+│   │   ├── editwindow/ manualedit/ inplace/ # staged edits and recovery primitives
+│   │   ├── search/ replace/ regexutil/  # streaming, encoding-aware matching
+│   │   ├── exportx/ fileio/             # byte-range export and atomic writes
+│   │   └── plugins/csv/ plugins/sql/    # streaming data tools
+│   ├── frontend/
+│   │   ├── package.json, package-lock.json
+│   │   ├── tests/           # UI and source-contract tests
+│   │   └── src/             # React components and CodeMirror editor
+│   └── Taskfile.yml         # application tasks
+├── docs/                    # user and developer documentation
+├── bin/                     # generated executables/packages (gitignored)
+├── logos/                   # branding assets
+├── .github/                 # repository CI and dependency-update policies
+└── Taskfile.yml             # forwards tasks into src/
 ```
 
-Module: `github.com/quarry/quarry-wails3` (Go 1.27.0). Stack: Wails v3
-`v3.0.0-beta.15` with its matching published frontend runtime
-`3.0.0-beta.15`, React + TypeScript + Vite, and CodeMirror 6. The frontend
+Source paths below are relative to `src/` unless explicitly described as
+repository-root paths. Direct Go, npm, and Wails commands use `src/` (or
+`src/frontend/` for npm); the root Taskfile forwards its tasks with the correct
+working directory. Generated executables always go to the root `bin/`.
+
+Module: `github.com/quarry/quarry-wails3` (Go 1.27.1). Stack: Wails v3
+`v3.0.0-beta.23` with its matching published frontend runtime
+`3.0.0-beta.23`, React + TypeScript + Vite, and CodeMirror 6. The frontend
 package is `quarry-frontend`.
 
 ## Build & test
 
 ```sh
-task dev            # hot-reload dev (or: wails3 dev)
-task build                    # optimized local build; not release-qualified
-wails3 task frontend:check    # bindings + locked UI tests/type-check/build
+# repository root
+task dev                     # hot-reload development
+task build                   # optimized local build; not release-qualified
+task frontend:check          # bindings + locked UI tests/type-check/build
+
+# direct Go commands run in the module workspace
+cd src
 go test ./...                 # full module; requires the generated dist above
 go test ./internal/...        # engine/plugin tests; no frontend prerequisite
 ```
 
-For the full local merge gate, run:
+For the full local merge gate, run from the repository root or `src/`:
 
 ```sh
 task verify
@@ -56,11 +62,11 @@ task verify:race
 The first command creates the ignored frontend bundle before whole-module Go
 commands, then verifies module and lockfile immutability, default and
 production-tag Go tests, frontend tests/type-check/bundle budgets, vet,
-staticcheck `v0.8.1`, govulncheck `v1.7.0`, npm audit, actionlint `v1.7.12`, and
-GoReleaser `v2.18.0` containment. The second command is separate because the
-race suite is materially slower. Scanner versions are pinned in `Taskfile.yml`;
-CI additionally fixes Go 1.27.0, Node 24.20.0, npm 12.0.2, Wails CLI
-`v3.0.0-beta.15`, runner generations, and every GitHub Action to a full
+staticcheck `v0.8.1`, govulncheck `v1.8.0`, npm audit, actionlint `v1.7.12`, and
+GoReleaser `v2.18.2` containment. The second command is separate because the
+race suite is materially slower. Scanner versions are pinned in `src/Taskfile.yml`;
+CI additionally fixes Go 1.27.1, Node 24.21.0, npm 12.0.2, Wails CLI
+`v3.0.0-beta.23`, runner generations, and every GitHub Action to a full
 commit SHA.
 
 To prove clean-checkout behavior, use a new clone rather than deleting files
@@ -75,7 +81,7 @@ Quarry does not ship a network server or server container. The registered
 `FileService` is a desktop-local capability surface and is not authenticated or
 confined for remote use. Builds made manually with the Wails `server` tag exit
 before starting the runtime. `task setup:docker` remains available only for the
-desktop cross-OS image. Its Debian 13/Trixie base enforces Wails beta.15's GTK
+desktop cross-OS image. Its Debian 13/Trixie base enforces Wails beta.23's GTK
 4.14-or-newer requirement at image-build time. Linux builds through that image
 are same-architecture only: native GTK/WebKit libraries and GCC cannot safely
 serve another `GOARCH`.
@@ -92,21 +98,24 @@ The frontend dependency graph is intentionally npm-only and pinned by
 `package-lock.json` and npm `12.0.2`; alternate package managers are not supported. Set
 `WAILS_VITE_PORT` when the default dev port (`9245`) is already occupied.
 
-Obfuscated builds are temporarily disabled. Garble `v0.17.0`, the newest
-tagged release, rejects Go 1.27; normal builds remain supported while the
-project waits for a compatible tagged Garble release that can be pinned and
-qualified.
+Obfuscated builds are temporarily disabled. Garble `v0.18.0` now supports Go
+1.27, but Quarry's generated bindings and cross-platform obfuscated builds
+have not been qualified with it. Normal builds remain supported. Re-enabling
+obfuscation requires a pinned tool plus binding and packaged-app verification.
 
 The production frontend build enforces the startup and total JavaScript budgets
 in `frontend/scripts/check-bundle-budget.mjs`. Optional workbench views must
 remain lazy-loaded. The application entry is capped at 280 KiB uncompressed
 and 90 KiB gzip; the complete initial module graph, including module preloads,
-is capped at 320 KiB uncompressed and 110 KiB gzip. The initial stylesheet is
+is capped at 352 KiB uncompressed and 110 KiB gzip. The initial stylesheet is
 capped at 64 KiB, every JavaScript chunk at 320 KiB, and all JavaScript chunks
-together at 720 KiB. Vite 8's Rolldown chunk groups isolate the React 19 runtime
+together at 768 KiB. Vite 8's Rolldown chunk groups isolate the React 19 runtime
 from Quarry's entry, preserving the tighter entry limits and a separately
 cacheable framework chunk. Change a budget only with a reviewed bundle analysis
-and an explanation of the startup impact.
+and an explanation of the startup impact. The September 2026 dependency audit
+raised only the raw initial and total budgets to accommodate React 19.3's
+framework growth; gzip and individual-chunk budgets remain unchanged. See the
+[audit report](project-audit-2026-09-20.md) for measurements and qualification limits.
 
 Android and iOS are not supported release targets and are intentionally absent
 from the root task inventory. Their generated platform Taskfiles support only
@@ -162,9 +171,9 @@ reproducible. The digest-pinned cross-OS container is developer infrastructure,
 not a substitute for native signed release qualification. Its Linux path
 requires the requested CPU architecture to match the host/image architecture.
 
-`bin/`, `.task/`, `frontend/dist/`, `frontend/node_modules/`, generated Windows
-`.syso` resources, and `frontend/bindings/` are gitignored, as are GoReleaser's
-local `dist/` and `release-artifacts/` scratch directories. Platform tasks
+The root `bin/`, `src/.task/`, `src/frontend/dist/`, `src/frontend/node_modules/`,
+generated Windows `.syso` resources, and `src/frontend/bindings/` are gitignored,
+as are GoReleaser's root `dist/` and `release-artifacts/` scratch directories. Platform tasks
 generate versioned resources from tracked templates without rewriting those
 templates.
 
@@ -175,6 +184,7 @@ The TypeScript client in `frontend/bindings/` is generated from the Go
 it returns:
 
 ```sh
+cd src
 wails3 generate bindings -ts -i
 ```
 
@@ -186,17 +196,17 @@ and bundling.
 
 ## Updating build metadata
 
-Product metadata lives in `build/config.yml`. After changing `info` or file
+Product metadata lives in `src/build/config.yml`. After changing `info` or file
 association values, regenerate the committed platform assets:
 
 ```sh
-wails3 task common:update:build-assets
+task common:update:build-assets  # from the repository root
 ```
 
-Review the generated files under `build/` before committing so package names,
+Review the generated files under `src/build/` before committing so package names,
 bundle identifiers, installer text, and desktop entries stay consistent.
 Use the task rather than invoking `wails3 update build-assets` directly. Wails
-beta.15 regenerates the Darwin plists with its macOS 12 default; the task's
+beta.23 regenerates the Darwin plists with its macOS 12 default; the task's
 cross-platform policy step validates both generated plists and reapplies
 Quarry's required macOS 13 minimum.
 
@@ -225,7 +235,7 @@ A tool is usually four small steps:
    cancelled dialog never occupies the global job slot. Once any atomic output
    is published, user/lifecycle cancellation is intentionally stale; allow the
    callback to finish and preserve its success or partial-failure evidence.
-3. **Bindings** — run `wails3 generate bindings -ts -i`.
+3. **Bindings** — run `wails3 generate bindings -ts -i` from `src/`.
 4. **UI** — add a control in `Tools.tsx` (CSV or SQL branch) that calls the new
    method through the generated client and reports the result.
 
@@ -244,7 +254,7 @@ A tool is usually four small steps:
 - **Source is never silently modified** is a required invariant. In-place save
   remains disabled until it has a durable, verified user-restorable backup and
   explicit recovery workflow; remaining writers must migrate to the shared
-  output transaction tracked in `col-review/` before release.
+  output transaction before release.
 - **Windowed everything.** When adding a feature, reach for `ReadRange` /
   sampling / streaming — never read `Size()` bytes into memory.
 - **Encoding.** Search and replace operate on raw bytes; the query is encoded
@@ -252,7 +262,7 @@ A tool is usually four small steps:
 - **SQL analysis caches** a `Summary` per file id on the `FileService`; tools
   that need offsets (extract, split, fixture, schema diff) require the dump to be
   analyzed first.
-- **Always build the GUI exe with `task build` / `wails3 build`**, not a bare
+- **Always build the GUI exe with root `task build` or `wails3 build` from `src/`**, not a bare
   `go build`. The production task links with `-ldflags="-H windowsgui"`, which
   sets the Windows GUI subsystem; a plain `go build` produces a *console*
   subsystem binary that pops an extra terminal window next to the app. The task

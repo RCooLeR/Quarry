@@ -8,6 +8,10 @@ Quarry is three layers:
 3. a **React UI** in `frontend/src/` whose editor materializes only bounded
    windows.
 
+All three layers live in the `src/` application workspace. Source paths below
+are relative to `src/`; repository documentation and build output remain in
+the root `docs/` and `bin/` directories.
+
 The guiding constraint is that **no operation may materialize unbounded
 whole-file data in memory**. Large-file paths are windowed, streamed, or
 sampled. A small-input path may materialize data only behind an explicit hard
@@ -77,7 +81,7 @@ CSV/SQL tools as methods that take and return **JSON-friendly structs**. The
 whole-file content never crosses the bridge — only bounded windows and bounded
 samples do.
 
-`wails3 generate bindings -ts -i` regenerates the TypeScript client into
+From `src/`, `wails3 generate bindings -ts -i` regenerates the TypeScript client into
 `frontend/bindings/` (gitignored) whenever a Go method signature changes.
 
 `internal/bridgetransport` is a Wails-independent admission layer in front of

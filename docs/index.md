@@ -6,6 +6,8 @@ source, and it layers a data workbench on top.
 
 ## Contents
 
+- **[Project audit, September 2026](project-audit-2026-09-20.md)** — dependency
+  updates, confirmed defects, performance evidence, validation, and remaining work.
 - **[Getting started](getting-started.md)** — prerequisites, build/run, opening
   files, and the views you can switch between.
 - **[Features & tools](features.md)** — the complete reference: editor, search,

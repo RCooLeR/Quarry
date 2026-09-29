@@ -43,50 +43,50 @@ Built with **Go + [Wails v3](https://v3.wails.io/) + React + TypeScript +
 
 > **Current edited-save policy:** Save copy is the only enabled save path and
 > in-place save is disabled until Quarry can retain and verify a durable,
-> user-restorable backup. The broader output-transaction hardening tracked in
-> `col-review/` must be completed before treating this branch as release-ready.
+> user-restorable backup. The remaining output-transaction hardening must be
+> completed before treating this branch as release-ready.
 
 ## Quick start
 
-Canonical prerequisites: [Go](https://go.dev/) 1.27.0, Node.js 24.20.0 with npm
-12.0.2, Wails CLI `v3.0.0-beta.15`, and [Task](https://taskfile.dev/)
+Canonical prerequisites: [Go](https://go.dev/) 1.27.1, Node.js 24.21.0 with npm
+12.0.2, Wails CLI `v3.0.0-beta.23`, and [Task](https://taskfile.dev/)
 (optional but convenient). Compatible developer Node ranges and exact install
 commands are listed in [Getting started](docs/getting-started.md).
 
 ```sh
-# run in development (hot reload for Go + frontend)
-task dev          # or: wails3 dev -config ./build/config.yml
+# run from the repository root in development (hot reload for Go + frontend)
+task dev
 
 # optimized local build (not release-qualified) → bin/quarry.exe
-task build        # or: wails3 build
+task build
 
 # run the tests
 task verify
 task verify:race
 ```
 
+The root Taskfile forwards these commands to the `src/` workspace. Run direct
+Go and Wails commands from `src/`; build output remains in the root `bin/`.
 See **[docs/getting-started.md](docs/getting-started.md)** for details.
 
 ## Project layout
 
 ```
 .
-├── main.go              # Wails app: window, dark title bar, file-drop bridge
-├── fileservice*.go      # FileService — the Go↔frontend binding layer
-├── jobs.go              # cancellable background-job manager
-├── internal/            # the streaming engine (no UI dependencies)
-│   ├── document/        # FileDocument: bounded windowed reads + chunk cache
-│   ├── lineindex/       # sparse line index (approx → exact line numbers)
-│   ├── search/ replace/ # streaming, encoding-aware find / replace
-│   ├── exportx/         # byte-range export
-│   ├── manualedit/ inplace/ editwindow/   # staged edits; guarded recovery primitives
-│   └── plugins/
-│       ├── csv/         # inspect, schema, convert, transform, export
-│       └── sql/         # analyze, extract, preset, reshape, schemadiff
-└── frontend/src/        # React UI
-    ├── editor/QuarryEditor.ts   # the CodeMirror windowed editor surface
-    ├── App.tsx          # workbench shell, menus, panels
-    └── Tools.tsx        # the data-tools panel (CSV / SQL)
+├── src/                 # self-contained Go/Wails application workspace
+│   ├── go.mod, go.sum   # Go module and locked dependency checksums
+│   ├── main.go         # Wails window, title bar, and file-drop bridge
+│   ├── fileservice*.go # Go↔frontend binding layer and adjacent tests
+│   ├── jobs.go         # cancellable background-job manager
+│   ├── internal/       # streaming engine and CSV/SQL plugins
+│   ├── frontend/       # React UI, generated bindings, tests, and npm manifest
+│   ├── build/          # platform assets, build helpers, and cross-build image
+│   └── Taskfile.yml    # application build and verification tasks
+├── docs/                # user and developer documentation
+├── bin/                 # generated executables (gitignored)
+├── logos/               # branding assets
+├── .github/             # CI, candidate validation, and dependency updates
+└── Taskfile.yml         # root entry point for application tasks
 ```
 
 ## Documentation

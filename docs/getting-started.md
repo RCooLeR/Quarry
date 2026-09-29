@@ -2,13 +2,13 @@
 
 ## Prerequisites
 
-- **Go** 1.27.0 or newer. CI and release-candidate validation use exactly
-  1.27.0 from `go.mod`.
+- **Go** 1.27.1 or newer. CI and release-candidate validation use exactly
+  1.27.1 from `src/go.mod`.
 - **Node.js** `^22.22.2`, `^24.15.0`, or `>=26.0.0` with **npm** `12.0.2` (the
-  frontend install is locked to npm and `package-lock.json`). The canonical CI
-  runtime is Node 24.20.0, also recorded in `.node-version`.
-- **Wails v3 CLI** `v3.0.0-beta.15`, matching `go.mod`:
-  `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.15`
+  frontend install is locked to npm and `src/frontend/package-lock.json`). The canonical CI
+  runtime is Node 24.21.0, also recorded in `.node-version`.
+- **Wails v3 CLI** `v3.0.0-beta.23`, matching `src/go.mod`:
+  `go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23`
 - **[Task](https://taskfile.dev/)** (optional) — the `Taskfile.yml` wraps the
   common Wails commands
 
@@ -22,31 +22,34 @@ using or distributing a validation build.
 
 ## Build & run
 
-Using Task:
+Using Task from the repository root (the root Taskfile forwards to `src/`):
 
 ```sh
 task dev      # development mode, hot reload for Go + frontend
 task build    # optimized local build; not a release-qualified artifact
-task run      # build and run
+task run      # run the built executable
 task package  # local unsigned/unqualified package for validation only
 ```
 
-Equivalent Wails CLI commands:
+Direct Wails CLI commands run from the application workspace:
 
 ```sh
+cd src
 wails3 dev -config ./build/config.yml
 wails3 build
 ```
 
-Frontend-only build (type-check + bundle), useful in CI:
+Frontend-only build (tests, type-check, and bundle), from the repository root:
 
 ```sh
-wails3 task frontend:check
+task frontend:check
 ```
 
 That task generates TypeScript bindings before running `npm ci`, Vitest,
 TypeScript, and the production Vite build. For a manual equivalent, use
-`wails3 generate bindings -ts -i` before entering `frontend/`.
+`wails3 generate bindings -ts -i` from `src/` before entering `src/frontend/`.
+Executables and local packages are written to the repository's `bin/`, not
+inside `src/`.
 
 Quarry supports the committed npm lockfile as its sole frontend dependency
 graph. `task dev WAILS_VITE_PORT=9246` changes the development port without
@@ -55,16 +58,17 @@ changing dependencies.
 ## Running the tests
 
 The engine/internal packages can be tested without a frontend bundle; the full
-module embeds `frontend/dist`, so generate the ignored bundle first in a fresh
+module embeds `src/frontend/dist`, so generate the ignored bundle first in a fresh
 checkout:
 
 ```sh
+cd src
 go test ./internal/... ./build/releasemeta
 wails3 task frontend:check
 go test ./...  # complete module, after frontend:check
 ```
 
-The canonical local gate is:
+The canonical local gate, run from the repository root, is:
 
 ```sh
 task verify       # unit/production-tag/UI/static/dependency/workflow gates
@@ -72,9 +76,9 @@ task verify:race  # race-enabled suite, run separately because it is slower
 ```
 
 Both canonical tasks build/check the frontend before whole-module Go commands,
-so they work from a fresh checkout where `frontend/dist` is absent. `task verify`
+so they work from a fresh checkout where `src/frontend/dist` is absent. `task verify`
 downloads exact scanner releases without adding them to
-`go.mod`. It requires network access for the Go vulnerability database and npm
+`src/go.mod`. It requires network access for the Go vulnerability database and npm
 advisory service. CI runs the same checks from a fresh checkout and records the
 verified commit, tree, tool versions, and lockfile hashes.
 
