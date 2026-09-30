@@ -4,6 +4,10 @@ These on-disk fixtures are used by `internal/replace` tests to validate
 encoding and line-ending transforms against real files (not only in-memory
 buffers).
 
+Git must preserve these `.txt` files byte for byte on every platform. The
+repository's `.gitattributes` disables text conversion for them so that newline
+sequences and byte offsets remain part of the test inputs.
+
 - `utf8_bom_mixed.txt`: UTF-8 with BOM and mixed CRLF/CR/LF endings.
 - `utf16be_bom_mixed.txt`: UTF-16BE with BOM and mixed CRLF/CR/LF endings.
 - `windows1251_crlf.txt`: Windows-1251 Cyrillic text with CRLF endings.

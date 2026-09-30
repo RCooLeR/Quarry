@@ -1,0 +1,5 @@
+# Keep source and dependency manifests stable across platform checkouts.
+* text=auto eol=lf
+
+# Encoding and newline fixtures are byte-level test inputs.
+src/internal/replace/testdata/encodings/*.txt binary
