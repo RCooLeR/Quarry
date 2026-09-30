@@ -40,16 +40,18 @@ jobs:
             ""|*[!0-9a-fA-F]*) echo "expected_commit must be a full hexadecimal Git object ID" >&2; exit 1 ;;
           esac
           test "${#EXPECTED_COMMIT}" -eq 40
-          actual="$(git rev-parse --verify HEAD^{commit})"
+          actual="$(git rev-parse --verify 'HEAD^{commit}')"
           test "$actual" = "$(printf '%s' "$EXPECTED_COMMIT" | tr 'A-F' 'a-f')"
           dirty="$(git status --porcelain --untracked-files=all)"
           if [ -n "$dirty" ]; then
             printf '%s\n' "$dirty" >&2
             exit 1
           fi
-          echo "commit=$actual" >> "$GITHUB_OUTPUT"
-          echo "tree=$(git rev-parse --verify HEAD^{tree})" >> "$GITHUB_OUTPUT"
-          echo "commit_date=$(git show -s --format=%cI HEAD)" >> "$GITHUB_OUTPUT"
+          {
+            echo "commit=$actual"
+            echo "tree=$(git rev-parse --verify 'HEAD^{tree}')"
+            echo "commit_date=$(git show -s --format=%cI HEAD)"
+          } >> "$GITHUB_OUTPUT"
 
   platform:
     name: ${{ matrix.name }} tests and build
@@ -139,7 +141,7 @@ jobs:
       - name: Verify build preserved source inputs
         shell: bash
         run: |
-          test "$(git rev-parse --verify HEAD^{commit})" = "${EXPECTED_COMMIT}"
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "${EXPECTED_COMMIT}"
           dirty="$(git status --porcelain --untracked-files=all)"
           if [ -n "$dirty" ]; then
             printf '%s\n' "$dirty" >&2

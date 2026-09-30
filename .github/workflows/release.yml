@@ -251,7 +251,7 @@ jobs:
           strings bin/quarry | grep -F -- "$APP_VERSION" >/dev/null
           strings bin/quarry | grep -F -- "$BUILD_COMMIT" >/dev/null
           strings bin/quarry | grep -F -- "$BUILD_DATE" >/dev/null
-          test "$(git rev-parse --verify HEAD^{commit})" = "$BUILD_COMMIT"
+          test "$(git rev-parse --verify 'HEAD^{commit}')" = "$BUILD_COMMIT"
           dirty="$(git status --porcelain --untracked-files=all)"
           if [ -n "$dirty" ]; then
             printf '%s\n' "$dirty" >&2
