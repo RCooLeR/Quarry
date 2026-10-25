@@ -215,7 +215,7 @@ jobs:
         env:
           GOTOOLCHAIN: local
         run: |
-          go install honnef.co/go/tools/cmd/staticcheck@v0.8.1
+          go install honnef.co/go/tools/cmd/staticcheck@v0.8.2
           "$(go env GOPATH)/bin/staticcheck" ./...
           "$(go env GOPATH)/bin/staticcheck" -tags production ./...
           GOOS=windows GOARCH=amd64 CGO_ENABLED=0 "$(go env GOPATH)/bin/staticcheck" ./...
@@ -323,7 +323,7 @@ jobs:
               workflow:{runId:$runId, attempt:$runAttempt},
               toolchain:{go:$goVersion, node:$nodeVersion, npm:$npmVersion,
                 goToolchainPolicy:"local",
-                wails:"v3.0.0-beta.23", staticcheck:"v0.8.1",
+                wails:"v3.0.0-beta.23", staticcheck:"v0.8.2",
                 govulncheck:"v1.8.0", actionlint:"v1.7.12", goreleaser:"v2.18.2"},
               inputs:{goModSha256:$goModSha256, goSumSha256:$goSumSha256,
                 frontendPackageSha256:$packageSha256, frontendLockSha256:$lockSha256},

@@ -62,7 +62,7 @@ task verify:race
 The first command creates the ignored frontend bundle before whole-module Go
 commands, then verifies module and lockfile immutability, default and
 production-tag Go tests, frontend tests/type-check/bundle budgets, vet,
-staticcheck `v0.8.1`, govulncheck `v1.8.0`, npm audit, actionlint `v1.7.12`, and
+staticcheck `v0.8.2`, govulncheck `v1.8.0`, npm audit, actionlint `v1.7.12`, and
 GoReleaser `v2.18.2` containment. The second command is separate because the
 race suite is materially slower. Scanner versions are pinned in `src/Taskfile.yml`;
 CI additionally fixes Go 1.27.3, Node 24.21.0, npm 12.0.2, Wails CLI
