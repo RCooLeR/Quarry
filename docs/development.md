@@ -33,7 +33,7 @@ repository-root paths. Direct Go, npm, and Wails commands use `src/` (or
 `src/frontend/` for npm); the root Taskfile forwards its tasks with the correct
 working directory. Generated executables always go to the root `bin/`.
 
-Module: `github.com/quarry/quarry-wails3` (Go 1.27.1). Stack: Wails v3
+Module: `github.com/quarry/quarry-wails3` (Go 1.27.3). Stack: Wails v3
 `v3.0.0-beta.23` with its matching published frontend runtime
 `3.0.0-beta.23`, React + TypeScript + Vite, and CodeMirror 6. The frontend
 package is `quarry-frontend`.
@@ -65,7 +65,7 @@ production-tag Go tests, frontend tests/type-check/bundle budgets, vet,
 staticcheck `v0.8.1`, govulncheck `v1.8.0`, npm audit, actionlint `v1.7.12`, and
 GoReleaser `v2.18.2` containment. The second command is separate because the
 race suite is materially slower. Scanner versions are pinned in `src/Taskfile.yml`;
-CI additionally fixes Go 1.27.1, Node 24.21.0, npm 12.0.2, Wails CLI
+CI additionally fixes Go 1.27.3, Node 24.21.0, npm 12.0.2, Wails CLI
 `v3.0.0-beta.23`, runner generations, and every GitHub Action to a full
 commit SHA.
 

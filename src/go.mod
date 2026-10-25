@@ -1,6 +1,6 @@
 module github.com/quarry/quarry-wails3
 
-go 1.27.1
+go 1.27.3
 
 require (
 	github.com/wailsapp/wails/v3 v3.0.0-beta.23

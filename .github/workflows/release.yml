@@ -120,7 +120,7 @@ jobs:
         shell: bash
         working-directory: src
         run: |
-          test "$(go env GOVERSION)" = "go1.27.1"
+          test "$(go env GOVERSION)" = "go1.27.3"
           test "$(node --version)" = "v24.21.0"
           test "$(npm --version)" = "12.0.2"
           go mod verify
@@ -232,7 +232,7 @@ jobs:
       - name: Verify pinned toolchain and dependency graph
         working-directory: src
         run: |
-          test "$(go env GOVERSION)" = "go1.27.1"
+          test "$(go env GOVERSION)" = "go1.27.3"
           test "$(node --version)" = "v24.21.0"
           test "$(npm --version)" = "12.0.2"
           go mod verify

@@ -2,8 +2,8 @@
 
 ## Prerequisites
 
-- **Go** 1.27.1 or newer. CI and release-candidate validation use exactly
-  1.27.1 from `src/go.mod`.
+- **Go** 1.27.3 or newer. CI and release-candidate validation use exactly
+  1.27.3 from `src/go.mod`.
 - **Node.js** `^22.22.2`, `^24.15.0`, or `>=26.0.0` with **npm** `12.0.2` (the
   frontend install is locked to npm and `src/frontend/package-lock.json`). The canonical CI
   runtime is Node 24.21.0, also recorded in `.node-version`.

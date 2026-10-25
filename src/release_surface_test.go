@@ -1024,7 +1024,7 @@ func TestPinnedReleaseToolchainIsConsistent(t *testing.T) {
 	}
 	text := combined.String()
 	for _, required := range []string{
-		"go 1.27.1",
+		"go 1.27.3",
 		"GOTOOLCHAIN: local",
 		"node-version: 24.21.0",
 		"npm --version)\" = \"12.0.2",
@@ -1060,7 +1060,7 @@ func TestDependencyUpdatePolicyAndCrossImagePin(t *testing.T) {
 	if !from.Match(dockerfile) {
 		t.Fatal("cross-build container base must use a content digest, not a mutable tag alone")
 	}
-	const crossBase = "FROM golang:1.27.1-trixie@sha256:433790e515d27dc6003e847e644cc0af956985cf315c1c58a3b73ee2dd305183"
+	const crossBase = "FROM golang:1.27.3-trixie@sha256:fbb7ae40b62ff8afe31662df570d39b4f5052ac32b90dae8e60d7657a20a74f4"
 	if !bytes.Contains(dockerfile, []byte(crossBase)) {
 		t.Fatalf("cross-build container does not use the qualified Go 1.27 base %q", crossBase)
 	}
