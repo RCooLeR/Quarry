@@ -1030,7 +1030,7 @@ func TestPinnedReleaseToolchainIsConsistent(t *testing.T) {
 		"npm --version)\" = \"12.0.2",
 		"github.com/wailsapp/wails/v3 v3.0.0-beta.23",
 		"github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23",
-		"honnef.co/go/tools/cmd/staticcheck@v0.8.1",
+		"honnef.co/go/tools/cmd/staticcheck@v0.8.2",
 		"golang.org/x/vuln/cmd/govulncheck@v1.8.0",
 		"github.com/rhysd/actionlint/cmd/actionlint@v1.7.12",
 		"version: v2.18.2",
