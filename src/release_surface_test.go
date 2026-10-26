@@ -1000,7 +1000,7 @@ func TestPinnedReleaseToolchainIsConsistent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(nodeVersion)) != "24.21.0" {
+	if strings.TrimSpace(string(nodeVersion)) != "24.22.1" {
 		t.Fatalf(".node-version = %q", nodeVersion)
 	}
 
@@ -1026,7 +1026,7 @@ func TestPinnedReleaseToolchainIsConsistent(t *testing.T) {
 	for _, required := range []string{
 		"go 1.27.3",
 		"GOTOOLCHAIN: local",
-		"node-version: 24.21.0",
+		"node-version: 24.22.1",
 		"npm --version)\" = \"12.0.2",
 		"github.com/wailsapp/wails/v3 v3.0.0-beta.23",
 		"github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.23",
